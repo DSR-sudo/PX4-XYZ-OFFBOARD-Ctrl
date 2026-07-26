@@ -5,6 +5,9 @@ ROS 2 Jazzy、MAVROS 2.14.0 和 MTF02P 光流＋测距。它不修改、导入�
 `tools/mavros_height_offboard`；旧工具仍是 `PositionTarget` 的“XY 位置＋Z 加速度”
 历史路线，本目录改用 PX4 原生 XYZ 位置闭环。
 
+构建、测试、控制授权和运行步骤记录于
+[C++17 操作记录](docs/cpp17_operation_record.md)。
+
 ## 默认行为
 
 `mavros_xyz_position_node` 是 C++17 `ament_cmake` 可执行文件，默认只创建订阅并输出缩进清晰的终端摘要：

@@ -1,0 +1,8 @@
+# Python bytecode and test caches at any depth
+**/*pycache*/
+
+# Generated PX4 and ROS artifacts at the repository root
+/artifacts/
+/build/
+/install/
+/log/

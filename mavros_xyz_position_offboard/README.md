@@ -7,9 +7,9 @@ ROS 2 Jazzy、MAVROS 2.14.0 和 MTF02P 光流＋测距。它不修改、导入�
 
 ## 默认行为
 
-`ros2_position_node.py` 默认只创建订阅并输出缩进清晰的终端摘要：
+`mavros_xyz_position_node` 是 C++17 `ament_cmake` 可执行文件，默认只创建订阅并输出缩进清晰的终端摘要：
 
-- 不创建 `/mavros/setpoint_position/local` publisher；
+- 不创建 `/mavros/setpoint_raw/local` publisher；
 - 不创建 `/mavros/set_mode` client；
 - 不创建 `/mavros/cmd/arming` client；
 - 不写 PX4 或 MAVROS 参数；
@@ -29,10 +29,10 @@ range、optical-flow 和 FCU URL 都必须作为参数提供，节点不会把�
 
 ## 原生位置控制
 
-MAVROS 2.14 `setpoint_position` 插件订阅 `PoseStamped` 的 `~/local`，向飞控发送
-XYZ＋yaw，忽略速度、加速度和 yaw-rate。节点发布 ROS ENU 坐标，不自行翻转为 NED。
-启用 publisher 前还必须确认 MAVROS 插件的 `mav_frame=LOCAL_NED`；
-`BODY_NED/BODY_OFFSET_NED` 不满足固定世界 XY 的设计。
+MAVROS 2.14 `setpoint_raw` 接口订阅 `PositionTarget` 的 local setpoint，向飞控发送
+XYZ＋yaw，并通过 type mask 忽略速度、加速度和 yaw-rate。节点保留 ROS ENU 位置值，
+设定点明确标记 `FRAME_LOCAL_NED`；启用 publisher 前还必须确认 MAVROS 的
+`mav_frame=LOCAL_NED`；`BODY_NED/BODY_OFFSET_NED` 不满足固定世界 XY 的设计。
 
 节点在全部门禁通过后锁存一次当前 X/Y/Z 和规范化姿态：
 
@@ -55,7 +55,7 @@ XYZ＋yaw，忽略速度、加速度和 yaw-rate。节点发布 ROS ENU 坐标�
 
 以下每组必须完整，残缺组合会在 ROS 初始化和资源创建之前退出。
 
-1. Pose publisher：
+1. PositionTarget publisher：
    `--enable-position-setpoints`、`--ack-native-xyz-position-control`、
    `--ack-setpoint-streaming-risk`、
    `--confirm-setpoint-mav-frame-local-ned`、
@@ -125,6 +125,10 @@ MAVROS 2.14 的这些标准话题不能直接证明：
 ## 本地测试
 
 ```bash
-cd /home/pi/px4-test-tools/mavros_xyz_position_offboard
-python3 -m unittest discover -s tests -v
+cd /home/pi/px4-test-tools
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-select mavros_xyz_position_offboard
+colcon test --packages-select mavros_xyz_position_offboard
+source install/setup.bash
+ros2 run mavros_xyz_position_offboard mavros_xyz_position_node --help
 ```

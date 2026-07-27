@@ -45,7 +45,7 @@ colcon test-result --verbose
 
 - LCP 服务初始化之后必须收到新的 `STATUS=2` 和里程计样本；
 - LCP 失败或遥测过期不能通过门禁；
-- LCP-hold 使用本地位置冻结，yaw=0 不使用 LCP 坐标；
+- LCP-hold 使用本地位置冻结；LCP NWU yaw=0（正北）在 ROS ENU 设定点中使用 yaw=+π/2，不使用 LCP 坐标作为航点目标；
 - XYZ 五次轨迹不超过配置速度和加速度；
 - `PositionTarget` 使用 `FRAME_LOCAL_NED`，忽略速度、加速度和 yaw-rate；
 - 默认 CLI 约束保持不变，危险控制的残缺确认组合会被拒绝。

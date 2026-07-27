@@ -13,6 +13,9 @@ namespace mavros_xyz_position_offboard::offboard
 {
 namespace
 {
+// LCP uses NWU, where yaw=0 is north. ROS ENU expresses the same heading as +pi/2.
+constexpr double kNorthFacingEnuYawRad = 1.57079632679489661923;
+
 /// 将布尔值编码为 JSON 字面量。
 std::string bool_json(bool value) {return value ? "true" : "false";}
 
@@ -103,7 +106,7 @@ void MavrosNativeXYZNode::latch_current_pose()
   navigation_.latch(telemetry.local_x_m, telemetry.local_y_m, telemetry.local_z_m, telemetry.orientation);
   // The flight test requires a fixed north-facing heading from the first
   // streamed setpoint through climb, waypoints, landing, and disarm.
-  navigation_.set_yaw_rad(0.0);
+  navigation_.set_yaw_rad(kNorthFacingEnuYawRad);
 }
 
 /// 由 OFFBOARD 独占推进轨迹并发布 PositionTarget。
@@ -188,6 +191,15 @@ void MavrosNativeXYZNode::monitor_tick(double now)
 /// 执行从预检到 OFFBOARD/解锁请求前的全部阶段转换。
 void MavrosNativeXYZNode::prearm_control_tick(double now, double dt_s)
 {
+  const auto & telemetry = initialization_.telemetry();
+  // Handle the heartbeat that confirms our ARM request before running the
+  // disarmed-only preflight gate again. Otherwise the first armed heartbeat
+  // resets the candidate and prevents the climb phase from starting.
+  if (phase_ == "arming_request_pending" && telemetry.armed && upper(telemetry.mode) == "OFFBOARD") {
+    flight_started_at_ = now; initialization_.seed_drift_baseline(now);
+    if (common::finite(telemetry.local_x_m) && common::finite(telemetry.local_y_m)) {navigation_.recenter_xy(telemetry.local_x_m, telemetry.local_y_m);}
+    navigation_.set_relative_target(config_.relative_z_m); result_ = "UNCONFIRMED"; phase_ = "climb"; phase_started_at_ = now; return;
+  }
   last_errors_ = initialization_.preflight_errors(now);
   if (!last_errors_.empty()) {
     if (phase_ != "waiting_preflight" || navigation_.latched()) {reset_candidate(now);}
@@ -204,12 +216,6 @@ void MavrosNativeXYZNode::prearm_control_tick(double now, double dt_s)
       navigation_.reset(); setpoint_stream_since_.reset(); mode_future_.reset(); mode_future_started_at_.reset(); arm_future_.reset(); arm_future_started_at_.reset();
     }
     phase_ = "lcp_initializing"; last_errors_ = lcp_prearm_errors(now); return;
-  }
-  const auto & telemetry = initialization_.telemetry();
-  if (phase_ == "arming_request_pending" && telemetry.armed && upper(telemetry.mode) == "OFFBOARD") {
-    flight_started_at_ = now; initialization_.seed_drift_baseline(now);
-    if (common::finite(telemetry.local_x_m) && common::finite(telemetry.local_y_m)) {navigation_.recenter_xy(telemetry.local_x_m, telemetry.local_y_m);}
-    navigation_.set_relative_target(config_.relative_z_m); result_ = "UNCONFIRMED"; phase_ = "climb"; phase_started_at_ = now; return;
   }
   if (!navigation_.latched()) {
     phase_ = "lcp_ready"; phase_started_at_ = now; latch_current_pose(); setpoint_stream_since_ = now; phase_ = "setpoint_warmup"; phase_started_at_ = now;
@@ -288,8 +294,8 @@ void MavrosNativeXYZNode::flight_tick(double now, double dt_s)
     if (reached_setpoint && reached_vehicle) {phase_ = "hold"; phase_started_at_ = now;}
   } else if (phase_ == "hold") {
     if (phase_started_at_ && now - *phase_started_at_ >= config_.hold_seconds) {
-      if (initialization_.lcp_runtime_healthy(now)) {navigation_.set_yaw_rad(0.0); navigation_.prepare_waypoints(); if (navigation_.start_next_waypoint()) {phase_ = "waypoint"; phase_started_at_ = now;} else {begin_landing(now);}}
-      else {last_errors_.emplace_back("waiting for fresh LCP STATUS=2 before waypoint and yaw=0");}
+      if (initialization_.lcp_runtime_healthy(now)) {navigation_.set_yaw_rad(kNorthFacingEnuYawRad); navigation_.prepare_waypoints(); if (navigation_.start_next_waypoint()) {phase_ = "waypoint"; phase_started_at_ = now;} else {begin_landing(now);}}
+      else {last_errors_.emplace_back("waiting for fresh LCP STATUS=2 before waypoint and north-facing yaw");}
     }
   } else if (phase_ == "waypoint") {
     if (navigation_.waypoint_reached(telemetry.local_x_m, telemetry.local_y_m)) {if (!navigation_.start_next_waypoint()) {begin_landing(now);} else {phase_ = "waypoint"; phase_started_at_ = now;}}
@@ -362,7 +368,7 @@ std::string MavrosNativeXYZNode::status_json(double now) const
   s << ",\"flight_snapshot\":{\"vehicle\":{\"armed\":" << bool_json(t.armed) << ",\"mode\":\"" << common::json_escape(t.mode) << "\",\"connected\":" << bool_json(t.connected) << ",\"landed_state\":" << t.landed_state << "},\"local_xyz_m\":{\"x\":" << number_json(t.local_x_m) << ",\"y\":" << number_json(t.local_y_m) << ",\"z\":" << number_json(t.local_z_m) << "},\"local_velocity_m_s\":{\"x\":" << number_json(t.velocity_x_m_s) << ",\"y\":" << number_json(t.velocity_y_m_s) << ",\"z\":" << number_json(t.velocity_z_m_s) << "},\"relative_target_height_m\":" << number_json(config_.relative_z_m) << "}"
     << ",\"mode_service\":" << mode_event_json() << ",\"arming_service\":" << arm_event_json() << ",\"lcp_start_service\":" << lcp_event_json()
     << ",\"telemetry\":" << initialization_.telemetry_json(now)
-    << ",\"audit\":{\"target_hardware\":\"PX4 FMUv6C.x / Pi 5 / MTF02P\",\"target_firmware\":\"PX4 1.17.0\",\"target_ros_mavros\":\"ROS 2 Jazzy / MAVROS 2.14.0\",\"confirmed_fcu_url\":\"" << common::json_escape(options_.confirmed_fcu_url) << "\",\"topics\":{\"state\":\"" << common::json_escape(options_.state_topic) << "\",\"sys_status\":\"" << common::json_escape(options_.sys_status_topic) << "\",\"battery\":\"" << common::json_escape(options_.battery_topic) << "\",\"landed\":\"" << common::json_escape(options_.extended_state_topic) << "\",\"local_pose\":\"" << common::json_escape(options_.local_pose_topic) << "\",\"local_velocity\":\"" << common::json_escape(options_.local_velocity_topic) << "\",\"estimator_status\":\"" << common::json_escape(options_.estimator_status_topic) << "\",\"range\":\"" << common::json_escape(options_.range_topic) << "\",\"optical_flow\":\"" << common::json_escape(options_.optical_flow_topic) << "\",\"setpoint\":\"" << common::json_escape(options_.setpoint_topic) << "\",\"lcp_status\":\"" << common::json_escape(options_.lcp_status_topic) << "\",\"lcp_odometry\":\"" << common::json_escape(options_.lcp_odometry_topic) << "},\"services\":{\"lcp_start_initialization\":\"" << common::json_escape(options_.lcp_start_service) << "\"},\"range_source_label\":\"" << common::json_escape(options_.range_source_label) << "\",\"optical_flow_source_label\":\"" << common::json_escape(options_.optical_flow_source_label) << "\",\"range_source_confirmed\":" << bool_json(options_.confirm_range_source) << ",\"optical_flow_source_confirmed\":" << bool_json(options_.confirm_optical_flow_source) << ",\"ignore_declared_min_range\":" << bool_json(options_.ignore_declared_min_range) << ",\"ack_range_below_declared_min\":" << bool_json(options_.ack_range_below_declared_min) << ",\"sensor_loss_grace_s\":" << number_json(config_.sensor_loss_grace_s) << ",\"lcp_status_timeout_s\":" << number_json(config_.lcp_status_timeout_s) << ",\"lcp_odometry_timeout_s\":" << number_json(config_.lcp_odometry_timeout_s) << ",\"lcp_ready_samples\":" << config_.lcp_ready_samples << ",\"lcp_unhealthy_hold_timeout_s\":" << number_json(config_.lcp_unhealthy_hold_timeout_s) << ",\"lcp_control_policy\":\"STATUS=3 during climb is ignored; after 10 s fixed-height hold, fresh STATUS=2 and odometry are required before waypoints; yaw=0\",\"artifact_log_path\":" << optional_string_json(artifact_path) << ",\"setpoint_frame\":\"ROS ENU PositionTarget on setpoint_raw/local; MAVROS converts to MAVLink LOCAL_NED\",\"setpoint_mav_frame_confirmed_local_ned\":" << bool_json(options_.confirm_setpoint_mav_frame_local_ned) << ",\"setpoint_policy\":\"full position hold (PX/PY/PZ + YAW); Z driven by quintic trajectory\",\"waypoint_policy\":\"four 0.5 m body-relative legs: forward, left, backward, right; final target returns to initial XY before landing\",\"waypoint_frame\":\"initial locked yaw in ROS ENU local XY\",\"waypoint_leg_m\":" << number_json(config_.waypoint_leg_m) << ",\"waypoint_max_speed_m_s\":" << number_json(config_.waypoint_max_speed_m_s) << ",\"waypoint_max_accel_m_s2\":" << number_json(config_.waypoint_max_accel_m_s2) << ",\"waypoint_tolerance_m\":" << number_json(config_.waypoint_tolerance_m) << ",\"parameter_writes\":false,\"force_arm_or_disarm\":false,\"px4_xy_fusion_evidence_label\":" << (options_.px4_xy_fusion_evidence_label.empty() ? "null" : "\"" + common::json_escape(options_.px4_xy_fusion_evidence_label) + "\"") << "}}";
+    << ",\"audit\":{\"target_hardware\":\"PX4 FMUv6C.x / Pi 5 / MTF02P\",\"target_firmware\":\"PX4 1.17.0\",\"target_ros_mavros\":\"ROS 2 Jazzy / MAVROS 2.14.0\",\"confirmed_fcu_url\":\"" << common::json_escape(options_.confirmed_fcu_url) << "\",\"topics\":{\"state\":\"" << common::json_escape(options_.state_topic) << "\",\"sys_status\":\"" << common::json_escape(options_.sys_status_topic) << "\",\"battery\":\"" << common::json_escape(options_.battery_topic) << "\",\"landed\":\"" << common::json_escape(options_.extended_state_topic) << "\",\"local_pose\":\"" << common::json_escape(options_.local_pose_topic) << "\",\"local_velocity\":\"" << common::json_escape(options_.local_velocity_topic) << "\",\"estimator_status\":\"" << common::json_escape(options_.estimator_status_topic) << "\",\"range\":\"" << common::json_escape(options_.range_topic) << "\",\"optical_flow\":\"" << common::json_escape(options_.optical_flow_topic) << "\",\"setpoint\":\"" << common::json_escape(options_.setpoint_topic) << "\",\"lcp_status\":\"" << common::json_escape(options_.lcp_status_topic) << "\",\"lcp_odometry\":\"" << common::json_escape(options_.lcp_odometry_topic) << "},\"services\":{\"lcp_start_initialization\":\"" << common::json_escape(options_.lcp_start_service) << "\"},\"range_source_label\":\"" << common::json_escape(options_.range_source_label) << "\",\"optical_flow_source_label\":\"" << common::json_escape(options_.optical_flow_source_label) << "\",\"range_source_confirmed\":" << bool_json(options_.confirm_range_source) << ",\"optical_flow_source_confirmed\":" << bool_json(options_.confirm_optical_flow_source) << ",\"ignore_declared_min_range\":" << bool_json(options_.ignore_declared_min_range) << ",\"ack_range_below_declared_min\":" << bool_json(options_.ack_range_below_declared_min) << ",\"sensor_loss_grace_s\":" << number_json(config_.sensor_loss_grace_s) << ",\"lcp_status_timeout_s\":" << number_json(config_.lcp_status_timeout_s) << ",\"lcp_odometry_timeout_s\":" << number_json(config_.lcp_odometry_timeout_s) << ",\"lcp_ready_samples\":" << config_.lcp_ready_samples << ",\"lcp_unhealthy_hold_timeout_s\":" << number_json(config_.lcp_unhealthy_hold_timeout_s) << ",\"lcp_control_policy\":\"STATUS=3 during climb is ignored; after 10 s fixed-height hold, fresh STATUS=2 and odometry are required before waypoints; yaw=LCP_NWU_0_north_ROS_ENU_pi_over_2\",\"artifact_log_path\":" << optional_string_json(artifact_path) << ",\"setpoint_frame\":\"ROS ENU PositionTarget on setpoint_raw/local; MAVROS converts to MAVLink LOCAL_NED\",\"setpoint_mav_frame_confirmed_local_ned\":" << bool_json(options_.confirm_setpoint_mav_frame_local_ned) << ",\"setpoint_policy\":\"full position hold (PX/PY/PZ + YAW); Z driven by quintic trajectory\",\"waypoint_policy\":\"four 0.5 m body-relative legs: forward, left, backward, right; final target returns to initial XY before landing\",\"waypoint_frame\":\"initial locked yaw in ROS ENU local XY\",\"waypoint_leg_m\":" << number_json(config_.waypoint_leg_m) << ",\"waypoint_max_speed_m_s\":" << number_json(config_.waypoint_max_speed_m_s) << ",\"waypoint_max_accel_m_s2\":" << number_json(config_.waypoint_max_accel_m_s2) << ",\"waypoint_tolerance_m\":" << number_json(config_.waypoint_tolerance_m) << ",\"parameter_writes\":false,\"force_arm_or_disarm\":false,\"px4_xy_fusion_evidence_label\":" << (options_.px4_xy_fusion_evidence_label.empty() ? "null" : "\"" + common::json_escape(options_.px4_xy_fusion_evidence_label) + "\"") << "}}";
   return s.str();
 }
 

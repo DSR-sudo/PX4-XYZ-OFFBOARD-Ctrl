@@ -45,10 +45,10 @@ XYZ＋yaw，并通过 type mask 忽略速度、加速度和 yaw-rate。节点保
 节点在全部门禁通过后锁存一次当前 X/Y/Z 和规范化姿态：
 
 - warmup 期间持续发布原始锁存位置；
-- 起飞和定高悬停阶段固定 X/Y 和 yaw；
+- 起飞、定高悬停、航点和降落阶段固定 X/Y，并从首条设定点开始保持 LCP NWU yaw=0（正北；ROS ENU yaw=+π/2）；
 - heartbeat 确认正常 ARM 后，Z 才开始向 `z0 + relative_z` 移动；
 - 爬升阶段不因 LCP `STATUS=3` 停止；定点定高保持 10 秒后，必须等到新鲜
-  `STATUS=2` 和 `/lcp/odometry`，然后将 yaw 目标设为 0 才开始航点运动；
+  `STATUS=2` 和 `/lcp/odometry`，然后保持北向目标（ROS ENU yaw=+π/2）才开始航点运动；
 - Z 使用速度、加速度有界的五次轨迹；
 - 定高悬停完成后，按锁存航向执行四段 0.5 m 航点：前、左、后、右；
 - 航点最后回到初始 XY，再执行下降和正常解锁；

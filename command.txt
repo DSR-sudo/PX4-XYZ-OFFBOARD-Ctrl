@@ -1,63 +1,26 @@
+# Terminal 1: start MAVROS
 source /opt/ros/jazzy/setup.bash
-
 ros2 launch mavros px4.launch \
   fcu_url:=/dev/serial/by-id/usb-3D_Robotics_PX4_FMU_v5.x_0-if00:2000000 \
   gcs_url:=udp://127.0.0.1:14551@
 
-
+# Terminal 2: run the bounded 0.8 m takeoff and 0.5 m square test
 cd /home/pi/px4-test-tools
 source /opt/ros/jazzy/setup.bash
 source /home/pi/px4-test-tools/install/setup.bash
 
 ros2 run mavros_xyz_position_offboard mavros_xyz_position_node \
-  --confirmed-fcu-url /dev/serial/by-id/usb-Auterion_PX4_FMU_v6C.x_0-if00:2000000 \
+  --confirmed-fcu-url /dev/serial/by-id/usb-3D_Robotics_PX4_FMU_v5.x_0-if00:2000000 \
   --range-topic /mavros/px4flow/ground_distance \
-  --range-source-label MTF02P-downward-range \
+  --range-source-label MTF02P-ground-distance \
   --optical-flow-topic /mavros/px4flow/raw/optical_flow_rad \
   --optical-flow-source-label MTF02P-optical-flow \
   --output jsonl \
-  --artifact-dir /home/pi/px4-test-tools/artifacts \
+  --artifact-dir /home/pi/px4-test-tools/artifacts/lcp-cpp-bridge-20260727 \
   --status-period 0.5 \
   --relative-z 0.80 \
   --hold-seconds 10.0 \
-  --max-flight-seconds 30.0 \
-  --sensor-loss-grace-seconds 2.0 \
-  --ignore-declared-min-range \
-  --enable-position-setpoints \
-  --ack-native-xyz-position-control \
-  --ack-setpoint-streaming-risk \
-  --confirm-setpoint-mav-frame-local-ned \
-  --confirm-range-source \
-  --confirm-optical-flow-source \
-  --request-offboard-mode \
-  --ack-disarmed-mode-switch \
-  --execute-bounded-flight \
-  --ack-normal-arm-only \
-  --ack-propeller-configuration-safe \
-  --ack-area-and-personnel-clear \
-  --ack-independent-emergency-stop-ready \
-  --ack-valid-flight-battery-installed \
-  --ack-direct-px4-xy-fusion-evidence \
-  --ack-range-below-declared-min \
-  --px4-xy-fusion-evidence-label "MTF02P-flow+range-EKF2-fused-20260720"
-
-
-  cd /home/pi/px4-test-tools
-source /opt/ros/jazzy/setup.bash
-source install/setup.bash
-
-ros2 run mavros_xyz_position_offboard mavros_xyz_position_node \
-  --confirmed-fcu-url /dev/serial/by-id/usb-Auterion_PX4_FMU_v6C.x_0-if00:2000000 \
-  --range-topic /mavros/px4flow/ground_distance \
-  --range-source-label MTF02P-downward-range \
-  --optical-flow-topic /mavros/px4flow/raw/optical_flow_rad \
-  --optical-flow-source-label MTF02P-optical-flow \
-  --output jsonl \
-  --artifact-dir /home/pi/px4-test-tools/artifacts \
-  --status-period 0.5 \
-  --relative-z 0.80 \
-  --hold-seconds 10.0 \
-  --max-flight-seconds 60.0 \
+  --max-flight-seconds 90.0 \
   --waypoint-leg 0.50 \
   --waypoint-max-speed 0.25 \
   --waypoint-max-accel 0.50 \
@@ -80,4 +43,4 @@ ros2 run mavros_xyz_position_offboard mavros_xyz_position_node \
   --ack-valid-flight-battery-installed \
   --ack-direct-px4-xy-fusion-evidence \
   --ack-range-below-declared-min \
-  --px4-xy-fusion-evidence-label "MTF02P-flow+range-EKF2-fused-20260720"
+  --px4-xy-fusion-evidence-label "PX4-20260727-listener-estimator_aid_src_optical_flow-fused-vehicle_local_position-xy_valid"

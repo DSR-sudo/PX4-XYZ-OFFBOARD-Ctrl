@@ -1,6 +1,7 @@
 source /opt/ros/jazzy/setup.bash
+
 ros2 launch mavros px4.launch \
-  fcu_url:=/dev/serial/by-id/usb-Auterion_PX4_FMU_v6C.x_0-if00:2000000 \
+  fcu_url:=/dev/serial/by-id/usb-3D_Robotics_PX4_FMU_v5.x_0-if00:2000000 \
   gcs_url:=udp://127.0.0.1:14551@
 
 

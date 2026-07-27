@@ -1,6 +1,6 @@
 # LCP 启动 API 与 Offboard 接入
 
-本文定义 `LSLIDARN10P` 驱动侧 LCP 的启动接口和 Offboard 使用规则。LCP 使用完整一圈 N10P 扫描建系，输出独立的 `lcp_map` 局部位姿；当前版本**不会**直接向 PX4/MAVROS 注入外部里程计。
+本文定义 `LSLIDARN10P` 驱动侧 LCP 的启动接口和 Offboard 使用规则。LCP 使用完整一圈 N10P 扫描建系，并在人工声明机头正北时输出独立的 `lcp_nwu` 局部位姿；LCP 本身**不会**直接向 PX4/MAVROS 注入外部里程计。
 
 ## 前置条件
 
@@ -33,12 +33,13 @@ ros2 service call /lcp/start_initialization std_srvs/srv/Trigger '{}'
 | 名称 | 类型 | 发布条件 | 含义 |
 | --- | --- | --- | --- |
 | `/lcp/status` | `std_msgs/msg/UInt8` | 每圈完整扫描 | LCP 状态值 |
-| `/lcp/odometry` | `nav_msgs/msg/Odometry` | 仅 `STATUS=2` | `lcp_map` 中的 XY 与 yaw 四元数 |
-| `/lcp/yaw` | `std_msgs/msg/Float32` | 仅 `STATUS=2` | yaw 标量，单位 rad |
+| `/lcp/odometry` | `nav_msgs/msg/Odometry` | 仅 `STATUS=2` | `lcp_nwu` 中的 XY 与 yaw 四元数 |
+| `/lcp/yaw` | `std_msgs/msg/Float32` | 仅 `STATUS=2` | 相对人工声明北方的 yaw，单位 rad |
 | `/lcp/debug` | `lslidar_msgs/msg/LcpDebug` | 仅 `STATUS=2` | 机体前后左右到已锁定矩形边界的绝对距离，以及锁定地图 XY 尺寸 |
 
-`/lcp/odometry` 使用 `header.frame_id=lcp_map`，`child_frame_id` 为雷达配置中的 `frame_id`。`/lcp/yaw` 与 Odometry 四元数表达同一个航向，仅作为方便读取的标量接口。
-`/lcp/debug` 的 `front/rear/left/right_distance_m` 以当前雷达/机体方向为准（+X/+Y/-X/-Y），并通过与已锁定地图边界求交得到正距离；它不把建系原点的 `(0,0)` 当作墙距。`map_size_x_m/map_size_y_m` 是锁定矩形在 `lcp_map` 中的尺寸。
+默认 `lcp_initial_heading_is_north=true`。在调用启动服务前，必须让**雷达 +X 与机体正前方对齐**，并把机体正前方实际摆向北方。LCP 在锁图的首帧将该方向声明为北：`header.frame_id=lcp_nwu`，`+X=北`、`+Y=西/左`、`+Z=上`，建系点为 `(0,0)`，`/lcp/yaw=0 rad`。此北向来自人工放置，不是磁力计或卫星测得的方位；移动设备、雷达安装偏角或摆放误差会等量带入所有后续 XY/yaw。
+
+`/lcp/debug` 的 `front/rear/left/right_distance_m` 以当前雷达/机体方向为准（+X/+Y/-X/-Y），并通过与已锁定地图边界求交得到正距离；它不把建系原点的 `(0,0)` 当作墙距。`map_size_x_m/map_size_y_m` 是内部锁定矩形的边长，不因公开的北向坐标旋转而重新命名。
 
 ## STATUS 状态机
 
@@ -60,7 +61,7 @@ ros2 service call /lcp/start_initialization std_srvs/srv/Trigger '{}'
 5. 飞行中若收到 `STATUS=3`，或 status/odometry 超时：冻结航点推进，持续发布当前 MAVROS 本地位置的 XY 固定点与当前高度目标。
 6. 连续恢复到新鲜 `STATUS=2` 后，才恢复原飞行阶段；若不健康超过 Offboard 配置的等待上限，应转入安全降落。
 
-Offboard 不应把 `/lcp/odometry` 的数值直接写入 `/mavros/setpoint_raw/local`，因为 `lcp_map` 与 PX4 当前 local frame 尚未建立变换。当前阶段，LCP 用作建系和健康门禁；后续若要替换磁罗盘，需要单独实现 `LCP Odometry -> MAVROS ODOMETRY -> PX4 EKF2` 融合链路。
+Offboard 不应把 `/lcp/odometry` 的数值直接写入 `/mavros/setpoint_raw/local`。`lcp_nwu` 使用北/西/上，而 MAVROS ROS 话题使用东/北/上；二者必须先做完整 XY+yaw 变换。当前阶段，LCP 用作建系和健康门禁；后续若要替换磁罗盘，需要单独实现 `LCP Odometry -> MAVROS ODOMETRY -> PX4 EKF2` 融合链路。
 
 ## LCP 外部 yaw 台架试验（2026-07-25）
 

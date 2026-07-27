@@ -130,6 +130,8 @@ ParsedOptions parse_options(const std::vector<std::string> & argv)
       else if (option == "--lcp-start-service") {o.lcp_start_service = value;}
       else if (option == "--lcp-status-topic") {o.lcp_status_topic = value;}
       else if (option == "--lcp-odometry-topic") {o.lcp_odometry_topic = value;}
+      else if (option == "--lcp-vision-pose-topic") {o.lcp_vision_pose_topic = value;}
+      else if (option == "--lcp-vision-input-frame") {o.lcp_vision_input_frame = value;}
       else if (option == "--output") {o.output = value;}
       else if (option == "--artifact-dir") {o.artifact_dir = value;}
       else if (option == "--px4-xy-fusion-evidence-label") {o.px4_xy_fusion_evidence_label = value;}
@@ -169,6 +171,9 @@ ParsedOptions parse_options(const std::vector<std::string> & argv)
       else if (option == "--lcp-status-timeout") {c.lcp_status_timeout_s = number;}
       else if (option == "--lcp-odometry-timeout") {c.lcp_odometry_timeout_s = number;}
       else if (option == "--lcp-unhealthy-hold-timeout") {c.lcp_unhealthy_hold_timeout_s = number;}
+      else if (option == "--lcp-vision-xy-stddev") {o.lcp_vision_xy_stddev_m = number;}
+      else if (option == "--lcp-vision-yaw-stddev") {o.lcp_vision_yaw_stddev_rad = number;}
+      else if (option == "--lcp-vision-max-status-age") {o.lcp_vision_max_status_age_s = number;}
       else {throw std::invalid_argument("unknown option: " + option);}
     };
 
@@ -176,7 +181,8 @@ ParsedOptions parse_options(const std::vector<std::string> & argv)
     "--confirmed-fcu-url", "--range-topic", "--range-source-label", "--optical-flow-topic", "--optical-flow-source-label",
     "--state-topic", "--sys-status-topic", "--battery-topic", "--extended-state-topic", "--local-pose-topic",
     "--local-velocity-topic", "--estimator-status-topic", "--setpoint-topic", "--lcp-start-service", "--lcp-status-topic",
-    "--lcp-odometry-topic", "--output", "--artifact-dir", "--px4-xy-fusion-evidence-label"};
+    "--lcp-odometry-topic", "--lcp-vision-pose-topic", "--lcp-vision-input-frame", "--output", "--artifact-dir",
+    "--px4-xy-fusion-evidence-label"};
   const std::vector<std::string> number_options{
     "--status-period", "--publish-rate", "--setpoint-warmup", "--relative-z", "--max-z-setpoint-rate", "--max-z-setpoint-accel",
     "--waypoint-leg", "--waypoint-max-speed", "--waypoint-max-accel", "--waypoint-tolerance", "--hold-seconds",
@@ -184,7 +190,8 @@ ParsedOptions parse_options(const std::vector<std::string> & argv)
     "--range-boundary-tolerance", "--max-preflight-horizontal-speed", "--max-preflight-vertical-speed", "--max-flight-horizontal-speed",
     "--max-flight-vertical-speed", "--max-flight-horizontal-drift", "--target-tolerance", "--touchdown-z-tolerance",
     "--flow-effective-min-height", "--mode-request-interval", "--service-timeout", "--sensor-loss-grace-seconds",
-    "--lcp-status-timeout", "--lcp-odometry-timeout", "--lcp-unhealthy-hold-timeout"};
+    "--lcp-status-timeout", "--lcp-odometry-timeout", "--lcp-unhealthy-hold-timeout", "--lcp-vision-xy-stddev",
+    "--lcp-vision-yaw-stddev", "--lcp-vision-max-status-age"};
 
   for (std::size_t i = 1; i < argv.size(); ++i) {
     std::string option = argv[i];
@@ -203,6 +210,9 @@ ParsedOptions parse_options(const std::vector<std::string> & argv)
     } else if (option == "--ignore-declared-min-range") {
       if (assigned) {throw std::invalid_argument(option + " does not take a value");}
       c.ignore_declared_min_range = true; o.ignore_declared_min_range = true;
+    } else if (option == "--disable-lcp-vision-bridge") {
+      if (assigned) {throw std::invalid_argument(option + " does not take a value");}
+      o.lcp_vision_bridge_enabled = false;
     } else if (std::find(string_options.begin(), string_options.end(), option) != string_options.end()) {
       set_string(option, require_value(argv, i, option, assigned));
     } else if (option == "--min-optical-flow-quality" || option == "--flow-effective-min-quality" || option == "--lcp-ready-samples") {
@@ -224,8 +234,9 @@ ParsedOptions parse_options(const std::vector<std::string> & argv)
   if (blank(o.range_source_label) || blank(o.optical_flow_source_label)) {
     throw std::invalid_argument("range and optical-flow source labels must be non-empty");
   }
-  if (blank(o.lcp_start_service) || blank(o.lcp_status_topic) || blank(o.lcp_odometry_topic)) {
-    throw std::invalid_argument("LCP service and topic names must be non-empty");
+  if (blank(o.lcp_start_service) || blank(o.lcp_status_topic) || blank(o.lcp_odometry_topic) ||
+      blank(o.lcp_vision_pose_topic) || blank(o.lcp_vision_input_frame)) {
+    throw std::invalid_argument("LCP service, topic, frame, and bridge topic names must be non-empty");
   }
   if (o.output != "summary" && o.output != "jsonl") {
     throw std::invalid_argument("--output must be summary or jsonl");
@@ -247,6 +258,10 @@ ParsedOptions parse_options(const std::vector<std::string> & argv)
   }
   if (o.status_period <= 0.0 || o.mode_request_interval <= 0.0 || o.service_timeout <= 0.0) {
     throw std::invalid_argument("status-period, mode-request-interval, and service-timeout must be positive");
+  }
+  if (o.lcp_vision_xy_stddev_m <= 0.0 || o.lcp_vision_yaw_stddev_rad <= 0.0 ||
+      o.lcp_vision_max_status_age_s <= 0.0) {
+    throw std::invalid_argument("LCP vision standard deviations and status age must be positive");
   }
   c.range_source_confirmed = o.confirm_range_source;
   c.optical_flow_source_confirmed = o.confirm_optical_flow_source;

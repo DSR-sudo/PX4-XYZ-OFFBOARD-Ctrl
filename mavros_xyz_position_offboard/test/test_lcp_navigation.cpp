@@ -6,6 +6,7 @@
 
 #include "mavros_xyz_position_offboard/common/cli.hpp"
 #include "mavros_xyz_position_offboard/common/types.hpp"
+#include "mavros_xyz_position_offboard/bridge/lcp_vision_bridge.hpp"
 #include "mavros_xyz_position_offboard/initialization/initialization.hpp"
 #include "mavros_xyz_position_offboard/navigation/navigation.hpp"
 #include "mavros_xyz_position_offboard/offboard/offboard.hpp"
@@ -95,6 +96,27 @@ TEST(NavigationTest, FreezeAndYawZeroDoNotUseLcpCoordinates)
   EXPECT_NEAR(navigation.yaw_rad(), 0.0, 1e-9);
 }
 
+/// 验证人工北向 lcp_nwu 同时正确转换 XY、yaw 和协方差到 MAVROS 的 ROS ENU。
+TEST(LcpVisionBridgeTest, ConvertsNwuToEnuWithConservativeCovariance)
+{
+  nav_msgs::msg::Odometry source;
+  source.header.frame_id = "lcp_nwu";
+  source.pose.pose.position.x = 2.0;   // north
+  source.pose.pose.position.y = 3.0;   // west
+  source.pose.pose.position.z = 0.0;
+  source.pose.pose.orientation.w = 1.0;  // north-facing yaw=0 in lcp_nwu
+  const auto output = mavros_xyz_position_offboard::bridge::LcpVisionBridge::nwu_to_enu(source, 0.20, 0.20);
+  EXPECT_EQ(output.header.frame_id, "lcp_enu");
+  EXPECT_DOUBLE_EQ(output.pose.pose.position.x, -3.0);  // east
+  EXPECT_DOUBLE_EQ(output.pose.pose.position.y, 2.0);   // north
+  EXPECT_NEAR(output.pose.pose.orientation.z, std::sqrt(0.5), 1e-12);
+  EXPECT_NEAR(output.pose.pose.orientation.w, std::sqrt(0.5), 1e-12);
+  EXPECT_DOUBLE_EQ(output.pose.covariance[0], 0.04);
+  EXPECT_DOUBLE_EQ(output.pose.covariance[7], 0.04);
+  EXPECT_DOUBLE_EQ(output.pose.covariance[14], 10000.0);
+  EXPECT_DOUBLE_EQ(output.pose.covariance[35], 0.04);
+}
+
 /// 验证五次轨迹的速度和加速度不超过配置上限。
 TEST(NavigationTest, QuinticSetpointsObserveConfiguredBounds)
 {
@@ -149,6 +171,8 @@ TEST(CliTest, PreservesApplicationDefaultsAndRejectsPartialOptIn)
   EXPECT_DOUBLE_EQ(parsed.config.max_z_setpoint_rate_m_s, 0.20);
   EXPECT_DOUBLE_EQ(parsed.config.max_z_setpoint_accel_m_s2, 0.40);
   EXPECT_DOUBLE_EQ(parsed.config.max_flight_horizontal_speed_m_s, 0.50);
+  EXPECT_TRUE(parsed.options.lcp_vision_bridge_enabled);
+  EXPECT_EQ(parsed.options.lcp_vision_input_frame, "lcp_nwu");
   EXPECT_FALSE(mavros_xyz_position_offboard::common::setpoint_enabled(parsed.options));
   auto incomplete = basic;
   incomplete.emplace_back("--enable-position-setpoints");

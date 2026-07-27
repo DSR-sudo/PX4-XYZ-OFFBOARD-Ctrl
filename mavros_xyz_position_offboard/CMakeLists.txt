@@ -20,6 +20,7 @@ add_library(${PROJECT_NAME}_core
   src/common/artifact_log.cpp
   src/common/cli.cpp
   src/common/types.cpp
+  src/bridge/lcp_vision_bridge.cpp
   src/initialization/initialization.cpp
   src/navigation/navigation.cpp
   src/offboard/offboard.cpp)

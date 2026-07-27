@@ -40,7 +40,7 @@ std::string optional_string_json(const std::optional<std::string> & value)
 /// 创建唯一节点、四层协作对象、按权限启用的 MAVROS 资源和控制定时器。
 MavrosNativeXYZNode::MavrosNativeXYZNode(const common::AppOptions & options, const common::SafetyConfig & config)
 : Node("mavros_native_xyz_position"), options_(options), config_(config), initialization_(*this, options_, config_),
-  navigation_(config_), artifact_log_(options_.artifact_dir, options_.output == "jsonl"),
+  navigation_(config_), lcp_vision_bridge_(*this, options_), artifact_log_(options_.artifact_dir, options_.output == "jsonl"),
   publish_enabled_(common::setpoint_enabled(options_)), mode_enabled_(common::mode_enabled(options_)),
   arming_enabled_(common::arming_enabled(options_))
 {
@@ -101,6 +101,9 @@ void MavrosNativeXYZNode::latch_current_pose()
 {
   const auto & telemetry = initialization_.telemetry();
   navigation_.latch(telemetry.local_x_m, telemetry.local_y_m, telemetry.local_z_m, telemetry.orientation);
+  // The flight test requires a fixed north-facing heading from the first
+  // streamed setpoint through climb, waypoints, landing, and disarm.
+  navigation_.set_yaw_rad(0.0);
 }
 
 /// 由 OFFBOARD 独占推进轨迹并发布 PositionTarget。

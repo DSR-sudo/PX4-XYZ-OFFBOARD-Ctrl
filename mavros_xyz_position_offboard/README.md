@@ -12,6 +12,7 @@ ROS 2 Jazzy、MAVROS 2.14.0 和 MTF02P 光流＋测距。它不修改、导入�
 
 `mavros_xyz_position_node` 是 C++17 `ament_cmake` 可执行文件，默认只创建订阅并输出缩进清晰的终端摘要：
 
+- 自动将 LCP 的 `lcp_nwu` XY+yaw 桥接到 `/mavros/vision_pose/pose_cov`：固定转换为 ROS ENU，且仅接受新鲜 `STATUS=2`；
 - 不创建 `/mavros/setpoint_raw/local` publisher；
 - 不创建 `/mavros/set_mode` client；
 - 不创建 `/mavros/cmd/arming` client；
@@ -29,6 +30,10 @@ range、optical-flow 和 FCU URL 都必须作为参数提供，节点不会把�
 或传感器身份套到当前硬件。当前只读核验看到的话题是
 `/mavros/px4flow/ground_distance` 和
 `/mavros/px4flow/raw/optical_flow_rad`，但更换 launch/plugin 配置后必须重新核验。
+
+LCP 桥接默认启用，使用 XY/yaw 标准差 `0.20`、`lcp_nwu -> lcp_enu` 变换。它不读取
+PX4 当前 yaw，也不设定 PX4 参数。仅为隔离诊断可加
+`--disable-lcp-vision-bridge`；常规运行不应添加该选项。Python 旧桥接不能与本节点同时运行。
 
 ## 原生位置控制
 

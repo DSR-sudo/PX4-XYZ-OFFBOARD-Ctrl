@@ -86,20 +86,23 @@ PX4 磁力计或用于飞行**。可用于 PX4 EKF2 的候选量只有 `/lcp/odo
 
 ### 已验证的传输链路与当前限制
 
-临时地面桥接脚本为 `~/px4-test-tools/lcp_yaw_vision_bridge.py`：
+LCP 到 MAVROS 的桥接已内置于 C++ ROS 2 包
+`mavros_xyz_position_offboard`。启动 `mavros_xyz_position_node` 时会自动创建；默认只
+发布外部视觉消息，不创建设定点 publisher、不会请求 Offboard 或解锁。旧
+`~/px4-test-tools/lcp_yaw_vision_bridge.py` 保留为迁移前参考，不能与 C++ 节点同时运行。
 
 ```text
 /lcp/odometry (STATUS=2)
-  -> lcp_yaw_vision_bridge.py
+  -> mavros_xyz_position_node 内置 LcpVisionBridge
   -> /mavros/vision_pose/pose_cov
   -> MAVLink VISION_POSITION_ESTIMATE
   -> PX4 vehicle_visual_odometry
 ```
 
-该桥只在飞控 `connected`、未解锁且 `ON_GROUND` 时标定一次
-`PX4 yaw - LCP yaw` 固定偏置，用来消除 LCP 地图任意 0° 与 PX4 当前局部 yaw
-之间的跳变。之后只发布对齐后的 yaw：XY、Z、roll、pitch 的方差均设为 `10000`，
-yaw 标准差暂设为 `0.20 rad`。它不会设置 PX4 参数。
+该桥仅接受 `header.frame_id=lcp_nwu` 和新鲜 `STATUS=2`，固定做完整
+`NWU -> ENU` 变换：`east=-west`、`north=north`、`yaw_enu=pi/2+yaw_nwu`。XY/yaw
+标准差默认 `0.20`，z/roll/pitch 方差 `10000`；它不读取 PX4 当前 yaw，也不会设置
+PX4 参数。
 
 台架中 PX4 已接收到 `vehicle_visual_odometry`，其 yaw 方差为 `0.0400`，采样到
 飞控接收延迟约 `44 ms`。但当时的 PX4 基线参数为：

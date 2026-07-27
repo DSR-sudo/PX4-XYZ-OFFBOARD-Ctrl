@@ -14,6 +14,7 @@
 
 #include "mavros_xyz_position_offboard/common/artifact_log.hpp"
 #include "mavros_xyz_position_offboard/common/cli.hpp"
+#include "mavros_xyz_position_offboard/bridge/lcp_vision_bridge.hpp"
 #include "mavros_xyz_position_offboard/initialization/initialization.hpp"
 #include "mavros_xyz_position_offboard/navigation/navigation.hpp"
 
@@ -102,6 +103,7 @@ private:
   const common::SafetyConfig config_;
   initialization::Initialization initialization_;
   navigation::Navigation navigation_;
+  bridge::LcpVisionBridge lcp_vision_bridge_;
   common::ArtifactLogger artifact_log_;
   bool publish_enabled_{false};
   bool mode_enabled_{false};

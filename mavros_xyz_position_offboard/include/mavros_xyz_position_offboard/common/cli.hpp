@@ -26,12 +26,18 @@ struct AppOptions
   std::string lcp_start_service{"/lcp/start_initialization"};
   std::string lcp_status_topic{"/lcp/status"};
   std::string lcp_odometry_topic{"/lcp/odometry"};
+  std::string lcp_vision_pose_topic{"/mavros/vision_pose/pose_cov"};
+  std::string lcp_vision_input_frame{"lcp_nwu"};
   std::string output{"summary"};
   std::string artifact_dir{"artifacts"};
   std::string px4_xy_fusion_evidence_label;
   double status_period{0.5};
   double mode_request_interval{2.0};
   double service_timeout{3.0};
+  double lcp_vision_xy_stddev_m{0.20};
+  double lcp_vision_yaw_stddev_rad{0.20};
+  double lcp_vision_max_status_age_s{0.35};
+  bool lcp_vision_bridge_enabled{true};
   bool enable_position_setpoints{false};
   bool ack_native_xyz_position_control{false};
   bool ack_setpoint_streaming_risk{false};

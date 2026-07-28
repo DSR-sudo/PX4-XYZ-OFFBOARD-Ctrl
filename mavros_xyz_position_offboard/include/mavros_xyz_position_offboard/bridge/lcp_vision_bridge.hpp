@@ -27,8 +27,11 @@ public:
   static geometry_msgs::msg::PoseWithCovarianceStamped nwu_to_enu(
     const nav_msgs::msg::Odometry & source, double xy_stddev_m, double yaw_stddev_rad);
 
+  /// 指示桥接 publisher 和订阅是否按配置启用。
   bool enabled() const {return enabled_;}
+  /// 返回启动后成功发布到 MAVROS 的外部视觉消息数量。
   std::uint64_t published_count() const {return published_count_;}
+  /// 返回最近一次位姿未发布的原因；最近一次成功后为空。
   const std::string & last_reject_reason() const {return last_reject_reason_;}
 
 private:
@@ -38,6 +41,7 @@ private:
   void odometry_callback(const nav_msgs::msg::Odometry::SharedPtr message);
   /// 记录拒绝原因；相同原因只记录一次，防止 10 Hz 日志刷屏。
   void reject(const std::string & reason);
+  /// 返回用于 LCP 状态新鲜度判断的 steady_clock 秒数。
   static double monotonic_now();
 
   rclcpp::Node & node_;

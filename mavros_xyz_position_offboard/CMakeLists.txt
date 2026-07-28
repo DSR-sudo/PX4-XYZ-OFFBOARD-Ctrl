@@ -15,12 +15,16 @@ find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(mavros_msgs REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(JSONCPP REQUIRED IMPORTED_TARGET jsoncpp)
 
 add_library(${PROJECT_NAME}_core
   src/common/artifact_log.cpp
   src/common/cli.cpp
   src/common/types.cpp
   src/bridge/lcp_vision_bridge.cpp
+  src/application/application_node.cpp
+  src/communication/ground_station_link.cpp
   src/initialization/initialization.cpp
   src/navigation/navigation.cpp
   src/offboard/offboard.cpp)
@@ -29,6 +33,7 @@ target_include_directories(${PROJECT_NAME}_core PUBLIC
   $<INSTALL_INTERFACE:include>)
 ament_target_dependencies(${PROJECT_NAME}_core
   rclcpp geometry_msgs nav_msgs sensor_msgs std_msgs std_srvs mavros_msgs)
+target_link_libraries(${PROJECT_NAME}_core PkgConfig::JSONCPP)
 target_compile_options(${PROJECT_NAME}_core PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(mavros_xyz_position_node src/main.cpp)
@@ -42,6 +47,7 @@ install(TARGETS ${PROJECT_NAME}_core mavros_xyz_position_node
   RUNTIME DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)
 install(FILES package.xml README.md DESTINATION share/${PROJECT_NAME})
+install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
@@ -49,6 +55,7 @@ if(BUILD_TESTING)
   if(TARGET test_lcp_navigation)
     target_link_libraries(test_lcp_navigation ${PROJECT_NAME}_core)
     ament_target_dependencies(test_lcp_navigation rclcpp)
+    target_compile_definitions(test_lcp_navigation PRIVATE MAVROS_XYZ_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     target_compile_options(test_lcp_navigation PRIVATE -Wall -Wextra -Wpedantic)
   endif()
 endif()

@@ -1,121 +1,85 @@
 # C++17 ROS 2 包操作记录
 
-本文记录 `mavros_xyz_position_offboard` 从 Python 迁移为 C++17 `ament_cmake` 包后的日常操作、验证方式和职责边界。
-
 ## 目录与职责
 
 | 路径 | 职责 |
 | --- | --- |
-| `include/.../common`、`src/common` | 配置、CLI、遥测值类型、数值函数与 JSONL/摘要日志。 |
-| `include/.../initialization`、`src/initialization` | MAVROS/LCP 订阅、测距保护、预检和飞行期门禁、LCP 初始化客户端。 |
-| `include/.../navigation`、`src/navigation` | 初始位姿锁存、受速度/加速度约束的五次 XYZ 轨迹、航点和保持策略。 |
-| `include/.../offboard`、`src/offboard` | `PositionTarget` 发布、模式/解锁异步请求、飞行状态机、LCP-hold 与安全降落。 |
-| `src/main.cpp` | 剥离 ROS 参数、解析应用 CLI，并通过 `SingleThreadedExecutor` 启动唯一节点。 |
-| `test/test_lcp_navigation.cpp` | LCP 门禁、轨迹约束、`PositionTarget` 映射和 CLI 门禁测试。 |
+| `application/` | 唯一 `ApplicationNode`，组装各层并执行固定 20 Hz 单线程循环。 |
+| `initialization/` | ROS 遥测、预检、飞行健康快照和 LCP 初始化服务。 |
+| `communication/` | JSON V1 DTO/codec、UDP socket、白名单、去重和周期状态。 |
+| `navigation/` | 无 ROS 的任务状态机和 `TrajectoryPlanner`。 |
+| `offboard/` | MAVROS PositionTarget、SetMode 和 CommandBool 执行适配器。 |
+| `bridge/` | LCP NWU 到 MAVROS ENU vision pose。 |
+| `common/` | CLI、安全配置、值类型和 artifact 日志。 |
+| `config/udp_ground_station.yaml` | 固定端点、白名单、状态周期和目标安全包络。 |
 
-`MavrosNativeXYZNode` 是唯一 ROS 节点，节点名为 `mavros_native_xyz_position`。Navigation 与 OFFBOARD 之间只传递内部 C++ `PositionSetpoint`，不会创建内部 ROS 话题。
+唯一节点名保持 `mavros_native_xyz_position`，唯一执行器保持
+`SingleThreadedExecutor`。模块间不创建内部 ROS 话题。
 
-## 构建
-
-在工作空间根目录执行：
+## 构建、测试与安装入口
 
 ```bash
 cd /home/pi/px4-test-tools
 source /opt/ros/jazzy/setup.bash
 colcon build --packages-select mavros_xyz_position_offboard
+colcon test --packages-select mavros_xyz_position_offboard
+colcon test-result --all --verbose
 source install/setup.bash
-```
-
-构建完成后，可确认安装入口：
-
-```bash
 ros2 run mavros_xyz_position_offboard mavros_xyz_position_node --help
 ```
 
-## 单元测试
+本包没有 `lslidar_msgs` 依赖，不需要 LSLIDAR overlay。测试覆盖 LCP 初始化基线、NWU/ENU
+转换、五次轨迹约束、全部 V1 输入消息、白名单/版本/去重/乱序/畸形包、三份配置一致性、
+OFFBOARD/ARM 确认、ACK hold/恢复、PositionTarget mask、OFFBOARD 结构边界和 CLI 门禁。
 
-```bash
-cd /home/pi/px4-test-tools
-source /opt/ros/jazzy/setup.bash
-colcon test --packages-select mavros_xyz_position_offboard
-colcon test-result --verbose
+## 控制循环
+
+每个 wall timer tick 的顺序不可调整：
+
+1. `Initialization::poll_lcp_start`、`Offboard::poll`、`GroundStationLink::poll`；
+2. `Initialization::health_snapshot` 复制本周期不可变遥测与健康结论；
+3. `Navigation::update` 生成阶段、设定点、模式/ARM 意图和业务输出；
+4. `Offboard::apply` 发布设定点并按限频规则提交异步服务请求；
+5. `GroundStationLink` 发送业务消息以及周期 XYZ/电池状态；
+6. 写入 `px4.mavros_native_xyz.v1` 状态日志。
+
+日志新增 `navigation_batch.waypoint_index`、`ack_age_s`、
+`communication_rejection` 和 `navigation_rejections`。服务 response 不代表飞控已经执行；
+Navigation 只认下一条 MAVROS state 中的实际 mode/armed 值。
+
+## UDP 现场检查
+
+安装后的参数文件位于：
+
+```text
+share/mavros_xyz_position_offboard/config/udp_ground_station.yaml
 ```
 
-当前测试覆盖：
+修改参数后必须重启节点。确认地面站数据报源地址和源端口都匹配白名单；`seq` 只需唯一，
+无需按到达顺序递增。批次发送顺序建议为三份 `navigation_and_point`、三份
+`navigation_nfz`、三份 `navigation_plan`、一个 `navigation_fly_plan_send_ok`，飞行期间
+至少 2 Hz 发送 `ACK`。
 
-- LCP 服务初始化之后必须收到新的 `STATUS=2` 和里程计样本；
-- LCP 失败或遥测过期不能通过门禁；
-- LCP-hold 使用本地位置冻结；LCP NWU yaw=0（正北）在 ROS ENU 设定点中使用 yaw=+π/2，不使用 LCP 坐标作为航点目标；
-- XYZ 五次轨迹不超过配置速度和加速度；
-- `PositionTarget` 使用 `FRAME_LOCAL_NED`，忽略速度、加速度和 yaw-rate；
-- 默认 CLI 约束保持不变，危险控制的残缺确认组合会被拒绝。
+节点不会对输入数据报返回逐包 ACK。用抓包检查时，只应看到阶段业务消息和按
+`udp.status_period_s` 发送的 `xyz_state`/`battery_state`。
 
-## 只读监视运行
+## 控制授权和现场边界
 
-以下命令只创建订阅、输出状态和写入 artifact 日志；不会创建设定点发布器、模式客户端或解锁客户端：
+CLI 三层确认保持不变：
 
-```bash
-ros2 run mavros_xyz_position_offboard mavros_xyz_position_node \
-  --confirmed-fcu-url udp://127.0.0.1:14540 \
-  --range-topic /mavros/px4flow/ground_distance \
-  --range-source-label downward_range_confirmed \
-  --optical-flow-topic /mavros/px4flow/raw/optical_flow_rad \
-  --optical-flow-source-label optical_flow_confirmed
-```
+1. PositionTarget publisher 的原生 XYZ、streaming 风险、LOCAL_NED 和传感器来源确认；
+2. SetMode client 的 OFFBOARD 和 disarmed mode switch 确认；
+3. CommandBool client 的有界飞行、普通 ARM、桨叶/场地/急停/电池和 PX4 XY 融合证据确认。
 
-日志默认写入当前工作目录的 `artifacts/`。使用 `--output jsonl` 可切换为每行一个严格 JSON 记录；使用 `--artifact-dir DIR` 可改变输出目录。
+缺少任何同层配套参数会在节点创建前拒绝。连接实机前仍需重新核对 FCU URL、Range
+方向、光流来源、LCP 状态、地面站固定端点、空间隔离及 PX4 原生融合证据。本文记录的
+构建/单元测试不等同于带桨飞行验收。
 
-## 控制授权顺序
+## 故障行为
 
-控制能力由 CLI 显式确认逐级开启，缺少任一确认参数会在创建 ROS 资源前以错误退出。
-
-1. 发布 `PositionTarget`：
-   `--enable-position-setpoints`、`--ack-native-xyz-position-control`、
-   `--ack-setpoint-streaming-risk`、`--confirm-setpoint-mav-frame-local-ned`、
-   `--confirm-range-source`、`--confirm-optical-flow-source`。
-2. 请求 `OFFBOARD`：第一组基础上增加
-   `--request-offboard-mode`、`--ack-disarmed-mode-switch`。
-3. 有界飞行与普通解锁：第二组基础上增加
-   `--execute-bounded-flight`、`--ack-normal-arm-only`、
-   `--ack-propeller-configuration-safe`、`--ack-area-and-personnel-clear`、
-   `--ack-independent-emergency-stop-ready`、
-   `--ack-valid-flight-battery-installed`、
-   `--ack-direct-px4-xy-fusion-evidence`，并提供
-   `--px4-xy-fusion-evidence-label LABEL`。
-
-服务应答本身不推进飞行状态机。节点仅在之后的 `/mavros/state` 心跳确实报告 `OFFBOARD` 或 `armed=true` 时继续执行。
-
-## 运行动作与安全策略
-
-- wall timer 默认以 20 Hz 工作；`--publish-rate` 仅允许 10–50 Hz。
-- LCP 初始化由 Initialization 发起。初始化服务接受后，仍须有足量的新鲜 `STATUS=2` 和里程计样本才能解锁预检门禁。
-- OFFBOARD 是唯一发布 `/mavros/setpoint_raw/local`、请求 `/mavros/set_mode` 和 `/mavros/cmd/arming` 的组件。
-- 五次轨迹约束 Z 与 XY 的设定点速度/加速度；到达容差后才转换航点。
-- 航点阶段 LCP 失效会进入 `lcp_hold`，冻结本地设定点；超过 `--lcp-unhealthy-hold-timeout` 后进入安全降落。
-- 飞行期出现阻断门禁、模式丢失或最大飞行时间超限时，节点保持 XY、下降至锁存 Z 基线，并仅使用正常的 `AUTO.LAND`/上锁路径。
-
-## 常用参数校验
-
-可用下列命令验证参数拒绝路径，不会创建节点：
-
-```bash
-ros2 run mavros_xyz_position_offboard mavros_xyz_position_node \
-  --confirmed-fcu-url udp://127.0.0.1:14540 \
-  --range-topic /range --range-source-label downward \
-  --optical-flow-topic /flow --optical-flow-source-label flow \
-  --publish-rate 5
-```
-
-该命令应以错误退出，因为设定点发布频率必须位于 10–50 Hz。单独提供任何危险控制确认（例如仅提供 `--enable-position-setpoints`）同样会被拒绝并列出缺失确认项。
-
-## 迁移后验证记录
-
-在 ROS 2 Jazzy 与 MAVROS 2.14 环境中已执行：
-
-```bash
-colcon build --packages-select mavros_xyz_position_offboard
-colcon test --packages-select mavros_xyz_position_offboard
-ros2 run mavros_xyz_position_offboard mavros_xyz_position_node --help
-```
-
-构建和 7 个 gtest 均通过。此验证未连接真实飞控；连接飞控前仍应按现场飞行安全流程重新确认传感器来源、飞控 URL、空间隔离和 PX4 原生融合证据。
+- ACK 年龄超过 2 秒：`link_hold`，冻结实测 XY/命令 Z；ACK 恢复后连续重规划。
+- LCP 失效：`lcp_hold`；恢复后继续原目标，超时请求安全降落。
+- 飞行健康门禁持续失败超过 grace、OFFBOARD 丢失或最大飞行时间超限：安全降落；模式
+  丢失不抢回 OFFBOARD。
+- 正常任务完成：等待 `ok_fly_plan_succeed`，随后回到初始化 Z、Disarm，确认后请求
+  `MANUAL`。

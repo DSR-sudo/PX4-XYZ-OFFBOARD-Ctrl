@@ -15,6 +15,7 @@ constexpr double kPi = 3.14159265358979323846;
 constexpr double kHalfPi = 1.57079632679489661923;
 constexpr double kLargeVariance = 10000.0;
 
+/// 将任意弧度角归一化到 (-pi, pi] 区间。
 double wrap_pi(double angle)
 {
   while (angle > kPi) {angle -= 2.0 * kPi;}
@@ -23,6 +24,7 @@ double wrap_pi(double angle)
 }
 }  // namespace
 
+/// 按配置创建 LCP 状态/里程计订阅和 MAVROS 外部视觉 publisher。
 LcpVisionBridge::LcpVisionBridge(rclcpp::Node & node, const common::AppOptions & options)
 : node_(node), enabled_(options.lcp_vision_bridge_enabled), input_frame_(options.lcp_vision_input_frame),
   xy_stddev_m_(options.lcp_vision_xy_stddev_m), yaw_stddev_rad_(options.lcp_vision_yaw_stddev_rad),
@@ -46,6 +48,7 @@ LcpVisionBridge::LcpVisionBridge(rclcpp::Node & node, const common::AppOptions &
     options.lcp_odometry_topic.c_str(), input_frame_.c_str(), options.lcp_vision_pose_topic.c_str());
 }
 
+/// 将 LCP North/West/Up 位置、yaw 和配置协方差转换到 ROS East/North/Up。
 geometry_msgs::msg::PoseWithCovarianceStamped LcpVisionBridge::nwu_to_enu(
   const nav_msgs::msg::Odometry & source, double xy_stddev_m, double yaw_stddev_rad)
 {
@@ -77,12 +80,14 @@ geometry_msgs::msg::PoseWithCovarianceStamped LcpVisionBridge::nwu_to_enu(
   return output;
 }
 
+/// 缓存最近 LCP 状态值及其单调接收时间。
 void LcpVisionBridge::status_callback(const std_msgs::msg::UInt8::SharedPtr message)
 {
   lcp_status_ = message->data;
   lcp_status_at_ = monotonic_now();
 }
 
+/// 仅在 STATUS=2 新鲜、输入帧正确且位姿有效时发布转换后的视觉位姿。
 void LcpVisionBridge::odometry_callback(const nav_msgs::msg::Odometry::SharedPtr message)
 {
   if (lcp_status_ != kLcpLockedStatus || monotonic_now() - lcp_status_at_ > max_status_age_s_) {
@@ -102,6 +107,7 @@ void LcpVisionBridge::odometry_callback(const nav_msgs::msg::Odometry::SharedPtr
   }
 }
 
+/// 锁存拒绝原因，并仅在原因变化时输出警告以抑制重复日志。
 void LcpVisionBridge::reject(const std::string & reason)
 {
   if (reason != last_reject_reason_) {
@@ -110,6 +116,7 @@ void LcpVisionBridge::reject(const std::string & reason)
   last_reject_reason_ = reason;
 }
 
+/// 读取不受系统时间校准影响的 steady_clock 秒数。
 double LcpVisionBridge::monotonic_now()
 {
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();

@@ -19,7 +19,9 @@ public:
   ArtifactLogger(const std::string & directory, bool jsonl);
   /// 刷新并关闭仍处于打开状态的日志文件。
   ~ArtifactLogger();
+  /// 禁止复制日志器，避免多个对象共同拥有同一文件流。
   ArtifactLogger(const ArtifactLogger &) = delete;
+  /// 禁止复制赋值，保持日志文件流的唯一所有权。
   ArtifactLogger & operator=(const ArtifactLogger &) = delete;
 
   /// 追加一条状态记录并尽力立即落盘。

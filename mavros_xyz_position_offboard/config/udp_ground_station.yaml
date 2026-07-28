@@ -1,0 +1,17 @@
+mavros_native_xyz_position:
+  ros__parameters:
+    udp:
+      enabled: true
+      bind_ip: 0.0.0.0
+      bind_port: 5005
+      remote_ip: 192.168.10.59
+      remote_port: 5005
+      whitelist_ip: 192.168.10.59
+      whitelist_port: 5005
+      status_period_s: 0.5
+      relative_x_min_m: 0.0
+      relative_x_max_m: 4.0
+      relative_y_min_m: 0.0
+      relative_y_max_m: 5.0
+      absolute_z_min_m: 0.20
+      absolute_z_max_m: 1.00

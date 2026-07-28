@@ -486,6 +486,22 @@ bool Initialization::optical_flow_effective(double now) const
     !common::stale(telemetry_.optical_flow_at, now, config_.optical_flow_timeout_s) && telemetry_.optical_flow_quality >= config_.flow_effective_min_quality;
 }
 
+/// 复制本周期遥测，并一次性计算预检、飞行期和 LCP 派生健康结论。
+HealthSnapshot Initialization::health_snapshot(
+  double now, bool in_flight, double hold_x_m, double hold_y_m,
+  bool require_offboard, bool at_hover)
+{
+  HealthSnapshot snapshot;
+  snapshot.telemetry = telemetry_;
+  snapshot.preflight_errors = preflight_errors(now);
+  if (in_flight) {
+    snapshot.flight_errors = flight_errors(now, hold_x_m, hold_y_m, require_offboard, at_hover);
+  }
+  snapshot.lcp_healthy = lcp_runtime_healthy(now);
+  snapshot.lcp_ready = lcp_ready(now);
+  return snapshot;
+}
+
 /// 将当前有限的本地 XY 保存为漂移比较基准。
 void Initialization::seed_drift_baseline(double now)
 {

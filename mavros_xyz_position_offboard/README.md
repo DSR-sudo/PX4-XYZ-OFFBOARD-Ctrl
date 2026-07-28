@@ -1,142 +1,130 @@
-# ROS 2 MAVROS 原生 XYZ 位置节点
+# ROS 2 MAVROS 原生 XYZ 任务节点
 
-这是独立的新工具，目标环境为 PX4 FMUv6C.x、PX4 1.17.0、Raspberry Pi 5、
-ROS 2 Jazzy、MAVROS 2.14.0 和 MTF02P 光流＋测距。它不修改、导入或替换
-`tools/mavros_height_offboard`；旧工具仍是 `PositionTarget` 的“XY 位置＋Z 加速度”
-历史路线，本目录改用 PX4 原生 XYZ 位置闭环。
+本包面向 PX4 1.17、ROS 2 Jazzy 和 MAVROS 2.14，以单进程、单 ROS 2 节点、20 Hz
+单线程循环执行 OFFBOARD XYZ+yaw 任务。它不修改 PX4/MAVROS 参数，也没有
+force-arm/force-disarm 路径。
 
-构建、测试、控制授权和运行步骤记录于
-[C++17 操作记录](docs/cpp17_operation_record.md)。
+详细构建和现场操作见 [C++17 操作记录](docs/cpp17_operation_record.md)。
 
-## 默认行为
+## 架构和循环顺序
 
-`mavros_xyz_position_node` 是 C++17 `ament_cmake` 可执行文件，默认只创建订阅并输出缩进清晰的终端摘要：
+唯一 ROS 节点是 `application::ApplicationNode`，节点名仍为
+`mavros_native_xyz_position`。内部依赖方向固定如下：
 
-- 自动将 LCP 的 `lcp_nwu` XY+yaw 桥接到 `/mavros/vision_pose/pose_cov`：固定转换为 ROS ENU，且仅接受新鲜 `STATUS=2`；
-- 不创建 `/mavros/setpoint_raw/local` publisher；
-- 不创建 `/mavros/set_mode` client；
-- 不创建 `/mavros/cmd/arming` client；
-- 不写 PX4 或 MAVROS 参数；
-- 没有 force-arm/force-disarm 路径。
+```text
+GroundStationLink --解析事件--> Navigation --OffboardCommand--> Offboard --> PX4
+Initialization --------健康快照----^
+LcpVisionBridge: LCP NWU --> MAVROS ENU
+```
 
-默认同时在当前工作目录的 `artifacts/` 下创建
-`mavros-xyz-flight-<UTC>-<pid>.log`，内容与终端摘要一致。使用 `--output jsonl`
-时改为创建同名 `.jsonl` 文件，每条记录包含完整遥测，以及便于检索的
-`flight_snapshot`：实际 XYZ、实际 XYZ 速度、XYZ 位置目标、目标高度、电压/电量、
-range/光流年龄、模式和状态阶段。可用 `--artifact-dir` 修改日志目录；`--output
-summary` 为默认的人类可读格式；无论 artifact 选择哪种格式，终端始终输出该摘要。
+- `Initialization`：MAVROS/LCP 遥测缓存、预检、飞行健康、LCP 初始化服务；不决定任务阶段。
+- `GroundStationLink`：非阻塞 UDP、白名单、严格 JSON V1 编解码、去重和状态发送。
+- `Navigation`：纯 C++ 任务状态机、三包批次、航点队列、hold/恢复和安全决策；不引用 ROS、MAVROS、socket 或 JSONCPP。
+- `TrajectoryPlanner`：连续、速度/加速度有界的 XY/Z 五次轨迹。
+- `Offboard`：设定点映射/发布及 SetMode、CommandBool 异步请求；不引用通信或任务阶段。
+- `LcpVisionBridge`：把 `lcp_nwu` XY+yaw 转为 ROS ENU vision pose。
 
-range、optical-flow 和 FCU URL 都必须作为参数提供，节点不会把旧 README 的设备路径
-或传感器身份套到当前硬件。当前只读核验看到的话题是
-`/mavros/px4flow/ground_distance` 和
-`/mavros/px4flow/raw/optical_flow_rad`，但更换 launch/plugin 配置后必须重新核验。
+定时器每周期严格执行：轮询服务结果和 UDP → 获取不可变健康快照 → Navigation →
+Offboard → GroundStationLink 发送 → 统一日志。
 
-LCP 桥接默认启用，使用 XY/yaw 标准差 `0.20`、`lcp_nwu -> lcp_enu` 变换。它不读取
-PX4 当前 yaw，也不设定 PX4 参数。仅为隔离诊断可加
-`--disable-lcp-vision-bridge`；常规运行不应添加该选项。Python 旧桥接不能与本节点同时运行。
+## 飞行时序
 
-## 原生位置控制
+任务阶段为：
 
-MAVROS 2.14 `setpoint_raw` 接口订阅 `PositionTarget` 的 local setpoint，向飞控发送
-XYZ＋yaw，并通过 type mask 忽略速度、加速度和 yaw-rate。节点保留 ROS ENU 位置值，
-设定点明确标记 `FRAME_LOCAL_NED`；启用 publisher 前还必须确认 MAVROS 的
-`mav_frame=LOCAL_NED`；`BODY_NED/BODY_OFFSET_NED` 不满足固定世界 XY 的设计。
+```text
+waiting_preflight -> waiting_start -> setpoint_warmup
+-> offboard_request_pending -> arming_request_pending -> climb -> stabilize
+-> waiting_navigation_config -> run_fly_plan
+-> awaiting_fly_plan_succeed -> landing -> disarming
+-> manual_request_pending -> manual
+```
 
-节点在全部门禁通过后锁存一次当前 X/Y/Z 和规范化姿态：
+运行中还可能进入 `link_hold` 或 `lcp_hold`。
 
-- warmup 期间持续发布原始锁存位置；
-- 起飞、定高悬停、航点和降落阶段固定 X/Y，并从首条设定点开始保持 LCP NWU yaw=0（正北；ROS ENU yaw=+π/2）；
-- heartbeat 确认正常 ARM 后，Z 才开始向 `z0 + relative_z` 移动；
-- 爬升阶段不因 LCP `STATUS=3` 停止；定点定高保持 10 秒后，必须等到新鲜
-  `STATUS=2` 和 `/lcp/odometry`，然后保持北向目标（ROS ENU yaw=+π/2）才开始航点运动；
-- Z 使用速度、加速度有界的五次轨迹；
-- 定高悬停完成后，按锁存航向执行四段 0.5 m 航点：前、左、后、右；
-- 航点最后回到初始 XY，再执行下降和正常解锁；
-- 默认 20 Hz、warmup 2 秒。
+1. 完整预检和 LCP 初始化就绪后发送 `ok_preflight`，等待 `start`。
+2. `height_start` 必须在 0.2～1.0 m；它是相对初始化 local ENU Z 的高度。
+3. 先持续预热原点设定点，再请求 OFFBOARD 和 ARM。服务 response 只记日志；仅在
+   `/mavros/state` 实际确认 `OFFBOARD` 且 `armed=true` 后发送 `ok_flight` 并爬升。
+4. 位置稳定 `hold_seconds` 后发送 `wait_plan` 并收集导航批次。
+5. `plan_mode=1` 按航点数组顺序执行；若最后航点不是 `navigation_and_point.point`，自动追加终点。
+   航点切换要求轨迹结束且实测 XY 欧氏距离不超过 0.2 m；Z 发送但不参与协议完成判定。
+6. 最终目标到达后保持位置并发送 `ok_fly_plan`。收到 `ok_fly_plan_succeed` 才下降到
+   初始化 Z、Disarm，最后请求并确认 `MANUAL`。
 
-“前/左/后/右”按 ARM 时锁存的机体 yaw 在 ROS ENU local XY 中计算。XY 航点同样使用
-速度、加速度有界的五次轨迹，不直接跳变位置设定值。默认有界飞行时间为 60 秒，
-可用 `--waypoint-leg`、`--waypoint-max-speed`、`--waypoint-max-accel` 和
-`--waypoint-tolerance` 调整。
+`plan_mode=0` 本版本明确拒绝并记录 `autonomous_planning_not_supported`。飞行中不接受
+替换/追加任务。NFZ 本版本仅做数组、数量、类型、有限性和三份一致性校验。
 
-## 三层显式确认
+ACK 是 GCS→UAV 心跳。`run_fly_plan` 连续 2 秒无有效 ACK 时，在最新可靠实测 XY 和
+当前命令 Z 进入 `link_hold`；恢复 ACK 后从冻结状态平滑重规划到原活动航点。LCP
+失效进入 `lcp_hold`，恢复后同样连续重规划，超时则安全降落。模式丢失不会抢回
+OFFBOARD，而是请求正常 `AUTO.LAND`。
 
-以下每组必须完整，残缺组合会在 ROS 初始化和资源创建之前退出。
+## JSON UDP V1
 
-1. PositionTarget publisher：
-   `--enable-position-setpoints`、`--ack-native-xyz-position-control`、
-   `--ack-setpoint-streaming-risk`、
-   `--confirm-setpoint-mav-frame-local-ned`、
-   `--confirm-range-source`、`--confirm-optical-flow-source`。
-2. SetMode client：第一组加
-   `--request-offboard-mode`、`--ack-disarmed-mode-switch`。
-3. CommandBool client：前两组加
-   `--execute-bounded-flight`、`--ack-normal-arm-only`、
-   `--ack-propeller-configuration-safe`、
-   `--ack-area-and-personnel-clear`、
-   `--ack-independent-emergency-stop-ready`、
-   `--ack-valid-flight-battery-installed`、
-   `--ack-direct-px4-xy-fusion-evidence`，并提供可审计的
-   `--px4-xy-fusion-evidence-label`。
+参数文件为 `config/udp_ground_station.yaml`。默认仅接收
+`192.168.10.59:5005`，发送也固定到该端点。所有数据报必须是 UTF-8 JSON 对象并包含：
 
-若确实需要允许地面附近读数低于 `sensor_msgs/Range.min_range`，可显式加入
-`--ignore-declared-min-range`；进入有界飞行控制时还必须加入
-`--ack-range-below-declared-min`。该开关只改变本节点的软件下限，不修改传感器声明、
-PX4 参数或传感器物理有效范围；本节点配置的 `--configured-min-range`、最大距离、
-新鲜度和跳变保护仍然生效。
+```json
+{"version":1,"type":"ACK","seq":42}
+```
 
-服务 response 只记录，不当成状态成功；只有后续 `/mavros/state` heartbeat 实际回报
-`OFFBOARD` 或 `armed=true` 才推进状态机。ARM 后模式丢失不会抢回 OFFBOARD；节点进入
-abort/landing 路径，必要时只请求正常 `AUTO.LAND`。只有落地、回到 Z 基线并正常解锁后
-才会给出 `PASS` 或 `ABORTED_SAFE`。
+`version` 必须为整数 1，`type` 必须为字符串，`seq` 必须为无符号整数。`seq` 在进程
+生命周期内用于去重，但允许 UDP 乱序。重复字段、额外字段、错误类型、非有限数值、
+畸形数组、点数不符和非白名单来源均拒绝。接收器不发送旧式逐包 ACK。
 
-## 预检门禁
+GCS→UAV 消息：
 
-控制候选要求以下 MAVROS 可见证据全部新鲜、有限且通过：
+```json
+{"version":1,"type":"start","seq":1,"height_start":0.8}
+{"version":1,"type":"navigation_and_point","seq":2,"plan_mode":1,"point":{"x":2.0,"y":3.0,"z":0.8}}
+{"version":1,"type":"navigation_nfz","seq":3,"nfz_point_count":1,"nfz_points":[{"x":1.0,"y":1.0,"z":0.0}]}
+{"version":1,"type":"navigation_plan","seq":4,"waypoint_count":2,"waypoints":[{"x":1.0,"y":2.0,"z":0.8},{"x":2.0,"y":2.0,"z":0.8}]}
+{"version":1,"type":"navigation_fly_plan_send_ok","seq":5}
+{"version":1,"type":"ACK","seq":6}
+{"version":1,"type":"ok_fly_plan_succeed","seq":7}
+```
 
-- `/mavros/state`：连接、heartbeat 新鲜、未解锁、PX4 `STANDBY`；
-- `/mavros/sys_status`：`MAV_SYS_STATUS_PREARM_CHECK` health 位为 1，且
-  `enabled & ~health == 0`；
-- `/mavros/battery`：电池存在、有效电压和剩余比例高于阈值；
-- `/mavros/extended_state`：`ON_GROUND`；
-- local pose/velocity：XYZ、四元数和速度有效、新鲜，静止速度不过限；
-- `/mavros/estimator_status`：attitude、水平/垂直速度、水平位置和垂直位置
-  legacy status flags 有效，GPS glitch/accel error 未置位；
-- Range：来源已确认、消息新鲜、数值落在配置范围内，并默认落在消息声明 min/max 内；
-  只有显式 `--ignore-declared-min-range` 时才忽略声明的最小值，声明的最大值仍参与检查；
-- OpticalFlowRad：来源已确认、消息新鲜、integration time 有效、积分角有限、
-  quality 达标。
+在 `waiting_navigation_config` 中，前三种导航载荷必须各收到恰好三份且三份业务载荷
+完全一致，随后收到一个 `navigation_fly_plan_send_ok`。缺失、不一致或数量超限会清空
+整批并保持悬停，不发送 `ok_receive`。
 
-OpticalFlowRad `temperature` 会写入 JSONL，但在来源语义另行确认前不参与门禁。
-地面静止时 `const_pos_mode_status_flag=true` 可能来自 PX4 的 `vehicle_at_rest`，因此它
-会被记录但不单独阻断地面预检；ARM/飞行阶段出现该位则立即中止。
+UAV→GCS 消息为 `ok_preflight`、`ok_flight`、`wait_plan`、`ok_receive`、
+`ok_fly_plan`、`xyz_state` 和 `battery_state`。所有输出也带 V1 包络和 UAV 自增 `seq`。
+`xyz_state` 是 MAVROS local ENU 绝对 XYZ；`battery_state` 包含 `present`、`voltage` 和
+`remaining`。两类状态默认每 0.5 秒发送一次，可用 `udp.status_period_s` 修改。
 
-当前实测 `range=0.05 m`、消息声明 `min_range≈0.30 m`。默认策略会报
-`outside declared/accepted interval`；启用显式覆盖后可通过本节点的软件下限，但这不代表
-`0.05 m` 已成为传感器有效测量。当前 `battery=0 V` 仍必须阻断。原始 flow
-`quality=59` 不能抵消电池、XY 原生融合或传感器有效性问题，也不能单独证明 EKF 已融合光流。
+导航目标继续受 YAML 安全包络限制：XY 相对初始化 local ENU 原点，Z 为绝对 local ENU。
+NFZ 点不作为控制目标，因此不套用飞行目标包络。
 
-## MAVROS 可见性边界
-
-MAVROS 2.14 的这些标准话题不能直接证明：
-
-- PX4 `vehicle_local_position.xy_valid/z_valid/v_xy_valid/v_z_valid/dead_reckoning`；
-- `estimator_status_flags.cs_opt_flow/cs_rng_hgt/reject_*`；
-- `estimator_aid_src_*` 的 `fused`、`innovation_rejected`、test ratio 和年龄；
-- `sensor_optical_flow.distance_available`；
-- `sensor_msgs/Range` 背后的 MAVLink `DISTANCE_SENSOR.orientation`。
-
-节点不会伪造这些字段。`EstimatorStatus` 门禁只是必要条件，不足以批准自由带桨 XYZ
-悬停；飞行确认组额外要求一份 PX4 shell/ULog 原生融合证据标签。若无法取得，保持
-只读验证或使用物理约束架。
-
-## 本地测试
+## 构建与测试
 
 ```bash
 cd /home/pi/px4-test-tools
 source /opt/ros/jazzy/setup.bash
 colcon build --packages-select mavros_xyz_position_offboard
 colcon test --packages-select mavros_xyz_position_offboard
+colcon test-result --all --verbose
 source install/setup.bash
 ros2 run mavros_xyz_position_offboard mavros_xyz_position_node --help
 ```
+
+本包不再依赖 `lslidar_msgs`，构建和测试无需 source LSLIDAR overlay。
+
+## 运行与安全授权
+
+只读监视示例：
+
+```bash
+ros2 run mavros_xyz_position_offboard mavros_xyz_position_node \
+  --confirmed-fcu-url udp://127.0.0.1:14540 \
+  --range-topic /mavros/px4flow/ground_distance --range-source-label downward \
+  --optical-flow-topic /mavros/px4flow/raw/optical_flow_rad --optical-flow-source-label flow \
+  --ros-args --params-file \
+  /home/pi/px4-test-tools/install/mavros_xyz_position_offboard/share/mavros_xyz_position_offboard/config/udp_ground_station.yaml
+```
+
+默认不创建设定点 publisher、SetMode client 或 CommandBool client。控制资源仍由原有 CLI
+三层显式确认逐级开启：PositionTarget 确认 → OFFBOARD 模式确认 → 有界飞行与普通 ARM
+确认。缺少任一配套确认会在创建 ROS 资源前退出。所有传感器、电池、估计器、落地状态、
+LCP 新鲜度和本地位姿门禁继续生效；节点不把 MAVROS 可见字段包装成不存在的 PX4 原生
+融合证据。

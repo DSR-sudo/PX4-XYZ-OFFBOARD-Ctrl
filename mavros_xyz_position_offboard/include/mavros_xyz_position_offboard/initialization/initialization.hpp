@@ -57,6 +57,15 @@ struct ServiceEvent
   std::optional<double> monotonic_s{};
 };
 
+struct HealthSnapshot
+{
+  common::Telemetry telemetry{};
+  std::vector<std::string> preflight_errors{};
+  std::vector<std::string> flight_errors{};
+  bool lcp_healthy{false};
+  bool lcp_ready{false};
+};
+
 class Initialization
 {
 public:
@@ -133,6 +142,10 @@ public:
   void seed_drift_baseline(double now);
   /// 将完整遥测和派生状态序列化为严格 JSON 对象。
   std::string telemetry_json(double now) const;
+  /// Capture one immutable telemetry and derived-health value for an application cycle.
+  HealthSnapshot health_snapshot(
+    double now, bool in_flight, double hold_x_m, double hold_y_m,
+    bool require_offboard = false, bool at_hover = false);
 
 private:
   /// 校验连接、心跳、SYS_STATUS 和预解锁健康掩码。

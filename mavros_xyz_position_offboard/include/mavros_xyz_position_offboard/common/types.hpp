@@ -93,10 +93,8 @@ struct SafetyConfig
   double relative_z_m{0.80};
   double max_z_setpoint_rate_m_s{1.0};
   double max_z_setpoint_accel_m_s2{1.50};
-  double waypoint_leg_m{0.50};
-  double waypoint_max_speed_m_s{0.25};
-  double waypoint_max_accel_m_s2{0.50};
-  double waypoint_tolerance_m{0.08};
+  double target_xy_max_speed_m_s{0.25};
+  double target_xy_max_accel_m_s2{0.50};
   double target_tolerance_m{0.04};
   double touchdown_z_tolerance_m{0.08};
   double hold_seconds{10.0};

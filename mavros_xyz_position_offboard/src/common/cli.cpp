@@ -93,8 +93,6 @@ ParsedOptions parse_options(const std::vector<std::string> & argv)
   c.max_z_setpoint_accel_m_s2 = 0.40;
   c.max_flight_horizontal_speed_m_s = 0.50;
   c.max_flight_vertical_speed_m_s = 0.80;
-  // The bounded test traverses four 0.5 m legs; a corner can be about
-  // sqrt(0.5^2 + 0.5^2) = 0.707 m from the takeoff baseline.
   c.max_flight_horizontal_drift_m = 1.0;
   std::unordered_map<std::string, bool *> flags{
     {"--enable-position-setpoints", &o.enable_position_setpoints},
@@ -148,10 +146,8 @@ ParsedOptions parse_options(const std::vector<std::string> & argv)
       else if (option == "--relative-z") {c.relative_z_m = number;}
       else if (option == "--max-z-setpoint-rate") {c.max_z_setpoint_rate_m_s = number;}
       else if (option == "--max-z-setpoint-accel") {c.max_z_setpoint_accel_m_s2 = number;}
-      else if (option == "--waypoint-leg") {c.waypoint_leg_m = number;}
-      else if (option == "--waypoint-max-speed") {c.waypoint_max_speed_m_s = number;}
-      else if (option == "--waypoint-max-accel") {c.waypoint_max_accel_m_s2 = number;}
-      else if (option == "--waypoint-tolerance") {c.waypoint_tolerance_m = number;}
+      else if (option == "--target-xy-max-speed") {c.target_xy_max_speed_m_s = number;}
+      else if (option == "--target-xy-max-accel") {c.target_xy_max_accel_m_s2 = number;}
       else if (option == "--hold-seconds") {c.hold_seconds = number;}
       else if (option == "--max-flight-seconds") {c.max_flight_seconds = number;}
       else if (option == "--min-battery-voltage") {c.min_battery_voltage_v = number;}
@@ -187,7 +183,7 @@ ParsedOptions parse_options(const std::vector<std::string> & argv)
     "--px4-xy-fusion-evidence-label"};
   const std::vector<std::string> number_options{
     "--status-period", "--publish-rate", "--setpoint-warmup", "--relative-z", "--max-z-setpoint-rate", "--max-z-setpoint-accel",
-    "--waypoint-leg", "--waypoint-max-speed", "--waypoint-max-accel", "--waypoint-tolerance", "--hold-seconds",
+    "--target-xy-max-speed", "--target-xy-max-accel", "--hold-seconds",
     "--max-flight-seconds", "--min-battery-voltage", "--min-battery-fraction", "--configured-min-range", "--configured-max-range",
     "--range-boundary-tolerance", "--max-preflight-horizontal-speed", "--max-preflight-vertical-speed", "--max-flight-horizontal-speed",
     "--max-flight-vertical-speed", "--max-flight-horizontal-drift", "--target-tolerance", "--touchdown-z-tolerance",

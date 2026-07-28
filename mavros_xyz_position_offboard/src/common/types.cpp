@@ -29,7 +29,7 @@ double yaw_from_quaternion(const Quaternion & q)
 /// 逐项检查安全配置，拒绝无效阈值和不兼容范围。
 void SafetyConfig::validate() const
 {
-  const std::array<std::pair<const char *, double>, 41> positive{{
+  const std::array<std::pair<const char *, double>, 39> positive{{
     {"state_timeout_s", state_timeout_s}, {"sys_status_timeout_s", sys_status_timeout_s},
     {"battery_timeout_s", battery_timeout_s}, {"landed_timeout_s", landed_timeout_s},
     {"local_pose_timeout_s", local_pose_timeout_s}, {"local_velocity_timeout_s", local_velocity_timeout_s},
@@ -50,8 +50,8 @@ void SafetyConfig::validate() const
     {"climb_horizontal_drift_limit_m", climb_horizontal_drift_limit_m}, {"hover_min_height_m", hover_min_height_m},
     {"setpoint_warmup_s", setpoint_warmup_s}, {"relative_z_m", relative_z_m},
     {"max_z_setpoint_rate_m_s", max_z_setpoint_rate_m_s}, {"max_z_setpoint_accel_m_s2", max_z_setpoint_accel_m_s2},
-    {"waypoint_leg_m", waypoint_leg_m}, {"waypoint_max_speed_m_s", waypoint_max_speed_m_s},
-    {"waypoint_max_accel_m_s2", waypoint_max_accel_m_s2}, {"waypoint_tolerance_m", waypoint_tolerance_m},
+    {"target_xy_max_speed_m_s", target_xy_max_speed_m_s},
+    {"target_xy_max_accel_m_s2", target_xy_max_accel_m_s2},
     {"target_tolerance_m", target_tolerance_m}, {"touchdown_z_tolerance_m", touchdown_z_tolerance_m},
     {"hold_seconds", hold_seconds}, {"max_flight_seconds", max_flight_seconds},
     {"flow_effective_min_height_m", flow_effective_min_height_m},

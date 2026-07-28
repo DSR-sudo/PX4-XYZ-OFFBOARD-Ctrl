@@ -93,7 +93,9 @@ ParsedOptions parse_options(const std::vector<std::string> & argv)
   c.max_z_setpoint_accel_m_s2 = 0.40;
   c.max_flight_horizontal_speed_m_s = 0.50;
   c.max_flight_vertical_speed_m_s = 0.80;
-  c.max_flight_horizontal_drift_m = 0.50;
+  // The bounded test traverses four 0.5 m legs; a corner can be about
+  // sqrt(0.5^2 + 0.5^2) = 0.707 m from the takeoff baseline.
+  c.max_flight_horizontal_drift_m = 1.0;
   std::unordered_map<std::string, bool *> flags{
     {"--enable-position-setpoints", &o.enable_position_setpoints},
     {"--ack-native-xyz-position-control", &o.ack_native_xyz_position_control},

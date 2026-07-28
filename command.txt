@@ -21,6 +21,7 @@ ros2 run mavros_xyz_position_offboard mavros_xyz_position_node \
   --relative-z 0.80 \
   --hold-seconds 10.0 \
   --max-flight-seconds 90.0 \
+  --max-flight-horizontal-drift 1.0 \
   --waypoint-leg 0.50 \
   --waypoint-max-speed 0.25 \
   --waypoint-max-accel 0.50 \

@@ -171,6 +171,7 @@ TEST(CliTest, PreservesApplicationDefaultsAndRejectsPartialOptIn)
   EXPECT_DOUBLE_EQ(parsed.config.max_z_setpoint_rate_m_s, 0.20);
   EXPECT_DOUBLE_EQ(parsed.config.max_z_setpoint_accel_m_s2, 0.40);
   EXPECT_DOUBLE_EQ(parsed.config.max_flight_horizontal_speed_m_s, 0.50);
+  EXPECT_DOUBLE_EQ(parsed.config.max_flight_horizontal_drift_m, 1.0);
   EXPECT_TRUE(parsed.options.lcp_vision_bridge_enabled);
   EXPECT_EQ(parsed.options.lcp_vision_input_frame, "lcp_nwu");
   EXPECT_FALSE(mavros_xyz_position_offboard::common::setpoint_enabled(parsed.options));

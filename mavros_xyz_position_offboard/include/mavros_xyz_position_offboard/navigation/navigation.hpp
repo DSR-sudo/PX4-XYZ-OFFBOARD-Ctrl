@@ -12,6 +12,9 @@ namespace mavros_xyz_position_offboard::navigation
 {
 
 /// 纯值类型的有界 XYZ 加偏航轨迹生成器，不包含任务或协议状态。
+///
+/// Navigation owns the mission origin and final goal. This class only advances the
+/// commanded point from its current value to a target supplied by its caller.
 class TrajectoryPlanner
 {
 public:
@@ -20,12 +23,8 @@ public:
 
   /// 清除锁存位置和轨迹，使规划器回到未初始化状态。
   void reset();
-  /// 锁存当前局部 XYZ 与姿态，作为后续相对控制的原点。
+  /// 以当前局部 XYZ 与姿态初始化轨迹的命令起点。
   void latch(double x_m, double y_m, double z_m, const common::Quaternion & orientation);
-  /// ARM 后以当前实测 XY 重新建立水平原点。
-  void recenter_xy(double x_m, double y_m);
-  /// 以锁存 Z 原点为基准开始相对高度五次轨迹。
-  void set_relative_target(double relative_z_m);
   /// 开始到世界坐标 XY 目标的有界五次轨迹。
   void set_xy_target(double x_m, double y_m);
   /// 将水平设定点立即冻结在指定实测位置。
@@ -36,8 +35,8 @@ public:
   void set_z_target(double z_m);
   /// 冻结当前 Z 设定点并清除垂直速度。
   void freeze_z();
-  /// 规划返回锁存地面高度的下降轨迹。
-  void set_ground_target();
+  /// 立即将 Z 设定点冻结在指定实测高度并清除垂直速度。
+  void freeze_z_at(double z_m);
   /// 将输出姿态改为指定世界偏航角。
   void set_yaw_rad(double yaw_rad);
   /// 同时开始到绝对本地 ENU XYZ 目标的有界五次轨迹。
@@ -50,7 +49,7 @@ public:
   /// 返回当前锁存或命令姿态的偏航角。
   double yaw_rad() const;
 
-  /// 指示是否已锁存可用的初始局部位姿。
+  /// 指示是否已初始化可用的命令起点。
   bool latched() const {return latched_;}
   /// 指示当前水平五次轨迹是否已经结束。
   bool xy_target_reached() const {return xy_trajectory_duration_s_ <= 0.0;}
@@ -64,12 +63,6 @@ public:
   double x_m() const {return x_m_;}
   /// 返回当前规划 Y 设定点。
   double y_m() const {return y_m_;}
-  /// 返回锁存的 X 原点。
-  double origin_x_m() const {return origin_x_m_;}
-  /// 返回锁存的 Y 原点。
-  double origin_y_m() const {return origin_y_m_;}
-  /// 返回锁存的 Z 原点。
-  double origin_z_m() const {return origin_z_m_;}
   /// 返回当前水平 X 目标。
   double target_x_m() const {return target_x_m_;}
   /// 返回当前水平 Y 目标。
@@ -101,8 +94,6 @@ private:
   bool flow_effective_{false};
   double x_m_{NAN};
   double y_m_{NAN};
-  double origin_x_m_{NAN};
-  double origin_y_m_{NAN};
   double target_x_m_{NAN};
   double target_y_m_{NAN};
   double xy_velocity_x_m_s_{0.0};
@@ -110,7 +101,6 @@ private:
   double xy_trajectory_elapsed_s_{0.0};
   double xy_trajectory_duration_s_{0.0};
   std::array<Coefficients, 2> xy_coefficients_{};
-  double origin_z_m_{NAN};
   double command_z_m_{NAN};
   double target_z_m_{NAN};
   double vertical_rate_m_s_{0.0};
@@ -159,6 +149,25 @@ struct NavigationInput
   bool gripper_failed{false};
 };
 
+/// 任务语义与实际发布命令严格分离的可审计控制状态。
+struct ControlState
+{
+  /// 解锁确认后一次性锁定的本地 ENU 飞行原点；预热期间为空。
+  std::optional<common::PositionSetpoint> origin{};
+  /// 当前任务最终 XYZ+yaw；临时保持永不改写它。
+  std::optional<common::PositionSetpoint> mission_goal{};
+  /// 最近一次交给 Offboard 发布的 ENU XYZ+yaw 命令。
+  std::optional<common::PositionSetpoint> commanded_setpoint{};
+  /// LCP 或跟车数据失效时锁定的实测 XYZ 与最近命令偏航。
+  std::optional<common::PositionSetpoint> hold_setpoint{};
+  std::string hold_reason{};
+  std::string hold_resume_phase{};
+  bool mission_paused{false};
+};
+
+/// 将完整控制状态编码为 JSON 对象，供 JSONL 审计和单元测试共同使用。
+std::string control_json(const ControlState & control);
+
 /// 导航状态机为当前控制周期生成的控制与通信决策。
 struct NavigationDecision
 {
@@ -169,6 +178,7 @@ struct NavigationDecision
   std::vector<communication::OutgoingMessage> messages{};
   std::vector<std::string> rejections{};
   bool release_gripper{false};
+  ControlState control{};
 };
 
 /// 纯值类型任务状态机，只依赖输入值和已解析的协议事件。
@@ -184,8 +194,15 @@ public:
 
   /// 返回当前协议任务阶段名称。
   const std::string & phase() const {return phase_;}
-  /// 返回只读轨迹规划器，供组装层读取原点和当前控制目标。
+  /// 返回只读轨迹规划器，供测试和组装层读取当前命令轨迹。
   const TrajectoryPlanner & planner() const {return planner_;}
+  /// 返回完整控制状态，供健康检查与审计读取。
+  const ControlState & control_state() const {return control_;}
+  /// 返回最近一次实际发布的命令点；没有命令流时为空。
+  const std::optional<common::PositionSetpoint> & commanded_setpoint() const
+  {
+    return control_.commanded_setpoint;
+  }
 
 private:
   /// 切换任务阶段并记录新阶段的开始时间。
@@ -196,9 +213,19 @@ private:
   void reject(const std::string & reason);
   /// 按当前任务阶段处理已解析且去重的地面站协议事件。
   void process_events(const NavigationInput & input);
-  /// 保存恢复目标，并在指定的链路/LCP 保持阶段冻结可靠实测位置。
-  void enter_hold(const NavigationInput & input, const std::string & hold_phase);
-  /// 从冻结位置连续重规划到保存目标并恢复被中断阶段。
+  /// 更新最终任务目标；只有明确的任务事件可以调用它。
+  void set_mission_goal(const common::PositionSetpoint & goal);
+  /// 从当前命令点重新规划到任务最终目标。
+  void plan_to_mission_goal();
+  /// 使用新鲜实测 XYZ 和最近命令偏航构建临时保持点。
+  common::PositionSetpoint measured_hold_setpoint(const NavigationInput & input) const;
+  /// 在指定保持阶段冻结可靠实测位置，且绝不改写任务最终目标。
+  void enter_hold(
+    const NavigationInput & input, const std::string & hold_phase,
+    const std::string & reason, const std::optional<std::string> & resume_phase = std::nullopt);
+  /// 清除保持元数据，不触碰任务最终目标。
+  void clear_hold();
+  /// 从冻结位置连续重规划到任务最终目标，或恢复等待新车辆状态。
   void resume_hold(double now);
   /// 固定水平位置、规划返回初始化 Z，并进入正常或故障降落阶段。
   void begin_landing(double now, const std::string & reason = {});
@@ -208,8 +235,12 @@ private:
   bool stable_at(const common::Telemetry & telemetry, const common::PositionSetpoint & target) const;
   /// 判断实测偏航角是否已接近目标世界航向。
   bool actual_yaw_within(const common::Telemetry & telemetry, double yaw_rad, double tolerance_rad) const;
-  /// 依据最新 car_status 生成一次受安全半径保护的 ENU 跟踪目标。
-  void apply_car_target(const NavigationInput & input);
+  /// 依据最新 car_status 生成一次受安全半径保护的 ENU 跟踪任务最终目标。
+  bool apply_car_target(const NavigationInput & input);
+  /// 判断最后一条车辆状态在本周期是否仍然新鲜。
+  bool car_status_fresh(double now) const;
+  /// 判断阶段是否必须因 LCP 不健康冻结位置。
+  bool lcp_required_in_phase() const;
 
   const common::SafetyConfig & config_;
   const MissionConfig mission_;
@@ -220,10 +251,8 @@ private:
   std::optional<communication::CarStatus> latest_car_status_{};
   std::optional<double> latest_car_status_at_{};
   bool car_target_pending_{false};
-  bool car_hold_{false};
   bool normal_completion_{false};
-  std::optional<common::PositionSetpoint> held_target_{};
-  std::string hold_resume_phase_{};
+  ControlState control_{};
   std::vector<communication::OutgoingMessage> pending_messages_{};
   std::vector<std::string> pending_rejections_{};
   std::string landing_reason_{};

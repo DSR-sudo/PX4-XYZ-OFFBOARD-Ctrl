@@ -2,6 +2,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -43,6 +44,7 @@ using mavros_xyz_position_offboard::navigation::MissionConfig;
 using mavros_xyz_position_offboard::navigation::Navigation;
 using mavros_xyz_position_offboard::navigation::NavigationInput;
 using mavros_xyz_position_offboard::navigation::TrajectoryPlanner;
+using mavros_xyz_position_offboard::navigation::control_json;
 
 GroundStationLink disabled_link(double max_distance_m = 5.0)
 {
@@ -232,7 +234,6 @@ TEST(NavigationV2Test, CompleteMissionUsesPolarTrackingAndOrderedEvents)
   SafetyConfig safety;
   safety.setpoint_warmup_s = 0.01;
   safety.max_flight_seconds = 200.0;
-  safety.lcp_unhealthy_hold_timeout_s = 0.5;
   MissionConfig mission;
   mission.takeoff_height_m = 1.5;
   mission.standoff_m = 0.10;
@@ -241,20 +242,47 @@ TEST(NavigationV2Test, CompleteMissionUsesPolarTrackingAndOrderedEvents)
   Navigation navigation(safety, mission);
   auto input = base_input(0.0);
   auto decision = navigation.update(input);
+  EXPECT_EQ(navigation.phase(), "setpoint_warmup");
+  EXPECT_FALSE(decision.control.origin);
+  EXPECT_FALSE(decision.control.mission_goal);
+  EXPECT_FALSE(has_message(decision, MessageType::ok_wait));
+  ASSERT_TRUE(decision.setpoint);
+  EXPECT_NEAR(decision.setpoint->z_m, 0.0, 1e-9);
+
+  input.now += 0.01;
+  decision = navigation.update(input);
   EXPECT_EQ(navigation.phase(), "waiting_run_plan1");
   EXPECT_TRUE(has_message(decision, MessageType::ok_wait));
+  ASSERT_TRUE(decision.setpoint);
+  EXPECT_NEAR(decision.setpoint->z_m, 0.0, 1e-9);
+
+  input.now += 0.20;
+  decision = navigation.update(input);
+  EXPECT_EQ(navigation.phase(), "waiting_run_plan1");
+  EXPECT_FALSE(decision.target_mode);
+  EXPECT_FALSE(decision.arm_intent);
+  ASSERT_TRUE(decision.setpoint);
+  EXPECT_NEAR(decision.setpoint->z_m, 0.0, 1e-9);
 
   input.now += 0.01;
   input.events = {event(MessageType::run_plan1, input.now)};
-  navigation.update(input);
-  input.events.clear(); input.now += 0.02;
-  navigation.update(input);
+  decision = navigation.update(input);
+  input.events.clear();
   EXPECT_EQ(navigation.phase(), "offboard_request_pending");
   input.controller.mode = "OFFBOARD"; input.now += 0.01;
   navigation.update(input);
+  input.telemetry.local_x_m = 0.25;
+  input.telemetry.local_y_m = -0.10;
+  input.telemetry.local_z_m = 0.40;
   input.controller.armed = true; input.now += 0.01;
-  navigation.update(input);
+  decision = navigation.update(input);
   EXPECT_EQ(navigation.phase(), "climb");
+  ASSERT_TRUE(decision.control.origin);
+  ASSERT_TRUE(decision.control.mission_goal);
+  EXPECT_NEAR(decision.control.origin->x_m, 0.25, 1e-9);
+  EXPECT_NEAR(decision.control.origin->y_m, -0.10, 1e-9);
+  EXPECT_NEAR(decision.control.origin->z_m, 0.40, 1e-9);
+  EXPECT_NEAR(decision.control.mission_goal->z_m, 1.90, 1e-9);
   for (int i = 0; i < 800 && navigation.phase() == "climb"; ++i) {
     input.now += 0.05;
     follow_planner(navigation, input);
@@ -281,8 +309,8 @@ TEST(NavigationV2Test, CompleteMissionUsesPolarTrackingAndOrderedEvents)
   input.now += 0.01;
   input.events = {car_event(1.1, 0.0, input.now)};
   decision = navigation.update(input);
-  EXPECT_NEAR(navigation.planner().target_x_m(), 1.0, 1e-9);
-  EXPECT_NEAR(navigation.planner().target_y_m(), 0.0, 1e-9);
+  EXPECT_NEAR(navigation.planner().target_x_m(), 1.25, 1e-9);
+  EXPECT_NEAR(navigation.planner().target_y_m(), -0.10, 1e-9);
   input.now += 0.01;
   input.events = {car_event(0.10, 0.0, input.now), event(MessageType::match_car_ok, input.now)};
   decision = navigation.update(input);
@@ -296,6 +324,11 @@ TEST(NavigationV2Test, CompleteMissionUsesPolarTrackingAndOrderedEvents)
   decision = navigation.update(input);
   EXPECT_EQ(navigation.phase(), "returning");
   EXPECT_TRUE(has_message(decision, MessageType::ok_return));
+  ASSERT_TRUE(decision.control.origin);
+  ASSERT_TRUE(decision.control.mission_goal);
+  EXPECT_NEAR(decision.control.mission_goal->x_m, decision.control.origin->x_m, 1e-9);
+  EXPECT_NEAR(decision.control.mission_goal->y_m, decision.control.origin->y_m, 1e-9);
+  EXPECT_NEAR(decision.control.mission_goal->z_m, decision.control.origin->z_m + mission.takeoff_height_m, 1e-9);
 
   for (int i = 0; i < 800 && navigation.phase() == "returning"; ++i) {
     input.now += 0.05;
@@ -319,6 +352,241 @@ TEST(NavigationV2Test, CompleteMissionUsesPolarTrackingAndOrderedEvents)
   EXPECT_TRUE(has_message(decision, MessageType::ok_down));
 }
 
+TEST(NavigationV2Test, PreflightLossBeforeArmForcesManualAndDisarm)
+{
+  SafetyConfig safety;
+  safety.setpoint_warmup_s = 0.01;
+  Navigation navigation(safety);
+  auto input = base_input(0.0);
+  navigation.update(input);
+  ASSERT_EQ(navigation.phase(), "setpoint_warmup");
+  input.now = 0.01;
+  navigation.update(input);
+  ASSERT_EQ(navigation.phase(), "waiting_run_plan1");
+
+  input.now = 0.02;
+  input.events = {event(MessageType::run_plan1, input.now)};
+  navigation.update(input);
+  input.events.clear();
+  ASSERT_EQ(navigation.phase(), "offboard_request_pending");
+
+  input.controller.mode = "OFFBOARD";
+  input.now = 0.04;
+  navigation.update(input);
+  ASSERT_EQ(navigation.phase(), "arming_request_pending");
+
+  // 模拟模式切换前预检丢失；不得将预解锁回退误判为需要 AUTO.LAND 的飞行阶段。
+  input.controller.mode = "OFFBOARD";
+  input.controller.armed = true;
+  input.preflight_ready = false;
+  input.now = 0.05;
+  const auto decision = navigation.update(input);
+  EXPECT_EQ(navigation.phase(), "manual_request_pending");
+  ASSERT_TRUE(decision.target_mode);
+  EXPECT_EQ(*decision.target_mode, "MANUAL");
+  ASSERT_TRUE(decision.arm_intent);
+  EXPECT_FALSE(*decision.arm_intent);
+  EXPECT_FALSE(decision.setpoint);
+  EXPECT_FALSE(decision.control.origin);
+  EXPECT_TRUE(std::find(decision.rejections.begin(), decision.rejections.end(),
+    "preflight_lost_before_arm") != decision.rejections.end());
+
+  input.controller.mode = "MANUAL";
+  input.controller.armed = false;
+  input.now = 0.10;
+  navigation.update(input);
+  EXPECT_EQ(navigation.phase(), "manual");
+}
+
+TEST(NavigationV2Test, LcpLossDuringClimbDoesNotInterruptClimb)
+{
+  SafetyConfig safety;
+  safety.setpoint_warmup_s = 0.01;
+  safety.max_z_setpoint_rate_m_s = 0.20;
+  safety.max_z_setpoint_accel_m_s2 = 0.40;
+  MissionConfig mission;
+  mission.takeoff_height_m = 1.5;
+  Navigation navigation(safety, mission);
+  auto input = base_input(0.0);
+
+  navigation.update(input);
+  input.now = 0.01;
+  navigation.update(input);
+  input.now = 0.02;
+  input.events = {event(MessageType::run_plan1, input.now)};
+  navigation.update(input);
+  input.events.clear();
+  input.controller.mode = "OFFBOARD";
+  input.now = 0.03;
+  navigation.update(input);
+  input.controller.armed = true;
+  input.now = 0.04;
+  navigation.update(input);
+  ASSERT_EQ(navigation.phase(), "climb");
+  ASSERT_NEAR(navigation.planner().target_z_m(), mission.takeoff_height_m, 1e-9);
+  ASSERT_TRUE(navigation.control_state().mission_goal);
+  const auto climb_goal = *navigation.control_state().mission_goal;
+  ASSERT_TRUE(navigation.control_state().commanded_setpoint);
+  const double command_before_lcp_loss = navigation.control_state().commanded_setpoint->z_m;
+
+  input.now = 0.09;
+  follow_planner(navigation, input);
+  input.lcp_healthy = false;
+  const auto decision = navigation.update(input);
+  EXPECT_EQ(navigation.phase(), "climb");
+  EXPECT_NEAR(navigation.planner().target_z_m(), mission.takeoff_height_m, 1e-9);
+  EXPECT_FALSE(navigation.planner().target_reached());
+  ASSERT_TRUE(decision.control.mission_goal);
+  ASSERT_TRUE(decision.control.commanded_setpoint);
+  EXPECT_FALSE(decision.control.hold_setpoint);
+  EXPECT_FALSE(decision.control.mission_paused);
+  EXPECT_NEAR(decision.control.mission_goal->z_m, climb_goal.z_m, 1e-9);
+  EXPECT_GT(decision.control.commanded_setpoint->z_m, command_before_lcp_loss);
+}
+
+TEST(NavigationV2Test, LcpLossAfterClimbHoldsMeasuredPositionUntilRecovery)
+{
+  SafetyConfig safety;
+  safety.setpoint_warmup_s = 0.01;
+  safety.max_z_setpoint_rate_m_s = 1.0;
+  safety.max_z_setpoint_accel_m_s2 = 1.5;
+  MissionConfig mission;
+  mission.takeoff_height_m = 0.20;
+  mission.height_stable_seconds = 0.01;
+  Navigation navigation(safety, mission);
+  auto input = base_input(0.0);
+
+  navigation.update(input);
+  input.now = 0.01;
+  navigation.update(input);
+  input.now = 0.02;
+  input.events = {event(MessageType::run_plan1, input.now)};
+  navigation.update(input);
+  input.events.clear();
+  input.controller.mode = "OFFBOARD";
+  input.now = 0.03;
+  navigation.update(input);
+  input.controller.armed = true;
+  input.now = 0.04;
+  navigation.update(input);
+  for (int i = 0; i < 100 && navigation.phase() != "tracking"; ++i) {
+    input.now += 0.05;
+    follow_planner(navigation, input);
+    navigation.update(input);
+  }
+  ASSERT_EQ(navigation.phase(), "tracking");
+
+  input.now += 0.01;
+  input.events = {car_event(1.10, 0.0, input.now)};
+  navigation.update(input);
+  input.events.clear();
+  ASSERT_NEAR(navigation.planner().target_x_m(), 1.0, 1e-9);
+  ASSERT_TRUE(navigation.control_state().mission_goal);
+  const auto mission_before_hold = *navigation.control_state().mission_goal;
+
+  input.now += 0.05;
+  input.telemetry.local_x_m = 0.25;
+  input.telemetry.local_y_m = -0.10;
+  input.telemetry.local_z_m = 0.15;
+  input.lcp_healthy = false;
+  auto decision = navigation.update(input);
+  ASSERT_EQ(navigation.phase(), "lcp_hold");
+  ASSERT_TRUE(decision.setpoint);
+  EXPECT_NEAR(decision.setpoint->x_m, 0.25, 1e-9);
+  EXPECT_NEAR(decision.setpoint->y_m, -0.10, 1e-9);
+  EXPECT_NEAR(decision.setpoint->z_m, 0.15, 1e-9);
+  ASSERT_TRUE(decision.control.hold_setpoint);
+  ASSERT_TRUE(decision.control.mission_goal);
+  EXPECT_TRUE(decision.control.mission_paused);
+  EXPECT_EQ(decision.control.hold_reason, "lcp_unhealthy");
+  EXPECT_NEAR(decision.control.hold_setpoint->x_m, 0.25, 1e-9);
+  EXPECT_NEAR(decision.control.hold_setpoint->y_m, -0.10, 1e-9);
+  EXPECT_NEAR(decision.control.hold_setpoint->z_m, 0.15, 1e-9);
+  EXPECT_NEAR(decision.control.mission_goal->x_m, mission_before_hold.x_m, 1e-9);
+  EXPECT_NEAR(decision.control.mission_goal->y_m, mission_before_hold.y_m, 1e-9);
+  EXPECT_NEAR(decision.control.mission_goal->z_m, mission_before_hold.z_m, 1e-9);
+
+  input.now += 1.0;
+  decision = navigation.update(input);
+  EXPECT_EQ(navigation.phase(), "lcp_hold");
+  ASSERT_TRUE(decision.setpoint);
+  EXPECT_NEAR(decision.setpoint->x_m, 0.25, 1e-9);
+  EXPECT_NEAR(decision.setpoint->y_m, -0.10, 1e-9);
+  EXPECT_NEAR(decision.setpoint->z_m, 0.15, 1e-9);
+
+  input.now += 0.05;
+  input.lcp_healthy = true;
+  navigation.update(input);
+  EXPECT_EQ(navigation.phase(), "tracking");
+  EXPECT_NEAR(navigation.planner().target_x_m(), 1.0, 1e-9);
+  EXPECT_NEAR(navigation.planner().target_y_m(), 0.0, 1e-9);
+  EXPECT_NEAR(navigation.planner().target_z_m(), mission.takeoff_height_m, 1e-9);
+  EXPECT_FALSE(navigation.planner().target_reached());
+  ASSERT_TRUE(navigation.control_state().mission_goal);
+  EXPECT_NEAR(navigation.control_state().mission_goal->x_m, mission_before_hold.x_m, 1e-9);
+  EXPECT_FALSE(navigation.control_state().mission_paused);
+}
+
+TEST(NavigationV2Test, HeightStabilizationRestartsAfterLcpRecovery)
+{
+  SafetyConfig safety;
+  safety.setpoint_warmup_s = 0.01;
+  safety.max_z_setpoint_rate_m_s = 1.0;
+  safety.max_z_setpoint_accel_m_s2 = 1.5;
+  MissionConfig mission;
+  mission.takeoff_height_m = 0.20;
+  mission.height_stable_seconds = 3.0;
+  Navigation navigation(safety, mission);
+  auto input = base_input(0.0);
+
+  navigation.update(input);
+  input.now = 0.01;
+  navigation.update(input);
+  input.now = 0.02;
+  input.events = {event(MessageType::run_plan1, input.now)};
+  navigation.update(input);
+  input.events.clear();
+  input.controller.mode = "OFFBOARD";
+  input.now = 0.03;
+  navigation.update(input);
+  input.controller.armed = true;
+  input.now = 0.04;
+  navigation.update(input);
+  for (int i = 0; i < 100 && navigation.phase() != "height_stabilizing"; ++i) {
+    input.now += 0.05;
+    follow_planner(navigation, input);
+    navigation.update(input);
+  }
+  ASSERT_EQ(navigation.phase(), "height_stabilizing");
+
+  input.now += 0.05;
+  follow_planner(navigation, input);
+  input.lcp_healthy = false;
+  navigation.update(input);
+  ASSERT_EQ(navigation.phase(), "lcp_hold");
+
+  input.now += 0.05;
+  follow_planner(navigation, input);
+  input.lcp_healthy = true;
+  navigation.update(input);
+  ASSERT_EQ(navigation.phase(), "height_stabilizing");
+  const double lcp_recovered_at = input.now;
+  for (int i = 0; i < 59; ++i) {
+    input.now += 0.05;
+    follow_planner(navigation, input);
+    const auto decision = navigation.update(input);
+    EXPECT_EQ(navigation.phase(), "height_stabilizing");
+    EXPECT_FALSE(has_message(decision, MessageType::ok_height));
+  }
+  for (int i = 0; i < 2 && navigation.phase() == "height_stabilizing"; ++i) {
+    input.now += 0.05;
+    follow_planner(navigation, input);
+    navigation.update(input);
+  }
+  EXPECT_GE(input.now - lcp_recovered_at, mission.height_stable_seconds);
+  EXPECT_EQ(navigation.phase(), "tracking");
+}
+
 TEST(NavigationV2Test, StaleCarHoldsPositionAndFailedGripperCanRetry)
 {
   SafetyConfig safety;
@@ -326,10 +594,10 @@ TEST(NavigationV2Test, StaleCarHoldsPositionAndFailedGripperCanRetry)
   Navigation navigation(safety);
   auto input = base_input(0.0);
   navigation.update(input);
-  input.events = {event(MessageType::run_plan1, 0.01)}; input.now = 0.01; navigation.update(input);
-  input.events.clear(); input.now = 0.03; navigation.update(input);
-  input.controller.mode = "OFFBOARD"; input.now = 0.04; navigation.update(input);
-  input.controller.armed = true; input.now = 0.05; navigation.update(input);
+  input.now = 0.01; navigation.update(input);
+  input.events = {event(MessageType::run_plan1, 0.02)}; input.now = 0.02; navigation.update(input);
+  input.events.clear(); input.controller.mode = "OFFBOARD"; input.now = 0.03; navigation.update(input);
+  input.controller.armed = true; input.now = 0.04; navigation.update(input);
   for (int i = 0; i < 800 &&
     (navigation.phase() == "climb" || navigation.phase() == "height_stabilizing"); ++i) {
     input.now += 0.05; follow_planner(navigation, input); navigation.update(input);
@@ -347,6 +615,110 @@ TEST(NavigationV2Test, StaleCarHoldsPositionAndFailedGripperCanRetry)
   navigation.update(input);
   EXPECT_NEAR(navigation.planner().target_x_m(), 0.3, 1e-9);
   EXPECT_NEAR(navigation.planner().target_y_m(), -0.2, 1e-9);
+}
+
+TEST(NavigationV3Test, CarTimeoutWaitsForNewStatusAndNeverRestoresOldGoal)
+{
+  SafetyConfig safety;
+  safety.setpoint_warmup_s = 0.01;
+  safety.max_z_setpoint_rate_m_s = 1.0;
+  safety.max_z_setpoint_accel_m_s2 = 1.5;
+  MissionConfig mission;
+  mission.takeoff_height_m = 0.20;
+  mission.height_stable_seconds = 0.01;
+  mission.car_status_timeout_s = 0.50;
+  Navigation navigation(safety, mission);
+  auto input = base_input(0.0);
+
+  navigation.update(input);
+  input.now = 0.01; navigation.update(input);
+  input.events = {event(MessageType::run_plan1, 0.02)}; input.now = 0.02; navigation.update(input);
+  input.events.clear(); input.controller.mode = "OFFBOARD"; input.now = 0.03; navigation.update(input);
+  input.controller.armed = true; input.now = 0.04; navigation.update(input);
+  for (int i = 0; i < 100 && navigation.phase() != "tracking"; ++i) {
+    input.now += 0.05; follow_planner(navigation, input); navigation.update(input);
+  }
+  ASSERT_EQ(navigation.phase(), "tracking");
+
+  input.now += 0.01;
+  input.events = {car_event(1.10, 0.0, input.now)};
+  navigation.update(input);
+  input.events.clear();
+  ASSERT_TRUE(navigation.control_state().mission_goal);
+  const auto old_goal = *navigation.control_state().mission_goal;
+  EXPECT_NEAR(old_goal.x_m, 1.0, 1e-9);
+
+  input.now += 0.60;
+  input.telemetry.local_x_m = 0.25;
+  input.telemetry.local_y_m = -0.10;
+  input.telemetry.local_z_m = 0.20;
+  auto decision = navigation.update(input);
+  ASSERT_EQ(navigation.phase(), "waiting_car_status");
+  ASSERT_TRUE(decision.control.hold_setpoint);
+  ASSERT_TRUE(decision.control.mission_goal);
+  EXPECT_EQ(decision.control.hold_reason, "car_status_timeout");
+  EXPECT_TRUE(decision.control.mission_paused);
+  EXPECT_NEAR(decision.control.hold_setpoint->x_m, 0.25, 1e-9);
+  EXPECT_NEAR(decision.control.hold_setpoint->y_m, -0.10, 1e-9);
+  EXPECT_NEAR(decision.control.mission_goal->x_m, old_goal.x_m, 1e-9);
+
+  input.now += 0.05;
+  input.lcp_healthy = false;
+  navigation.update(input);
+  ASSERT_EQ(navigation.phase(), "lcp_hold");
+  input.now += 0.05;
+  input.lcp_healthy = true;
+  decision = navigation.update(input);
+  ASSERT_EQ(navigation.phase(), "waiting_car_status");
+  ASSERT_TRUE(decision.control.mission_goal);
+  EXPECT_EQ(decision.control.hold_reason, "car_status_timeout");
+  EXPECT_TRUE(decision.control.mission_paused);
+  EXPECT_NEAR(decision.control.mission_goal->x_m, old_goal.x_m, 1e-9);
+  EXPECT_NEAR(navigation.planner().target_x_m(), 0.25, 1e-9);
+  EXPECT_NEAR(navigation.planner().target_y_m(), -0.10, 1e-9);
+
+  input.now += 0.01;
+  input.events = {car_event(0.60, 90.0, input.now)};
+  decision = navigation.update(input);
+  ASSERT_EQ(navigation.phase(), "tracking");
+  ASSERT_TRUE(decision.control.mission_goal);
+  EXPECT_FALSE(decision.control.hold_setpoint);
+  EXPECT_FALSE(decision.control.mission_paused);
+  EXPECT_NEAR(decision.control.mission_goal->x_m, 0.25, 1e-9);
+  EXPECT_NEAR(decision.control.mission_goal->y_m, 0.40, 1e-9);
+  EXPECT_NE(decision.control.mission_goal->x_m, old_goal.x_m);
+}
+
+TEST(NavigationV3Test, ControlJsonMatchesPublishedEnuPositionTarget)
+{
+  SafetyConfig safety;
+  Navigation navigation(safety);
+  auto input = base_input(0.0);
+  input.telemetry.local_x_m = 1.25;
+  input.telemetry.local_y_m = -2.50;
+  input.telemetry.local_z_m = 0.75;
+  const auto decision = navigation.update(input);
+  ASSERT_TRUE(decision.setpoint);
+
+  Json::CharReaderBuilder reader;
+  Json::Value root;
+  std::string errors;
+  std::istringstream encoded(control_json(decision.control));
+  ASSERT_TRUE(Json::parseFromStream(reader, encoded, &root, &errors));
+  EXPECT_TRUE(root["origin"].isNull());
+  EXPECT_TRUE(root["mission_goal"].isNull());
+  EXPECT_TRUE(root["hold_setpoint"].isNull());
+  EXPECT_EQ(root["hold_reason"].asString(), "");
+  EXPECT_FALSE(root["mission_paused"].asBool());
+  ASSERT_TRUE(root["commanded_setpoint"].isObject());
+
+  builtin_interfaces::msg::Time stamp;
+  const auto target = mavros_xyz_position_offboard::offboard::Offboard::make_position_target(
+    *decision.setpoint, stamp);
+  EXPECT_DOUBLE_EQ(root["commanded_setpoint"]["x_m"].asDouble(), target.position.x);
+  EXPECT_DOUBLE_EQ(root["commanded_setpoint"]["y_m"].asDouble(), target.position.y);
+  EXPECT_DOUBLE_EQ(root["commanded_setpoint"]["z_m"].asDouble(), target.position.z);
+  EXPECT_DOUBLE_EQ(root["commanded_setpoint"]["yaw_rad"].asDouble(), target.yaw);
 }
 
 class PwmGripperTest : public ::testing::Test
@@ -530,6 +902,14 @@ TEST(InitializationTest, LcpStartPrerequisitesPermitGroundCommissioningWithoutBa
 
   initialization.update_state(true, true, "MANUAL", 0, 10.2);
   EXPECT_FALSE(initialization.lcp_start_prerequisite_errors(10.2).empty());
+}
+
+TEST(SafetyConfigTest, DefaultBatteryTelemetryTimeoutIsFiveSeconds)
+{
+  SafetyConfig config;
+  EXPECT_DOUBLE_EQ(config.battery_timeout_s, 5.0);
+  EXPECT_FALSE(mavros_xyz_position_offboard::common::stale(10.0, 14.99, config.battery_timeout_s));
+  EXPECT_TRUE(mavros_xyz_position_offboard::common::stale(10.0, 15.01, config.battery_timeout_s));
 }
 
 TEST(LcpVisionBridgeTest, ConvertsNwuToEnu)

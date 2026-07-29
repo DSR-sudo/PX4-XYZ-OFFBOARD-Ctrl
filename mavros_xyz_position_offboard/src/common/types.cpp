@@ -29,14 +29,13 @@ double yaw_from_quaternion(const Quaternion & q)
 /// 逐项检查安全配置，拒绝无效阈值和不兼容范围。
 void SafetyConfig::validate() const
 {
-  const std::array<std::pair<const char *, double>, 39> positive{{
+  const std::array<std::pair<const char *, double>, 38> positive{{
     {"state_timeout_s", state_timeout_s}, {"sys_status_timeout_s", sys_status_timeout_s},
     {"battery_timeout_s", battery_timeout_s}, {"landed_timeout_s", landed_timeout_s},
     {"local_pose_timeout_s", local_pose_timeout_s}, {"local_velocity_timeout_s", local_velocity_timeout_s},
     {"estimator_timeout_s", estimator_timeout_s}, {"range_timeout_s", range_timeout_s},
     {"optical_flow_timeout_s", optical_flow_timeout_s}, {"sensor_loss_grace_s", sensor_loss_grace_s},
     {"lcp_status_timeout_s", lcp_status_timeout_s}, {"lcp_odometry_timeout_s", lcp_odometry_timeout_s},
-    {"lcp_unhealthy_hold_timeout_s", lcp_unhealthy_hold_timeout_s},
     {"range_boundary_tolerance_m", range_boundary_tolerance_m},
     {"configured_min_range_m", configured_min_range_m}, {"configured_max_range_m", configured_max_range_m},
     {"max_range_jump_m", max_range_jump_m}, {"jump_window_s", jump_window_s},

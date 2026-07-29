@@ -19,8 +19,10 @@ Initialization -- health/Z ----------+
 
 - `GroundStationLink` accepts one UTF-8 JSON object per UDP datagram, validates the source
   IP/port allowlist and the complete V2 object shape, and sends only to the fixed remote.
-- `Navigation` is a pure C++ state machine. It converts `car_status.distance/angle` to a
-  local-ENU goal using measured vehicle position and yaw.
+- `Navigation` is a pure C++ state machine. It keeps an immutable ARM-time `origin`, a task
+  `mission_goal`, the published `commanded_setpoint`, and a separate temporary `hold_setpoint`.
+  It converts `car_status.distance/angle` to a local-ENU mission goal using measured vehicle
+  position and yaw.
 - `Offboard` sends internal ENU position/yaw setpoints unchanged to MAVROS `PositionTarget`.
   MAVROS 2.14 `SetpointRawPlugin::local_cb()` converts the ROS ENU input to PX4 `LOCAL_NED`;
   the application must not convert it a second time.
@@ -32,16 +34,16 @@ Initialization -- health/Z ----------+
 Mission order:
 
 ```text
-waiting_preflight -> ok_wait -> waiting_run_plan1 -> warmup/OFFBOARD/ARM
--> climb 1.5 m -> hold stable for 3 s -> ok_height -> tracking -> PWM release -> ok_throw
--> b_ok -> ok_return -> return Init XY + world yaw 0 -> ok_downing
--> descend Init Z -> Disarm -> MANUAL -> ok_down
+waiting_preflight -> ground-hold warmup -> ok_wait -> waiting_run_plan1
+-> run_plan1 -> OFFBOARD/ARM -> latch origin and climb 1.5 m -> hold stable for 3 s -> ok_height
+-> tracking -> PWM release -> ok_throw -> b_ok -> ok_return
+-> return Init XY + world yaw 0 -> ok_downing -> descend Init Z -> Disarm -> MANUAL -> ok_down
 ```
 
-An LCP loss freezes safely and then lands after the configured hold timeout. Loss of mode,
-flight health, or the maximum flight time also goes to the existing safe landing path. “Power
-off” in the mission documents means PX4 Disarm plus `MANUAL`, never powering down the Pi or
-FCU.
+An LCP loss during climb does not interrupt the climb. A later LCP loss freezes the measured
+position until LCP recovers, then replans to the interrupted final target. Loss of mode, flight
+health, or the maximum flight time still goes to the existing safe landing path. “Power off” in
+the mission documents means PX4 Disarm plus `MANUAL`, never powering down the Pi or FCU.
 
 ## UDP V2
 
@@ -67,16 +69,19 @@ relative local coordinates, accepts `b_ok` in `awaiting_b_ok`, and then returns 
 Init XY origin. `position_z_m`, `z_valid`, and the selected Z source are unrelated to `b_ok`.
 
 `car_status` expires after `tracking.car_status_timeout_s` (default `0.5`). The UAV freezes at
-measured position rather than extrapolating. `match_car_ok` is accepted only in tracking with a
-fresh status inside `tracking.standoff_m +/- tracking.match_tolerance_m`; duplicate commands are
-phase-idempotent and cannot re-arm, release twice, or restart return.
+measured XYZ and enters `waiting_car_status`; the previous goal remains audit-only and is never
+resumed. Only a new fresh status creates a new mission goal. `match_car_ok` is accepted only in
+tracking with a fresh status inside `tracking.standoff_m +/- tracking.match_tolerance_m`;
+duplicate commands are phase-idempotent and cannot re-arm, release twice, or restart return.
 
 ## LCP and Z
 
-`xyzstatus` copies the raw LCP header and every geometry field from `/lcp/debug`. When `ok_wait`
-is emitted, the current MAVROS local Z is latched as `Init`. Default Z is the fresh local-pose
-difference from that baseline. A fresh valid down range is baselined at the same point and checks
-relative Z consistency (`z.range_cross_check_max_delta_m`, default `0.30 m`); set
+`xyzstatus` copies the raw LCP header and every geometry field from `/lcp/debug`. During preflight
+warmup and GCS wait, the node streams fresh measured ground-hold setpoints without creating a
+flight origin. Only ARM confirmation in OFFBOARD locks the MAVROS local pose as `Init` and starts
+the local-Z/range baseline. Default Z is the fresh local-pose difference from that baseline. A
+fresh valid down range is baselined at the same point and checks relative Z consistency
+(`z.range_cross_check_max_delta_m`, default `0.30 m`); set
 `z.prefer_range:true` only after field validation.
 
 When no selected source is fresh, valid, and consistent, LCP is still sent with exactly:
@@ -130,8 +135,8 @@ Its MAVROS defaults are the flight-controller serial URL
 the N10P LCP service, and the disarmed/on-ground state are healthy, the application automatically
 calls `/lcp/start_initialization`. This permits safe no-battery LCP commissioning. Battery,
 position, range, optical-flow, estimator, and LCP-ready checks remain mandatory before the task
-can emit `ok_wait` or accept a flight command. A missing service is retried only while the ground
-conditions remain valid.
+can warm the Init setpoint, emit `ok_wait`, or accept a flight command. A missing service is
+retried only while the ground conditions remain valid.
 
 The unified launch does not enable position setpoints, OFFBOARD requests, or arming. Those remain
 behind the existing explicit command-line confirmations, so starting the stack is suitable for
@@ -139,6 +144,11 @@ the no-battery communication and sensor checks. Do not start this launch while a
 LSLIDAR process already owns the same serial device or ROS interfaces. When a verified MAVROS
 instance is already connected, retain it and start only the LSLIDAR/application portion with
 `start_mavros:=false`. For an isolated no-battery sensor check, also use `udp_enabled:=false`.
+
+If preflight becomes invalid after `run_plan1` but before climb, the navigation state clears the
+task and reuses its existing `manual_request_pending` safety path to request Disarm plus `MANUAL`.
+It emits the machine-readable rejection `preflight_lost_before_arm`; audit records include both
+`preflight_errors` and `flight_errors` for diagnosis.
 
 Do not set `gripper_pwm.enabled:true` until a bench calibration has recorded the correct
 `chip_path`, `channel`, period, idle duty, and release duty. Enabled mode also requires a readable

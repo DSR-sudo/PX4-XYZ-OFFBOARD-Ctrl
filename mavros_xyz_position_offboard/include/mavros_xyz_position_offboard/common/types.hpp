@@ -65,7 +65,7 @@ struct SafetyConfig
 {
   double state_timeout_s{1.5};
   double sys_status_timeout_s{2.0};
-  double battery_timeout_s{2.0};
+  double battery_timeout_s{5.0};
   double landed_timeout_s{2.0};
   double local_pose_timeout_s{0.5};
   double local_velocity_timeout_s{0.5};
@@ -76,7 +76,6 @@ struct SafetyConfig
   double lcp_status_timeout_s{0.75};
   double lcp_odometry_timeout_s{0.75};
   int lcp_ready_samples{3};
-  double lcp_unhealthy_hold_timeout_s{2.0};
   double range_boundary_tolerance_m{0.001};
   double configured_min_range_m{0.02};
   double configured_max_range_m{12.0};

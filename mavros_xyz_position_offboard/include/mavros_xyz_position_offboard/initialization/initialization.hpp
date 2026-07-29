@@ -141,7 +141,8 @@ public:
   std::vector<std::string> preflight_errors(double now);
   /// 执行飞行期的完整安全门禁和水平漂移检查。
   std::vector<std::string> flight_errors(
-    double now, double hold_x_m, double hold_y_m, bool require_offboard = true, bool at_hover = false);
+    double now, double commanded_x_m, double commanded_y_m,
+    bool require_offboard = true, bool at_hover = false);
   /// 判断光流是否在高度、估计器和质量条件下实际可用。
   bool optical_flow_effective(double now) const;
   /// 以当前本地 XY 建立飞行期漂移检测基线。
@@ -150,7 +151,7 @@ public:
   std::string telemetry_json(double now) const;
   /// Capture one immutable telemetry and derived-health value for an application cycle.
   HealthSnapshot health_snapshot(
-    double now, bool in_flight, double hold_x_m, double hold_y_m,
+    double now, bool in_flight, double commanded_x_m, double commanded_y_m,
     bool require_offboard = false, bool at_hover = false);
 
 private:

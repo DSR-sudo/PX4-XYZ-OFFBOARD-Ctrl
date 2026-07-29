@@ -50,7 +50,7 @@ private:
   gripper::PwmGripperConfig load_gripper_config();
   /// 将每个新鲜 LcpDebug 样本直接编码并上送为 xyzstatus。
   void lcp_debug_callback(const lslidar_msgs::msg::LcpDebug::SharedPtr message);
-  /// 在 ok_wait 时锁存 local Z 与可用 Range 的任务基准。
+  /// 在 ARM 确认并锁存飞行 origin 时记录 local Z 与可用 Range 的任务基准。
   void latch_init_height(const common::Telemetry & telemetry);
   /// 按规定的六步顺序执行一次 20 Hz 单线程应用控制循环。
   void tick();

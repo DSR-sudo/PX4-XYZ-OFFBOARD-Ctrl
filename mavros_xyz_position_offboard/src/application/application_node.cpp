@@ -113,10 +113,10 @@ gripper::PwmGripperConfig ApplicationNode::load_gripper_config()
 
 void ApplicationNode::latch_init_height(const common::Telemetry & telemetry)
 {
-  if (!init_local_z_m_ && common::finite(telemetry.local_z_m)) {init_local_z_m_ = telemetry.local_z_m;}
-  if (!init_range_m_ && common::finite(telemetry.range_m) && !initialization_.range_fault()) {
-    init_range_m_ = telemetry.range_m;
-  }
+  init_local_z_m_.reset();
+  init_range_m_.reset();
+  if (common::finite(telemetry.local_z_m)) {init_local_z_m_ = telemetry.local_z_m;}
+  if (common::finite(telemetry.range_m) && !initialization_.range_fault()) {init_range_m_ = telemetry.range_m;}
 }
 
 void ApplicationNode::lcp_debug_callback(const lslidar_msgs::msg::LcpDebug::SharedPtr message)
@@ -182,22 +182,22 @@ void ApplicationNode::tick()
     navigation_.phase() != "waiting_run_plan1" && navigation_.phase() != "setpoint_warmup" &&
     navigation_.phase() != "offboard_request_pending" &&
     navigation_.phase() != "arming_request_pending" && navigation_.phase() != "manual";
-  double hold_x = NAN;
-  double hold_y = NAN;
-  if (navigation_.planner().latched()) {
-    hold_x = navigation_.planner().target_x_m();
-    hold_y = navigation_.planner().target_y_m();
+  double commanded_x = NAN;
+  double commanded_y = NAN;
+  if (const auto & commanded = navigation_.commanded_setpoint()) {
+    commanded_x = commanded->x_m;
+    commanded_y = commanded->y_m;
   }
 
   // 2. Capture one immutable health snapshot for this control cycle.
-  auto health = initialization_.health_snapshot(now, in_flight, hold_x, hold_y, false, false);
+  auto health = initialization_.health_snapshot(now, in_flight, commanded_x, commanded_y, false, false);
   const auto & lcp_state = health.telemetry.lcp_init_request_state;
   // LCP 建系仅会清空地面地图，允许在电池未上电的传感器验收阶段先完成。
   // 起飞仍由下方完整 preflight_errors 和 lcp_ready 两个门禁共同限制。
   if (initialization_.lcp_start_prerequisite_errors(now).empty() &&
     (lcp_state == "not_requested" || lcp_state == "waiting_service")) {
     initialization_.request_lcp_start(now);
-    health = initialization_.health_snapshot(now, in_flight, hold_x, hold_y, false, false);
+    health = initialization_.health_snapshot(now, in_flight, commanded_x, commanded_y, false, false);
   }
 
   bool flight_healthy = health.flight_errors.empty();
@@ -226,7 +226,15 @@ void ApplicationNode::tick()
   const auto gripper_state = gripper_.update(now);
   input.gripper_succeeded = gripper_state == gripper::ReleaseState::succeeded;
   input.gripper_failed = gripper_state == gripper::ReleaseState::failed;
+  const bool planner_was_latched = navigation_.planner().latched();
   const auto decision = navigation_.update(input);
+  const bool planner_is_latched = navigation_.planner().latched();
+  if (!planner_was_latched && planner_is_latched) {
+    latch_init_height(health.telemetry);
+  } else if (planner_was_latched && !planner_is_latched) {
+    init_local_z_m_.reset();
+    init_range_m_.reset();
+  }
 
   // 4. Apply the idempotent execution intent to MAVROS.
   offboard_.apply({decision.setpoint, decision.target_mode, decision.arm_intent}, now);
@@ -234,7 +242,6 @@ void ApplicationNode::tick()
   // 5. Send business messages and periodic telemetry through the communication layer.
   if (decision.release_gripper) {gripper_.begin_release(now);}
   for (const auto & message : decision.messages) {
-    if (message.type == communication::MessageType::ok_wait) {latch_init_height(health.telemetry);}
     ground_station_.send(message, now);
   }
   ground_station_.retry_events(now);
@@ -251,7 +258,7 @@ void ApplicationNode::emit_status(
   if (now - last_log_at_ < options_.status_period) {return;}
   last_log_at_ = now;
   std::ostringstream stream;
-  stream << "{\"schema\":\"px4.mavros_native_xyz.v2\",\"phase\":\""
+  stream << "{\"schema\":\"px4.mavros_native_xyz.v3\",\"phase\":\""
          << common::json_escape(decision.phase) << "\",\"monotonic_s\":"
          << std::setprecision(12) << now << ",\"pending_event_count\":"
          << ground_station_.pending_event_count();
@@ -261,7 +268,20 @@ void ApplicationNode::emit_status(
     if (i) {stream << ',';}
     stream << '"' << common::json_escape(decision.rejections[i]) << '"';
   }
-  stream << "],\"telemetry\":" << initialization_.telemetry_json(now) << "}";
+  const auto error_array = [](const std::vector<std::string> & errors) {
+      std::ostringstream encoded;
+      encoded << '[';
+      for (std::size_t i = 0; i < errors.size(); ++i) {
+        if (i) {encoded << ',';}
+        encoded << '"' << common::json_escape(errors[i]) << '"';
+      }
+      encoded << ']';
+      return encoded.str();
+    };
+  stream << "],\"preflight_errors\":" << error_array(health.preflight_errors)
+         << ",\"flight_errors\":" << error_array(health.flight_errors)
+         << ",\"control\":" << navigation::control_json(decision.control)
+         << ",\"telemetry\":" << initialization_.telemetry_json(now) << "}";
   artifact_log_.write(stream.str());
   std::cout << "phase=" << decision.phase << " pending_events=" << ground_station_.pending_event_count()
             << " errors=" << health.flight_errors.size() << std::endl;

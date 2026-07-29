@@ -92,7 +92,7 @@ class Scenario:
             return
         if self.phase == "right_front_60deg":
             # 1 m target motion: 0.10 m standoff plus 1.00 m travel at body-right-front -60 deg.
-            self.send("car_status", {"distance": 1.10, "angle": -60.0})
+            self.send("car_status", {"distance": 1.10, "angle": 60.0})
         elif self.phase == "forward_0_5m":
             # The UAV has been commanded to turn toward the first target; angle 0 is its current body front.
             self.send("car_status", {"distance": 0.60, "angle": 0.0})

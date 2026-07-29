@@ -168,7 +168,6 @@ ParsedOptions parse_options(const std::vector<std::string> & argv)
       else if (option == "--sensor-loss-grace-seconds") {c.sensor_loss_grace_s = number;}
       else if (option == "--lcp-status-timeout") {c.lcp_status_timeout_s = number;}
       else if (option == "--lcp-odometry-timeout") {c.lcp_odometry_timeout_s = number;}
-      else if (option == "--lcp-unhealthy-hold-timeout") {c.lcp_unhealthy_hold_timeout_s = number;}
       else if (option == "--lcp-vision-xy-stddev") {o.lcp_vision_xy_stddev_m = number;}
       else if (option == "--lcp-vision-yaw-stddev") {o.lcp_vision_yaw_stddev_rad = number;}
       else if (option == "--lcp-vision-max-status-age") {o.lcp_vision_max_status_age_s = number;}
@@ -188,7 +187,7 @@ ParsedOptions parse_options(const std::vector<std::string> & argv)
     "--range-boundary-tolerance", "--max-preflight-horizontal-speed", "--max-preflight-vertical-speed", "--max-flight-horizontal-speed",
     "--max-flight-vertical-speed", "--max-flight-horizontal-drift", "--target-tolerance", "--touchdown-z-tolerance",
     "--flow-effective-min-height", "--mode-request-interval", "--service-timeout", "--sensor-loss-grace-seconds",
-    "--lcp-status-timeout", "--lcp-odometry-timeout", "--lcp-unhealthy-hold-timeout", "--lcp-vision-xy-stddev",
+    "--lcp-status-timeout", "--lcp-odometry-timeout", "--lcp-vision-xy-stddev",
     "--lcp-vision-yaw-stddev", "--lcp-vision-max-status-age"};
 
   for (std::size_t i = 1; i < argv.size(); ++i) {

@@ -281,9 +281,11 @@ TEST(SimulatedGroundStationTest, CompletesPayloadlessMissionOverLoopbackUdp)
       }
     };
 
-  // 预检成功后发送 ok_wait；下一周期接收其 ACK，再发送起飞命令。
+  // 预检成功后先保持 Init 设定点，预热完成才发送 ok_wait。
   tick();
   ASSERT_TRUE(transport_ok);
+  ASSERT_TRUE(received_headers.empty());
+  tick();
   ASSERT_EQ(received_headers, std::vector<std::string>({"ok_wait"}));
   tick();
   EXPECT_EQ(link.pending_event_count(), 0U);
@@ -291,7 +293,7 @@ TEST(SimulatedGroundStationTest, CompletesPayloadlessMissionOverLoopbackUdp)
   wait_before_mission_command();
   send_gcs(empty_command_json("run_plan1"));
   tick();
-  tick();
+  ASSERT_EQ(navigation.phase(), "offboard_request_pending");
   input.controller.mode = "OFFBOARD";
   input.controller.armed = true;
   for (int count = 0; count < 4 && navigation.phase() != "climb"; ++count) {tick();}

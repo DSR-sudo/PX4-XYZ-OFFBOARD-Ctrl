@@ -1,11 +1,38 @@
 #include "mavros_xyz_position_offboard/navigation/navigation.hpp"
 
+#include "mavros_xyz_position_offboard/common/artifact_log.hpp"
+
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 
 namespace mavros_xyz_position_offboard::navigation
 {
+
+/// 用与 Offboard 相同的 ENU XYZ+yaw 表达审计每一个控制状态点。
+std::string control_json(const ControlState & control)
+{
+  const auto setpoint_json = [](const std::optional<common::PositionSetpoint> & setpoint) {
+      if (!setpoint) {return std::string("null");}
+      std::ostringstream encoded;
+      encoded << std::setprecision(12) << "{\"x_m\":" << setpoint->x_m
+              << ",\"y_m\":" << setpoint->y_m << ",\"z_m\":" << setpoint->z_m
+              << ",\"yaw_rad\":" << common::yaw_from_quaternion(setpoint->orientation)
+              << ",\"vertical_rate_m_s\":" << setpoint->vertical_rate_m_s << '}';
+      return encoded.str();
+    };
+  std::ostringstream encoded;
+  encoded << "{\"origin\":" << setpoint_json(control.origin)
+          << ",\"mission_goal\":" << setpoint_json(control.mission_goal)
+          << ",\"commanded_setpoint\":" << setpoint_json(control.commanded_setpoint)
+          << ",\"hold_setpoint\":" << setpoint_json(control.hold_setpoint)
+          << ",\"hold_reason\":\"" << common::json_escape(control.hold_reason)
+          << "\",\"hold_resume_phase\":\"" << common::json_escape(control.hold_resume_phase)
+          << "\",\"mission_paused\":" << (control.mission_paused ? "true" : "false") << '}';
+  return encoded.str();
+}
 
 /// 保存共享配置引用，供所有轨迹约束计算使用。
 TrajectoryPlanner::TrajectoryPlanner(const common::SafetyConfig & config) : config_(config) {}
@@ -13,14 +40,14 @@ TrajectoryPlanner::TrajectoryPlanner(const common::SafetyConfig & config) : conf
 /// 恢复未锁存状态并丢弃所有进行中的轨迹。
 void TrajectoryPlanner::reset()
 {
-  latched_ = false; flow_effective_ = false; x_m_ = NAN; y_m_ = NAN; origin_x_m_ = NAN; origin_y_m_ = NAN;
+  latched_ = false; flow_effective_ = false; x_m_ = NAN; y_m_ = NAN;
   target_x_m_ = NAN; target_y_m_ = NAN; xy_velocity_x_m_s_ = 0.0; xy_velocity_y_m_s_ = 0.0;
   xy_trajectory_elapsed_s_ = 0.0; xy_trajectory_duration_s_ = 0.0; xy_coefficients_ = {};
-  origin_z_m_ = NAN; command_z_m_ = NAN; target_z_m_ = NAN; vertical_rate_m_s_ = 0.0; orientation_ = {};
+  command_z_m_ = NAN; target_z_m_ = NAN; vertical_rate_m_s_ = 0.0; orientation_ = {};
   trajectory_elapsed_s_ = 0.0; trajectory_duration_s_ = 0.0; coefficients_ = {};
 }
 
-/// 对依赖原点的操作实施“必须先锁存”的不变量。
+/// 对依赖当前命令点的操作实施“必须先初始化”的不变量。
 void TrajectoryPlanner::require_latched(const char * action) const
 {
   if (!latched_) {throw std::runtime_error(std::string("position must be latched before ") + action);}
@@ -46,41 +73,23 @@ std::array<double, 3> TrajectoryPlanner::evaluate(const Coefficients & a, double
   return {p, v, acceleration};
 }
 
-/// 校验当前位姿后锁存为导航原点和初始保持设定点。
+/// 校验当前位姿后锁存为轨迹的初始命令点。
 void TrajectoryPlanner::latch(double x_m, double y_m, double z_m, const common::Quaternion & orientation)
 {
   if (!common::finite(x_m) || !common::finite(y_m) || !common::finite(z_m)) {
     throw std::invalid_argument("local XYZ pose must be finite before latching");
   }
   orientation_ = common::normalize_quaternion(orientation.x, orientation.y, orientation.z, orientation.w);
-  origin_x_m_ = x_m; origin_y_m_ = y_m; x_m_ = x_m; y_m_ = y_m; target_x_m_ = x_m; target_y_m_ = y_m;
+  x_m_ = x_m; y_m_ = y_m; target_x_m_ = x_m; target_y_m_ = y_m;
   xy_velocity_x_m_s_ = 0.0; xy_velocity_y_m_s_ = 0.0; xy_trajectory_elapsed_s_ = 0.0; xy_trajectory_duration_s_ = 0.0;
   xy_coefficients_ = {{{x_m, 0, 0, 0, 0, 0}, {y_m, 0, 0, 0, 0, 0}}};
-  origin_z_m_ = z_m; command_z_m_ = z_m; target_z_m_ = z_m; vertical_rate_m_s_ = 0.0;
+  command_z_m_ = z_m; target_z_m_ = z_m; vertical_rate_m_s_ = 0.0;
   trajectory_elapsed_s_ = 0.0; trajectory_duration_s_ = 0.0; coefficients_ = {z_m, 0, 0, 0, 0, 0};
   latched_ = true; flow_effective_ = false;
 }
 
-/// 在飞行器实际解锁位置重新对齐水平原点。
-void TrajectoryPlanner::recenter_xy(double x_m, double y_m)
-{
-  require_latched("recentering XY");
-  if (!common::finite(x_m) || !common::finite(y_m)) {throw std::invalid_argument("recenter XY pose must be finite");}
-  origin_x_m_ = x_m; origin_y_m_ = y_m; x_m_ = x_m; y_m_ = y_m; target_x_m_ = x_m; target_y_m_ = y_m;
-  xy_velocity_x_m_s_ = 0.0; xy_velocity_y_m_s_ = 0.0; xy_trajectory_elapsed_s_ = 0.0; xy_trajectory_duration_s_ = 0.0;
-  xy_coefficients_ = {{{x_m, 0, 0, 0, 0, 0}, {y_m, 0, 0, 0, 0, 0}}};
-}
-
 /// 从当前输出姿态返回偏航角。
 double TrajectoryPlanner::yaw_rad() const {return common::yaw_from_quaternion(orientation_);}
-
-/// 以锁存高度为参考设置相对上升或下降目标。
-void TrajectoryPlanner::set_relative_target(double relative_z_m)
-{
-  require_latched("setting a target");
-  if (!common::finite(relative_z_m)) {throw std::invalid_argument("relative Z target must be finite");}
-  begin_z_trajectory(origin_z_m_ + relative_z_m);
-}
 
 /// 校验并开始一段受限的水平移动。
 void TrajectoryPlanner::set_xy_target(double x_m, double y_m)
@@ -124,8 +133,14 @@ void TrajectoryPlanner::freeze_z()
   coefficients_ = {command_z_m_, 0, 0, 0, 0, 0};
 }
 
-/// 创建返回锁存地面高度的垂直轨迹。
-void TrajectoryPlanner::set_ground_target() {require_latched("setting a target"); begin_z_trajectory(origin_z_m_);}
+/// 立即将垂直保持点对齐到可靠的实测高度。
+void TrajectoryPlanner::freeze_z_at(double z_m)
+{
+  require_latched("freezing Z at a measurement");
+  if (!common::finite(z_m)) {throw std::invalid_argument("frozen Z must be finite");}
+  command_z_m_ = z_m; target_z_m_ = z_m; vertical_rate_m_s_ = 0.0;
+  trajectory_elapsed_s_ = 0.0; trajectory_duration_s_ = 0.0; coefficients_ = {z_m, 0, 0, 0, 0, 0};
+}
 
 /// 从给定偏航构造纯 Z 轴旋转四元数。
 void TrajectoryPlanner::set_yaw_rad(double yaw)
@@ -246,10 +261,8 @@ void Navigation::reset()
   latest_car_status_.reset();
   latest_car_status_at_.reset();
   car_target_pending_ = false;
-  car_hold_ = false;
   normal_completion_ = false;
-  held_target_.reset();
-  hold_resume_phase_.clear();
+  control_ = {};
   pending_messages_.clear();
   pending_rejections_.clear();
   landing_reason_.clear();
@@ -303,51 +316,99 @@ bool Navigation::actual_yaw_within(
 void Navigation::begin_landing(double now, const std::string & reason)
 {
   if (planner_.latched()) {
+    clear_hold();
     planner_.hold_xy();
-    planner_.set_ground_target();
+    if (control_.origin) {planner_.set_z_target(control_.origin->z_m);}
   }
   landing_reason_ = reason;
   normal_completion_ = false;
   transition("landing", now);
 }
 
-/// 保存当前目标并冻结轨迹，以便在健康状态恢复后连续继续任务。
-void Navigation::enter_hold(const NavigationInput & input, const std::string & hold_phase)
+/// 写入经校验的任务最终目标，保持点和轨迹中间点不允许调用此函数。
+void Navigation::set_mission_goal(const common::PositionSetpoint & goal)
+{
+  if (!common::finite(goal.x_m) || !common::finite(goal.y_m) || !common::finite(goal.z_m)) {
+    throw std::invalid_argument("mission goal XYZ must be finite");
+  }
+  auto normalized = goal;
+  normalized.orientation = common::normalize_quaternion(
+    goal.orientation.x, goal.orientation.y, goal.orientation.z, goal.orientation.w);
+  normalized.vertical_rate_m_s = 0.0;
+  control_.mission_goal = normalized;
+}
+
+/// 规划器只接受当前命令点到调用方给定最终目标的轨迹计算。
+void Navigation::plan_to_mission_goal()
+{
+  if (!planner_.latched() || !control_.mission_goal) {return;}
+  const auto & goal = *control_.mission_goal;
+  planner_.set_target(goal.x_m, goal.y_m, goal.z_m);
+  planner_.set_yaw_rad(common::yaw_from_quaternion(goal.orientation));
+}
+
+/// 保持使用实测 XYZ，偏航始终沿用最近实际发布的命令。
+common::PositionSetpoint Navigation::measured_hold_setpoint(const NavigationInput & input) const
+{
+  common::PositionSetpoint fallback = control_.commanded_setpoint.value_or(planner_.current());
+  common::PositionSetpoint hold = fallback;
+  if (common::finite(input.telemetry.local_x_m)) {hold.x_m = input.telemetry.local_x_m;}
+  if (common::finite(input.telemetry.local_y_m)) {hold.y_m = input.telemetry.local_y_m;}
+  if (common::finite(input.telemetry.local_z_m)) {hold.z_m = input.telemetry.local_z_m;}
+  hold.vertical_rate_m_s = 0.0;
+  return hold;
+}
+
+/// 冻结发布命令但保留 mission_goal，供后续恢复时重新规划。
+void Navigation::enter_hold(
+  const NavigationInput & input, const std::string & hold_phase,
+  const std::string & reason, const std::optional<std::string> & resume_phase)
 {
   if (!planner_.latched() || phase_ == hold_phase) {return;}
-  held_target_ = planner_.current();
-  hold_resume_phase_ = phase_;
-  if (common::finite(input.telemetry.local_x_m) && common::finite(input.telemetry.local_y_m)) {
-    planner_.freeze_xy_at(input.telemetry.local_x_m, input.telemetry.local_y_m);
-  } else {
-    planner_.hold_xy();
-  }
-  planner_.freeze_z();
+  const auto hold = measured_hold_setpoint(input);
+  planner_.freeze_xy_at(hold.x_m, hold.y_m);
+  planner_.freeze_z_at(hold.z_m);
+  planner_.set_yaw_rad(common::yaw_from_quaternion(hold.orientation));
+  control_.hold_setpoint = hold;
+  control_.hold_reason = reason;
+  control_.hold_resume_phase = resume_phase.value_or(phase_);
+  control_.mission_paused = true;
   transition(hold_phase, input.now);
 }
 
-/// 恢复保存的目标与阶段，并从冻结位置重新规划轨迹。
+/// 保持元数据与任务最终目标有独立的生命周期。
+void Navigation::clear_hold()
+{
+  control_.hold_setpoint.reset();
+  control_.hold_reason.clear();
+  control_.hold_resume_phase.clear();
+  control_.mission_paused = false;
+}
+
+/// LCP 恢复后禁止恢复超时前的车辆目标，必须等待新 car_status。
 void Navigation::resume_hold(double now)
 {
-  if (held_target_) {
-    planner_.set_target(held_target_->x_m, held_target_->y_m, held_target_->z_m);
-    planner_.set_yaw_rad(common::yaw_from_quaternion(held_target_->orientation));
+  const std::string resume = control_.hold_resume_phase.empty() ? "tracking" : control_.hold_resume_phase;
+  if (resume == "waiting_car_status") {
+    control_.hold_reason = "car_status_timeout";
+    control_.hold_resume_phase = "waiting_car_status";
+    control_.mission_paused = true;
+    transition(resume, now);
+    return;
   }
-  const std::string resume = hold_resume_phase_.empty() ? "tracking" : hold_resume_phase_;
-  held_target_.reset();
-  hold_resume_phase_.clear();
-  car_hold_ = false;
+  plan_to_mission_goal();
+  clear_hold();
   transition(resume, now);
 }
 
-/// 根据最新车辆距离和相对方位生成受安全半径保护的跟车目标。
-void Navigation::apply_car_target(const NavigationInput & input)
+/// 根据最新车辆距离和相对方位创建新的受限跟车任务最终目标。
+bool Navigation::apply_car_target(const NavigationInput & input)
 {
-  if (!latest_car_status_ || !planner_.latched()) {return;}
+  if (!latest_car_status_ || !planner_.latched() || !control_.origin) {return false;}
   const auto & car = *latest_car_status_;
   if (!common::finite(input.telemetry.local_x_m) || !common::finite(input.telemetry.local_y_m)) {
     reject("tracking_local_pose_invalid");
-    return;
+    return false;
   }
   double vehicle_yaw = 0.0;
   try {
@@ -356,20 +417,37 @@ void Navigation::apply_car_target(const NavigationInput & input)
       input.telemetry.orientation.z, input.telemetry.orientation.w));
   } catch (const std::invalid_argument &) {
     reject("tracking_yaw_invalid");
-    return;
+    return false;
   }
   constexpr double kPi = 3.14159265358979323846;
   const double target_yaw = vehicle_yaw + car.angle_deg * kPi / 180.0;
   const double travel_m = car.distance_m - mission_.standoff_m;
   const double target_x = input.telemetry.local_x_m + travel_m * std::cos(target_yaw);
   const double target_y = input.telemetry.local_y_m + travel_m * std::sin(target_yaw);
-  if (std::hypot(target_x - planner_.origin_x_m(), target_y - planner_.origin_y_m()) > mission_.max_distance_m) {
+  if (std::hypot(target_x - control_.origin->x_m, target_y - control_.origin->y_m) > mission_.max_distance_m) {
     reject("tracking_target_out_of_safety_envelope");
-    return;
+    return false;
   }
-  planner_.set_xy_target(target_x, target_y);
-  planner_.set_yaw_rad(target_yaw);
-  car_hold_ = false;
+  const double target_z = control_.mission_goal ? control_.mission_goal->z_m : planner_.current().z_m;
+  set_mission_goal({target_x, target_y, target_z,
+    {0.0, 0.0, std::sin(0.5 * target_yaw), std::cos(0.5 * target_yaw)}, 0.0});
+  plan_to_mission_goal();
+  return true;
+}
+
+/// 接收时间而不是旧目标决定车辆状态能否继续驱动任务。
+bool Navigation::car_status_fresh(double now) const
+{
+  return latest_car_status_at_ && now >= *latest_car_status_at_ &&
+    now - *latest_car_status_at_ <= mission_.car_status_timeout_s;
+}
+
+/// 爬升不依赖运行期 LCP，其余需要位置任务语义的阶段必须冻结。
+bool Navigation::lcp_required_in_phase() const
+{
+  return phase_ == "height_stabilizing" || phase_ == "tracking" ||
+    phase_ == "waiting_car_status" || phase_ == "throwing" ||
+    phase_ == "awaiting_b_ok" || phase_ == "returning";
 }
 
 /// 按当前任务阶段处理 ACK、跟车、投放和返航协议事件。
@@ -384,24 +462,20 @@ void Navigation::process_events(const NavigationInput & input)
     if (event.type == communication::MessageType::car_status) {
       latest_car_status_ = event.car_status;
       latest_car_status_at_ = event.received_at;
-      if (phase_ == "tracking") {car_target_pending_ = true;}
+      if (phase_ == "tracking" || phase_ == "waiting_car_status") {car_target_pending_ = true;}
       continue;
     }
     if (event.type == communication::MessageType::run_plan1) {
       if (phase_ == "waiting_run_plan1") {
-        planner_.set_relative_target(0.0);
-        transition("setpoint_warmup", input.now);
-      } else if (phase_ != "setpoint_warmup" && phase_ != "offboard_request_pending" &&
-        phase_ != "arming_request_pending" && phase_ != "climb" &&
-        phase_ != "height_stabilizing") {
+        transition("offboard_request_pending", input.now);
+      } else if (phase_ != "offboard_request_pending" && phase_ != "arming_request_pending" &&
+        phase_ != "climb" && phase_ != "height_stabilizing") {
         reject("run_plan1_not_allowed_in_phase");
       }
       continue;
     }
     if (event.type == communication::MessageType::match_car_ok) {
-      const bool fresh = latest_car_status_at_ && input.now >= *latest_car_status_at_ &&
-        input.now - *latest_car_status_at_ <= mission_.car_status_timeout_s;
-      const bool matched = fresh && latest_car_status_ &&
+      const bool matched = car_status_fresh(input.now) && latest_car_status_ &&
         std::abs(latest_car_status_->distance_m - mission_.standoff_m) <= mission_.match_tolerance_m;
       if (phase_ == "tracking" && matched) {
         pending_release_gripper_ = true;
@@ -412,9 +486,13 @@ void Navigation::process_events(const NavigationInput & input)
       continue;
     }
     if (event.type == communication::MessageType::b_ok) {
-      if (phase_ == "awaiting_b_ok") {
-        planner_.set_xy_target(planner_.origin_x_m(), planner_.origin_y_m());
-        planner_.set_yaw_rad(0.0);
+      if (phase_ == "awaiting_b_ok" && control_.origin) {
+        auto return_goal = *control_.origin;
+        // Return horizontally at the current task altitude; the normal descent event owns origin Z.
+        if (control_.mission_goal) {return_goal.z_m = control_.mission_goal->z_m;}
+        return_goal.orientation = {0.0, 0.0, 0.0, 1.0};
+        set_mission_goal(return_goal);
+        plan_to_mission_goal();
         emit(communication::MessageType::ok_return);
         transition("returning", input.now);
       } else if (phase_ != "returning" && phase_ != "downing" && phase_ != "disarming" &&
@@ -439,32 +517,43 @@ NavigationDecision Navigation::update(const NavigationInput & input)
   if (phase_ == "waiting_preflight") {
     if (input.preflight_ready && input.lcp_healthy && common::finite(input.telemetry.local_x_m) &&
       common::finite(input.telemetry.local_y_m) && common::finite(input.telemetry.local_z_m)) {
-      planner_.latch(input.telemetry.local_x_m, input.telemetry.local_y_m,
-        input.telemetry.local_z_m, input.telemetry.orientation);
-      emit(communication::MessageType::ok_wait);
-      transition("waiting_run_plan1", input.now);
+      transition("setpoint_warmup", input.now);
     }
   } else if (phase_ == "setpoint_warmup") {
     if (input.now - phase_started_at_ >= config_.setpoint_warmup_s) {
-      transition("offboard_request_pending", input.now);
+      emit(communication::MessageType::ok_wait);
+      transition("waiting_run_plan1", input.now);
     }
   } else if (phase_ == "offboard_request_pending") {
     if (input.controller.mode == "OFFBOARD") {transition("arming_request_pending", input.now);}
   } else if (phase_ == "arming_request_pending") {
     if (input.controller.mode != "OFFBOARD") {transition("offboard_request_pending", input.now);}
-    else if (input.controller.armed) {
-      planner_.set_relative_target(mission_.takeoff_height_m);
+    else if (input.controller.armed && input.preflight_ready) {
+      // The flight origin is immutable and is not created by ground setpoint warmup.
+      planner_.latch(input.telemetry.local_x_m, input.telemetry.local_y_m,
+        input.telemetry.local_z_m, input.telemetry.orientation);
+      control_.origin = planner_.current();
+      auto climb_goal = *control_.origin;
+      climb_goal.z_m += mission_.takeoff_height_m;
+      set_mission_goal(climb_goal);
+      plan_to_mission_goal();
       flight_started_at_ = input.now;
       transition("climb", input.now);
     }
-  } else if (phase_ == "climb") {
+  }
+
+  if (lcp_required_in_phase() && !input.lcp_healthy) {
+    enter_hold(input, "lcp_hold", "lcp_unhealthy");
+  }
+
+  if (phase_ == "climb") {
     if (planner_.target_reached() && stable_at(input.telemetry, planner_.current())) {
       transition("height_stabilizing", input.now);
     }
   } else if (phase_ == "height_stabilizing") {
     if (!planner_.target_reached() || !stable_at(input.telemetry, planner_.current())) {
       // 高度、水平位置任一离开容差时，必须重新满足连续稳定时长。
-      transition("climb", input.now);
+      phase_started_at_ = input.now;
     } else if (input.now - phase_started_at_ >= mission_.height_stable_seconds) {
       emit(communication::MessageType::ok_height);
       transition("tracking", input.now);
@@ -474,15 +563,18 @@ NavigationDecision Navigation::update(const NavigationInput & input)
       apply_car_target(input);
       car_target_pending_ = false;
     }
-    const bool fresh = latest_car_status_at_ && input.now >= *latest_car_status_at_ &&
-      input.now - *latest_car_status_at_ <= mission_.car_status_timeout_s;
-    if (!fresh && !car_hold_) {
-      if (common::finite(input.telemetry.local_x_m) && common::finite(input.telemetry.local_y_m)) {
-        planner_.freeze_xy_at(input.telemetry.local_x_m, input.telemetry.local_y_m);
-      } else {
-        planner_.hold_xy();
+    if (!car_status_fresh(input.now)) {
+      // Preserve the old goal for audit only; it must never be executed after timeout.
+      enter_hold(input, "waiting_car_status", "car_status_timeout", "waiting_car_status");
+    }
+  } else if (phase_ == "waiting_car_status") {
+    if (car_target_pending_) {
+      const bool applied = car_status_fresh(input.now) && apply_car_target(input);
+      car_target_pending_ = false;
+      if (applied) {
+        clear_hold();
+        transition("tracking", input.now);
       }
-      car_hold_ = true;
     }
   } else if (phase_ == "throwing") {
     if (input.gripper_failed) {
@@ -493,44 +585,48 @@ NavigationDecision Navigation::update(const NavigationInput & input)
       transition("awaiting_b_ok", input.now);
     }
   } else if (phase_ == "returning") {
-    if (planner_.target_reached() && actual_xy_within(
-        input.telemetry, planner_.origin_x_m(), planner_.origin_y_m(), config_.target_tolerance_m) &&
+    if (control_.origin && planner_.target_reached() && actual_xy_within(
+        input.telemetry, control_.origin->x_m, control_.origin->y_m, config_.target_tolerance_m) &&
       actual_yaw_within(input.telemetry, 0.0, 0.10)) {
-      planner_.hold_xy();
-      planner_.set_ground_target();
+      auto descent_goal = *control_.origin;
+      descent_goal.orientation = {0.0, 0.0, 0.0, 1.0};
+      set_mission_goal(descent_goal);
+      plan_to_mission_goal();
       normal_completion_ = true;
       emit(communication::MessageType::ok_downing);
       transition("downing", input.now);
     }
   } else if (phase_ == "lcp_hold") {
     if (input.lcp_healthy) {resume_hold(input.now);}
-    else if (input.now - phase_started_at_ > config_.lcp_unhealthy_hold_timeout_s) {
-      begin_landing(input.now, "lcp_unhealthy_timeout");
-    }
   } else if (phase_ == "downing" || phase_ == "landing") {
     const bool on_ground = input.telemetry.landed_state == common::MAV_LANDED_STATE_ON_GROUND;
-    const bool at_origin = common::finite(input.telemetry.local_z_m) && planner_.latched() &&
-      std::abs(input.telemetry.local_z_m - planner_.origin_z_m()) <= config_.touchdown_z_tolerance_m;
+    const bool at_origin = common::finite(input.telemetry.local_z_m) && control_.origin &&
+      std::abs(input.telemetry.local_z_m - control_.origin->z_m) <= config_.touchdown_z_tolerance_m;
     if (on_ground || (planner_.target_reached() && at_origin)) {transition("disarming", input.now);}
   } else if (phase_ == "disarming") {
     if (!input.controller.armed) {transition("manual_request_pending", input.now);}
-  } else if (phase_ == "manual_request_pending" && input.controller.mode == "MANUAL") {
+  } else if (phase_ == "manual_request_pending" &&
+    input.controller.mode == "MANUAL" && !input.controller.armed) {
     if (normal_completion_) {emit(communication::MessageType::ok_down);}
     transition("manual", input.now);
   }
 
-  const bool prearm_phase = phase_ == "waiting_run_plan1" || phase_ == "setpoint_warmup" ||
-    phase_ == "offboard_request_pending" || phase_ == "arming_request_pending";
-  if (prearm_phase && !input.preflight_ready) {reset();}
+  const bool waiting_gcs_phase = phase_ == "waiting_run_plan1" || phase_ == "setpoint_warmup";
+  if (waiting_gcs_phase && !input.preflight_ready) {
+    reset();
+  }
 
-  const bool lcp_required = phase_ == "climb" || phase_ == "height_stabilizing" ||
-    phase_ == "tracking" || phase_ == "throwing" ||
-    phase_ == "awaiting_b_ok" || phase_ == "returning";
-  if (lcp_required && !input.lcp_healthy) {enter_hold(input, "lcp_hold");}
+  const bool post_run_prearm_phase = phase_ == "offboard_request_pending" || phase_ == "arming_request_pending";
+  if (post_run_prearm_phase && !input.preflight_ready) {
+    // 已发出的 OFFBOARD/ARM 服务请求不能撤销；复用既有安全收尾状态显式反向请求。
+    reset();
+    transition("manual_request_pending", input.now);
+    reject("preflight_lost_before_arm");
+  }
 
   const bool airborne = phase_ != "waiting_preflight" && phase_ != "waiting_run_plan1" &&
     phase_ != "setpoint_warmup" && phase_ != "offboard_request_pending" &&
-    phase_ != "arming_request_pending" && phase_ != "manual";
+    phase_ != "arming_request_pending" && phase_ != "preflight_abort" && phase_ != "manual";
   if (airborne && phase_ != "landing" && phase_ != "downing" && phase_ != "disarming" &&
     phase_ != "manual_request_pending" && !input.flight_healthy) {
     begin_landing(input.now, input.health_errors.empty() ? "flight_health_failure" : input.health_errors.front());
@@ -549,8 +645,19 @@ NavigationDecision Navigation::update(const NavigationInput & input)
   decision.messages = pending_messages_;
   decision.rejections = pending_rejections_;
   decision.release_gripper = pending_release_gripper_;
-  if (planner_.latched() && phase_ != "waiting_preflight" && phase_ != "waiting_run_plan1" && phase_ != "manual") {
+  const bool ground_hold_stream = phase_ == "setpoint_warmup" || phase_ == "waiting_run_plan1" ||
+    phase_ == "offboard_request_pending" || phase_ == "arming_request_pending";
+  if (ground_hold_stream && common::finite(input.telemetry.local_x_m) &&
+    common::finite(input.telemetry.local_y_m) && common::finite(input.telemetry.local_z_m)) {
+    common::PositionSetpoint ground_hold{
+      input.telemetry.local_x_m, input.telemetry.local_y_m, input.telemetry.local_z_m,
+      common::normalize_quaternion(input.telemetry.orientation.x, input.telemetry.orientation.y,
+        input.telemetry.orientation.z, input.telemetry.orientation.w), 0.0};
+    decision.setpoint = ground_hold;
+    control_.commanded_setpoint = ground_hold;
+  } else if (planner_.latched() && phase_ != "waiting_preflight" && phase_ != "manual") {
     decision.setpoint = planner_.update(input.dt);
+    control_.commanded_setpoint = decision.setpoint;
   }
   if (phase_ == "offboard_request_pending" || phase_ == "arming_request_pending" || phase_ == "climb" ||
     phase_ == "height_stabilizing" ||
@@ -565,8 +672,9 @@ NavigationDecision Navigation::update(const NavigationInput & input)
     phase_ == "downing" || phase_ == "landing") {
     decision.arm_intent = true;
   }
-  if (phase_ == "disarming") {decision.arm_intent = false;}
+  if (phase_ == "disarming" || phase_ == "manual_request_pending") {decision.arm_intent = false;}
   if (phase_ == "manual_request_pending" || phase_ == "manual") {decision.target_mode = "MANUAL";}
+  decision.control = control_;
   return decision;
 }
 

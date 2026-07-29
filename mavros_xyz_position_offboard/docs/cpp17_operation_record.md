@@ -33,6 +33,7 @@ is copied into one `xyzstatus` datagram immediately. It is independent of event 
 | Parameter | Default | Meaning |
 | --- | ---: | --- |
 | `udp.event_retry_period_s` | `0.5` | Retry period for the oldest unacknowledged `ok_*`. |
+| `--setpoint-warmup` / `setpoint_warmup_s` | `2.0` | Init-hold setpoint publication time before `ok_wait`. |
 | `mission.takeoff_height_m` | `1.5` | Relative MAVROS local-Z climb from Init. |
 | `tracking.standoff_m` | `0.10` | Required horizontal UAV-to-car separation. |
 | `tracking.match_tolerance_m` | `0.10` | Acceptance tolerance for `match_car_ok`. |
@@ -85,10 +86,13 @@ values and the event order.
 
 - Existing CLI acknowledgements remain the only route to setpoint publication, mode request, and
   normal ARM/Disarm requests.
+- `run_plan1` does not start setpoint warmup; Init is latched and held for the configured warmup
+  before `ok_wait`, so `run_plan1` directly requests OFFBOARD/ARM and climb.
 - Duplicated `run_plan1`, `match_car_ok`, and `b_ok` do not repeat ARM, PWM release, return, or
   landing actions.
 - `car_status` is never extrapolated after its timeout; target radius is bounded from Init.
-- LCP failure holds then enters safe landing after the existing timeout; mode/flight-health loss
+- LCP failure during climb does not interrupt climb. Later LCP failure holds the measured
+  position until recovery, then resumes the interrupted final target; mode/flight-health loss
   and max-flight timeout retain their existing safe paths.
 - Normal completion means descend to Init, PX4 Disarm, and `MANUAL`; it never shuts down the Pi
   or removes FCU power.

@@ -480,7 +480,8 @@ std::vector<std::string> Initialization::preflight_errors(double now)
 }
 
 /// 聚合飞行期门禁，并检查相对漂移和 OFFBOARD 状态。
-std::vector<std::string> Initialization::flight_errors(double now, double hold_x_m, double hold_y_m, bool require_offboard, bool at_hover)
+std::vector<std::string> Initialization::flight_errors(
+  double now, double commanded_x_m, double commanded_y_m, bool require_offboard, bool at_hover)
 {
   auto errors = connection_errors(now, false);
   if (!telemetry_.armed) {errors.emplace_back("vehicle unexpectedly disarmed during flight phase");}
@@ -490,8 +491,8 @@ std::vector<std::string> Initialization::flight_errors(double now, double hold_x
   /// 将一类门禁错误追加到飞行期汇总列表。
   const auto append = [&errors](const std::vector<std::string> & more) {errors.insert(errors.end(), more.begin(), more.end());};
   append(battery_errors(now, true)); append(pose_velocity_errors(now, false, !at_hover)); append(estimator_errors(now)); append(range_flow_errors(now));
-  const double baseline_x = drift_baseline_x_m_.value_or(hold_x_m);
-  const double baseline_y = drift_baseline_y_m_.value_or(hold_y_m);
+  const double baseline_x = drift_baseline_x_m_.value_or(commanded_x_m);
+  const double baseline_y = drift_baseline_y_m_.value_or(commanded_y_m);
   if (common::finite(baseline_x) && common::finite(baseline_y) && common::finite(telemetry_.local_x_m) && common::finite(telemetry_.local_y_m)) {
     const double drift = std::hypot(telemetry_.local_x_m - baseline_x, telemetry_.local_y_m - baseline_y);
     const double limit = at_hover ? config_.max_flight_horizontal_drift_m : config_.climb_horizontal_drift_limit_m;
@@ -510,14 +511,15 @@ bool Initialization::optical_flow_effective(double now) const
 
 /// 复制本周期遥测，并一次性计算预检、飞行期和 LCP 派生健康结论。
 HealthSnapshot Initialization::health_snapshot(
-  double now, bool in_flight, double hold_x_m, double hold_y_m,
+  double now, bool in_flight, double commanded_x_m, double commanded_y_m,
   bool require_offboard, bool at_hover)
 {
   HealthSnapshot snapshot;
   snapshot.telemetry = telemetry_;
   snapshot.preflight_errors = preflight_errors(now);
   if (in_flight) {
-    snapshot.flight_errors = flight_errors(now, hold_x_m, hold_y_m, require_offboard, at_hover);
+    snapshot.flight_errors = flight_errors(
+      now, commanded_x_m, commanded_y_m, require_offboard, at_hover);
   }
   snapshot.lcp_healthy = lcp_runtime_healthy(now);
   snapshot.lcp_ready = lcp_ready(now);

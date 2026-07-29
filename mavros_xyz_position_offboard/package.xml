@@ -18,6 +18,11 @@
   <depend>lslidar_msgs</depend>
   <depend>jsoncpp</depend>
 
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>mavros</exec_depend>
+  <exec_depend>lslidar_driver</exec_depend>
+
   <test_depend>ament_cmake_gtest</test_depend>
 
   <export>

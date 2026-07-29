@@ -16,6 +16,7 @@ std::string upper(std::string value)
     [](unsigned char c) {return static_cast<char>(std::toupper(c));});
   return value;
 }
+
 }  // namespace
 
 /// 依据三级 CLI 授权分别创建发布器、模式客户端和 ARM 客户端。
@@ -39,7 +40,7 @@ void Offboard::observe_flight_state(const common::Telemetry & telemetry)
   status_.mode = upper(telemetry.mode);
 }
 
-/// 构造保留 XYZ+yaw 并忽略速度、加速度和 yaw-rate 的 LOCAL_NED 原始设定点。
+/// 构造保留 ROS ENU XYZ+yaw 的 LOCAL_NED 原始设定点，并忽略速度、加速度和 yaw-rate。
 mavros_msgs::msg::PositionTarget Offboard::make_position_target(
   const common::PositionSetpoint & setpoint, const builtin_interfaces::msg::Time & stamp)
 {
@@ -51,6 +52,7 @@ mavros_msgs::msg::PositionTarget Offboard::make_position_target(
     mavros_msgs::msg::PositionTarget::IGNORE_VY | mavros_msgs::msg::PositionTarget::IGNORE_VZ |
     mavros_msgs::msg::PositionTarget::IGNORE_AFX | mavros_msgs::msg::PositionTarget::IGNORE_AFY |
     mavros_msgs::msg::PositionTarget::IGNORE_AFZ | mavros_msgs::msg::PositionTarget::IGNORE_YAW_RATE;
+  // MAVROS 2.14 SetpointRawPlugin::local_cb() 会将此 ROS ENU 输入转换为 PX4 LOCAL_NED。
   message.position.x = setpoint.x_m;
   message.position.y = setpoint.y_m;
   message.position.z = setpoint.z_m;

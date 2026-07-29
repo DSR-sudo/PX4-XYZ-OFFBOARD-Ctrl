@@ -216,7 +216,9 @@ common::PositionSetpoint TrajectoryPlanner::current() const
 /// 校验任务的起飞、跟车、匹配和安全半径参数。
 void MissionConfig::validate() const
 {
-  const double values[] = {takeoff_height_m, standoff_m, match_tolerance_m, car_status_timeout_s, max_distance_m};
+  const double values[] = {
+    takeoff_height_m, height_stable_seconds, standoff_m, match_tolerance_m,
+    car_status_timeout_s, max_distance_m};
   for (const double value : values) {
     if (!common::finite(value) || value <= 0.0) {
       throw std::invalid_argument("mission configuration values must be finite and positive");
@@ -390,7 +392,8 @@ void Navigation::process_events(const NavigationInput & input)
         planner_.set_relative_target(0.0);
         transition("setpoint_warmup", input.now);
       } else if (phase_ != "setpoint_warmup" && phase_ != "offboard_request_pending" &&
-        phase_ != "arming_request_pending" && phase_ != "climb") {
+        phase_ != "arming_request_pending" && phase_ != "climb" &&
+        phase_ != "height_stabilizing") {
         reject("run_plan1_not_allowed_in_phase");
       }
       continue;
@@ -456,6 +459,13 @@ NavigationDecision Navigation::update(const NavigationInput & input)
     }
   } else if (phase_ == "climb") {
     if (planner_.target_reached() && stable_at(input.telemetry, planner_.current())) {
+      transition("height_stabilizing", input.now);
+    }
+  } else if (phase_ == "height_stabilizing") {
+    if (!planner_.target_reached() || !stable_at(input.telemetry, planner_.current())) {
+      // 高度、水平位置任一离开容差时，必须重新满足连续稳定时长。
+      transition("climb", input.now);
+    } else if (input.now - phase_started_at_ >= mission_.height_stable_seconds) {
       emit(communication::MessageType::ok_height);
       transition("tracking", input.now);
     }
@@ -513,7 +523,8 @@ NavigationDecision Navigation::update(const NavigationInput & input)
     phase_ == "offboard_request_pending" || phase_ == "arming_request_pending";
   if (prearm_phase && !input.preflight_ready) {reset();}
 
-  const bool lcp_required = phase_ == "climb" || phase_ == "tracking" || phase_ == "throwing" ||
+  const bool lcp_required = phase_ == "climb" || phase_ == "height_stabilizing" ||
+    phase_ == "tracking" || phase_ == "throwing" ||
     phase_ == "awaiting_b_ok" || phase_ == "returning";
   if (lcp_required && !input.lcp_healthy) {enter_hold(input, "lcp_hold");}
 
@@ -542,12 +553,14 @@ NavigationDecision Navigation::update(const NavigationInput & input)
     decision.setpoint = planner_.update(input.dt);
   }
   if (phase_ == "offboard_request_pending" || phase_ == "arming_request_pending" || phase_ == "climb" ||
+    phase_ == "height_stabilizing" ||
     phase_ == "tracking" || phase_ == "throwing" || phase_ == "awaiting_b_ok" || phase_ == "returning" ||
     phase_ == "lcp_hold" || phase_ == "downing") {
     decision.target_mode = "OFFBOARD";
   }
   if (phase_ == "landing" && !landing_reason_.empty()) {decision.target_mode = "AUTO.LAND";}
-  if (phase_ == "arming_request_pending" || phase_ == "climb" || phase_ == "tracking" ||
+  if (phase_ == "arming_request_pending" || phase_ == "climb" || phase_ == "height_stabilizing" ||
+    phase_ == "tracking" ||
     phase_ == "throwing" || phase_ == "awaiting_b_ok" || phase_ == "returning" || phase_ == "lcp_hold" ||
     phase_ == "downing" || phase_ == "landing") {
     decision.arm_intent = true;

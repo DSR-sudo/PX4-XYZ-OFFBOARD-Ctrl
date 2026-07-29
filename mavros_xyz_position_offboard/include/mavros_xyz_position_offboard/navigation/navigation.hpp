@@ -133,6 +133,7 @@ struct ControllerFeedback
 struct MissionConfig
 {
   double takeoff_height_m{1.5};
+  double height_stable_seconds{3.0};
   double standoff_m{0.10};
   double match_tolerance_m{0.10};
   double car_status_timeout_s{0.5};
@@ -187,7 +188,7 @@ public:
   const TrajectoryPlanner & planner() const {return planner_;}
 
 private:
-  /// 切换任务阶段、记录阶段开始时间并清除稳定计时。
+  /// 切换任务阶段并记录新阶段的开始时间。
   void transition(const std::string & phase, double now);
   /// 将一条待发送 GCS 业务消息加入本周期输出队列。
   void emit(communication::MessageType type);

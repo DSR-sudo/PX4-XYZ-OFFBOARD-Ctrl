@@ -128,6 +128,8 @@ public:
   void poll_lcp_start(double now, double timeout_s);
   /// 丢弃尚未完成的 LCP 请求句柄。
   void cancel_lcp_start();
+  /// 返回允许请求 LCP 建系服务的地面飞控条件错误，不检查电池或飞行传感器门禁。
+  std::vector<std::string> lcp_start_prerequisite_errors(double now) const;
 
   /// 判断 LCP 的状态和里程计在飞行期是否新鲜且健康。
   bool lcp_runtime_healthy(double now) const;

@@ -55,7 +55,7 @@ public:
   /// 从 Initialization 遥测同步飞控连接、ARM 和实际模式确认状态。
   void observe_flight_state(const common::Telemetry & telemetry);
 
-  /// 将内部 XYZ+yaw 位置设定点映射为 MAVROS LOCAL_NED PositionTarget。
+  /// 构造 ROS ENU XYZ+yaw 的 MAVROS LOCAL_NED PositionTarget，由 MAVROS 转换给 PX4。
   static mavros_msgs::msg::PositionTarget make_position_target(
     const common::PositionSetpoint & setpoint, const builtin_interfaces::msg::Time & stamp);
 

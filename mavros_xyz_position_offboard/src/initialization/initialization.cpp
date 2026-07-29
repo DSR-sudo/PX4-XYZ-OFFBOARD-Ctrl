@@ -312,6 +312,25 @@ void Initialization::poll_lcp_start(double now, double timeout_s)
 /// 丢弃正在等待的 LCP future，供预检候选重置使用。
 void Initialization::cancel_lcp_start() {lcp_start_future_.reset(); lcp_start_future_started_at_.reset();}
 
+/// 只检查 LCP 驱动服务允许清空地图的飞控地面条件，不依赖飞行电池和位置传感器。
+std::vector<std::string> Initialization::lcp_start_prerequisite_errors(double now) const
+{
+  std::vector<std::string> errors;
+  if (common::stale(telemetry_.state_at, now, config_.state_timeout_s)) {
+    errors.emplace_back("MAVROS state/heartbeat stale or unavailable for LCP initialization");
+  } else if (!telemetry_.connected) {
+    errors.emplace_back("MAVROS is not connected to the flight controller for LCP initialization");
+  } else if (telemetry_.armed) {
+    errors.emplace_back("vehicle is armed; LCP initialization requires disarmed state");
+  }
+  if (common::stale(telemetry_.landed_at, now, config_.landed_timeout_s)) {
+    errors.emplace_back("landed state stale or unavailable for LCP initialization");
+  } else if (telemetry_.landed_state != common::MAV_LANDED_STATE_ON_GROUND) {
+    errors.emplace_back("vehicle is not confirmed on ground for LCP initialization");
+  }
+  return errors;
+}
+
 /// 判定 STATUS=2、里程计和时间戳在飞行期均有效。
 bool Initialization::lcp_runtime_healthy(double now) const
 {

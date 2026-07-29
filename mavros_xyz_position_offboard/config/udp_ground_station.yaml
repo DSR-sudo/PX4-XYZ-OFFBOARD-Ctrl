@@ -12,6 +12,7 @@ mavros_native_xyz_position:
 
     mission:
       takeoff_height_m: 1.5
+      height_stable_seconds: 3.0
 
     tracking:
       standoff_m: 0.10

@@ -21,6 +21,9 @@ Initialization -- health/Z ----------+
   IP/port allowlist and the complete V2 object shape, and sends only to the fixed remote.
 - `Navigation` is a pure C++ state machine. It converts `car_status.distance/angle` to a
   local-ENU goal using measured vehicle position and yaw.
+- `Offboard` sends internal ENU position/yaw setpoints unchanged to MAVROS `PositionTarget`.
+  MAVROS 2.14 `SetpointRawPlugin::local_cb()` converts the ROS ENU input to PX4 `LOCAL_NED`;
+  the application must not convert it a second time.
 - `LcpVisionBridge` still publishes converted LCP external-vision pose. The application also
   subscribes to `lslidar_msgs/LcpDebug` on `/lcp/debug` and sends one `xyzstatus` per sample.
 - `PwmGripper` is a non-blocking `/sys/class/pwm/pwmchip*` adapter. Its default disabled mode
@@ -30,7 +33,7 @@ Mission order:
 
 ```text
 waiting_preflight -> ok_wait -> waiting_run_plan1 -> warmup/OFFBOARD/ARM
--> climb 1.5 m -> ok_height -> tracking -> PWM release -> ok_throw
+-> climb 1.5 m -> hold stable for 3 s -> ok_height -> tracking -> PWM release -> ok_throw
 -> b_ok -> ok_return -> return Init XY + world yaw 0 -> ok_downing
 -> descend Init Z -> Disarm -> MANUAL -> ok_down
 ```
@@ -58,6 +61,10 @@ UAV discrete events are `ok_wait`, `ok_height`, `ok_throw`, `ok_return`, `ok_dow
 away and retries it every `udp.event_retry_period_s` (default `0.5`). A GCS
 `{"header":"ack","data":{}}` acknowledges only that earliest event. `xyzstatus` is continuous
 and is neither queued nor acknowledged.
+
+GCS may apply its own map or business condition before sending `b_ok`. The UAV knows only its
+relative local coordinates, accepts `b_ok` in `awaiting_b_ok`, and then returns to its latched
+Init XY origin. `position_z_m`, `z_valid`, and the selected Z source are unrelated to `b_ok`.
 
 `car_status` expires after `tracking.car_status_timeout_s` (default `0.5`). The UAV freezes at
 measured position rather than extrapolating. `match_car_ok` is accepted only in tracking with a
@@ -99,7 +106,39 @@ loopback. No automated test drives a real PWM pin.
 ## Configuration and PWM Calibration
 
 Load [config/udp_ground_station.yaml](config/udp_ground_station.yaml) with ROS parameters. It
-contains the UDP allowlist/fixed remote, tracking, Z, and PWM defaults.
+contains the UDP allowlist/fixed remote, the `mission.takeoff_height_m: 1.5` and
+`mission.height_stable_seconds: 3.0` gate, tracking, Z, and PWM defaults. The 3-second timer only
+accumulates while measured XYZ remains within `--target-tolerance`; leaving the tolerance returns
+the state machine to climb and restarts the timer.
+
+## Unified Bringup
+
+Use the package launch file to start MAVROS, the N10P LSLIDAR driver, and this application under
+one ROS 2 launch supervisor:
+
+```bash
+cd /home/pi/px4-test-tools
+source /opt/ros/jazzy/setup.bash
+source /home/pi/LSLIDARN10P/install/setup.bash
+source install/setup.bash
+ros2 launch mavros_xyz_position_offboard flight_stack.launch.py
+```
+
+Its MAVROS defaults are the flight-controller serial URL
+`/dev/serial/by-id/usb-3D_Robotics_PX4_FMU_v5.x_0-if00:2000000` and GCS URL
+`udp://127.0.0.1:14551@`. It includes `lslidar_driver/lsn10p_launch.py`; once MAVROS telemetry,
+the N10P LCP service, and the disarmed/on-ground state are healthy, the application automatically
+calls `/lcp/start_initialization`. This permits safe no-battery LCP commissioning. Battery,
+position, range, optical-flow, estimator, and LCP-ready checks remain mandatory before the task
+can emit `ok_wait` or accept a flight command. A missing service is retried only while the ground
+conditions remain valid.
+
+The unified launch does not enable position setpoints, OFFBOARD requests, or arming. Those remain
+behind the existing explicit command-line confirmations, so starting the stack is suitable for
+the no-battery communication and sensor checks. Do not start this launch while another MAVROS or
+LSLIDAR process already owns the same serial device or ROS interfaces. When a verified MAVROS
+instance is already connected, retain it and start only the LSLIDAR/application portion with
+`start_mavros:=false`. For an isolated no-battery sensor check, also use `udp_enabled:=false`.
 
 Do not set `gripper_pwm.enabled:true` until a bench calibration has recorded the correct
 `chip_path`, `channel`, period, idle duty, and release duty. Enabled mode also requires a readable

@@ -50,6 +50,8 @@ install(TARGETS ${PROJECT_NAME}_core mavros_xyz_position_node
 install(DIRECTORY include/ DESTINATION include)
 install(FILES package.xml README.md DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
+install(DIRECTORY launch DESTINATION share/${PROJECT_NAME}
+  FILES_MATCHING PATTERN "*.launch.py")
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
@@ -59,6 +61,12 @@ if(BUILD_TESTING)
     ament_target_dependencies(test_lcp_navigation rclcpp lslidar_msgs)
     target_compile_definitions(test_lcp_navigation PRIVATE MAVROS_XYZ_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     target_compile_options(test_lcp_navigation PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+
+  ament_add_gtest(test_simulated_ground_station test/test_simulated_ground_station.cpp SKIP_LINKING_MAIN_LIBRARIES)
+  if(TARGET test_simulated_ground_station)
+    target_link_libraries(test_simulated_ground_station ${PROJECT_NAME}_core)
+    target_compile_options(test_simulated_ground_station PRIVATE -Wall -Wextra -Wpedantic)
   endif()
 endif()
 

@@ -62,6 +62,8 @@ navigation::MissionConfig ApplicationNode::load_mission_config()
 {
   navigation::MissionConfig value;
   value.takeoff_height_m = declare_parameter<double>("mission.takeoff_height_m", value.takeoff_height_m);
+  value.height_stable_seconds = declare_parameter<double>(
+    "mission.height_stable_seconds", value.height_stable_seconds);
   value.standoff_m = declare_parameter<double>("tracking.standoff_m", value.standoff_m);
   value.match_tolerance_m = declare_parameter<double>("tracking.match_tolerance_m", value.match_tolerance_m);
   value.car_status_timeout_s = declare_parameter<double>("tracking.car_status_timeout_s", value.car_status_timeout_s);
@@ -190,7 +192,9 @@ void ApplicationNode::tick()
   // 2. Capture one immutable health snapshot for this control cycle.
   auto health = initialization_.health_snapshot(now, in_flight, hold_x, hold_y, false, false);
   const auto & lcp_state = health.telemetry.lcp_init_request_state;
-  if (health.preflight_errors.empty() &&
+  // LCP 建系仅会清空地面地图，允许在电池未上电的传感器验收阶段先完成。
+  // 起飞仍由下方完整 preflight_errors 和 lcp_ready 两个门禁共同限制。
+  if (initialization_.lcp_start_prerequisite_errors(now).empty() &&
     (lcp_state == "not_requested" || lcp_state == "waiting_service")) {
     initialization_.request_lcp_start(now);
     health = initialization_.health_snapshot(now, in_flight, hold_x, hold_y, false, false);

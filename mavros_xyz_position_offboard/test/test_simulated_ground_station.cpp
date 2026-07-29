@@ -1,0 +1,409 @@
+#include <arpa/inet.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <cmath>
+#include <cstring>
+#include <iomanip>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include <gtest/gtest.h>
+#include <json/json.h>
+
+#include "mavros_xyz_position_offboard/common/types.hpp"
+#include "mavros_xyz_position_offboard/communication/ground_station_link.hpp"
+#include "mavros_xyz_position_offboard/gripper/pwm_gripper.hpp"
+#include "mavros_xyz_position_offboard/navigation/navigation.hpp"
+
+namespace
+{
+using mavros_xyz_position_offboard::common::MAV_LANDED_STATE_ON_GROUND;
+using mavros_xyz_position_offboard::common::PositionSetpoint;
+using mavros_xyz_position_offboard::common::SafetyConfig;
+using mavros_xyz_position_offboard::common::Telemetry;
+using mavros_xyz_position_offboard::communication::GroundStationConfig;
+using mavros_xyz_position_offboard::communication::GroundStationLink;
+using mavros_xyz_position_offboard::communication::MessageType;
+using mavros_xyz_position_offboard::communication::OutgoingMessage;
+using mavros_xyz_position_offboard::gripper::PwmGripper;
+using mavros_xyz_position_offboard::gripper::PwmGripperConfig;
+using mavros_xyz_position_offboard::gripper::ReleaseState;
+using mavros_xyz_position_offboard::navigation::MissionConfig;
+using mavros_xyz_position_offboard::navigation::Navigation;
+using mavros_xyz_position_offboard::navigation::NavigationDecision;
+using mavros_xyz_position_offboard::navigation::NavigationInput;
+
+constexpr double kPi = 3.14159265358979323846;
+constexpr double kMissionCommandWaitSeconds = 4.0;
+
+struct UdpEndpoint
+{
+  int fd{-1};
+  sockaddr_in address{};
+
+  ~UdpEndpoint()
+  {
+    if (fd >= 0) {::close(fd);}
+  }
+
+  UdpEndpoint() = default;
+  UdpEndpoint(const UdpEndpoint &) = delete;
+  UdpEndpoint & operator=(const UdpEndpoint &) = delete;
+  UdpEndpoint(UdpEndpoint && other) noexcept : fd(other.fd), address(other.address)
+  {
+    other.fd = -1;
+  }
+  UdpEndpoint & operator=(UdpEndpoint && other) noexcept
+  {
+    if (this == &other) {return *this;}
+    if (fd >= 0) {::close(fd);}
+    fd = other.fd;
+    address = other.address;
+    other.fd = -1;
+    return *this;
+  }
+
+  void close_socket()
+  {
+    if (fd >= 0) {
+      ::close(fd);
+      fd = -1;
+    }
+  }
+};
+
+/// 创建一个绑定在 127.0.0.1 临时端口的 UDP 端点。
+UdpEndpoint make_loopback_endpoint()
+{
+  UdpEndpoint endpoint;
+  endpoint.fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+  if (endpoint.fd < 0) {return endpoint;}
+  endpoint.address.sin_family = AF_INET;
+  endpoint.address.sin_port = 0;
+  ::inet_pton(AF_INET, "127.0.0.1", &endpoint.address.sin_addr);
+  if (::bind(endpoint.fd, reinterpret_cast<const sockaddr *>(&endpoint.address), sizeof(endpoint.address)) < 0) {
+    ::close(endpoint.fd);
+    endpoint.fd = -1;
+    return endpoint;
+  }
+  socklen_t length = sizeof(endpoint.address);
+  if (::getsockname(endpoint.fd, reinterpret_cast<sockaddr *>(&endpoint.address), &length) < 0) {
+    ::close(endpoint.fd);
+    endpoint.fd = -1;
+  }
+  return endpoint;
+}
+
+/// 将一条完整 JSON 数据报发送到给定端点。
+bool send_datagram(int fd, const sockaddr_in & destination, const std::string & json)
+{
+  const auto sent = ::sendto(fd, json.data(), json.size(), 0,
+    reinterpret_cast<const sockaddr *>(&destination), sizeof(destination));
+  return sent == static_cast<ssize_t>(json.size());
+}
+
+/// 在限定时间内接收一条 UDP 数据报，超时或错误时返回空值。
+std::optional<std::string> receive_datagram(int fd, int timeout_ms = 1000)
+{
+  pollfd descriptor{fd, POLLIN, 0};
+  if (::poll(&descriptor, 1, timeout_ms) <= 0 || (descriptor.revents & POLLIN) == 0) {
+    return std::nullopt;
+  }
+  char buffer[4096]{};
+  const auto received = ::recv(fd, buffer, sizeof(buffer), 0);
+  if (received <= 0) {return std::nullopt;}
+  return std::string(buffer, static_cast<std::size_t>(received));
+}
+
+/// 解析并返回协议根节点 header，同时验证最小事件对象形状。
+std::optional<std::string> event_header(const std::string & json)
+{
+  Json::CharReaderBuilder reader;
+  Json::Value root;
+  std::string errors;
+  std::istringstream input(json);
+  if (!Json::parseFromStream(reader, input, &root, &errors) || !root.isObject() ||
+    !root.isMember("header") || !root["header"].isString() || !root.isMember("data") ||
+    !root["data"].isObject() || !root["data"].empty()) {
+    return std::nullopt;
+  }
+  return root["header"].asString();
+}
+
+/// 将角度归一化到协议规定的 [-180, 180] 范围。
+double normalize_degrees(double degrees)
+{
+  while (degrees > 180.0) {degrees -= 360.0;}
+  while (degrees < -180.0) {degrees += 360.0;}
+  return degrees;
+}
+
+/// 根据虚拟车辆的世界坐标生成相对 UAV 机体的 car_status JSON。
+std::string car_status_json(const Telemetry & telemetry, double car_x_m, double car_y_m)
+{
+  const double dx = car_x_m - telemetry.local_x_m;
+  const double dy = car_y_m - telemetry.local_y_m;
+  const double distance = std::hypot(dx, dy);
+  const double world_bearing = std::atan2(dy, dx);
+  const double body_bearing = mavros_xyz_position_offboard::common::yaw_from_quaternion(
+    telemetry.orientation);
+  const double angle_degrees = normalize_degrees((world_bearing - body_bearing) * 180.0 / kPi);
+  std::ostringstream stream;
+  stream << std::fixed << std::setprecision(9)
+         << "{\"header\":\"car_status\",\"data\":{\"distance\":" << distance
+         << ",\"angle\":" << angle_degrees << "}}";
+  return stream.str();
+}
+
+/// 生成空 data 的 GCS 命令对象。
+std::string empty_command_json(const std::string & header)
+{
+  return "{\"header\":\"" + header + "\",\"data\":{}}";
+}
+
+/// 将模拟的实际飞行器遥测更新为本周期发出的规划设定点。
+void follow_setpoint(Telemetry & telemetry, const std::optional<PositionSetpoint> & setpoint)
+{
+  if (!setpoint) {return;}
+  telemetry.local_x_m = setpoint->x_m;
+  telemetry.local_y_m = setpoint->y_m;
+  telemetry.local_z_m = setpoint->z_m;
+  telemetry.orientation = setpoint->orientation;
+}
+
+/// 模拟 GCS 接收一个 ok_* 事件后立即发送最小 ACK。
+bool receive_event_and_ack(
+  UdpEndpoint & gcs, const sockaddr_in & uav_address, std::vector<std::string> & received_headers)
+{
+  const auto json = receive_datagram(gcs.fd);
+  if (!json) {return false;}
+  const auto header = event_header(*json);
+  if (!header || header->rfind("ok_", 0) != 0) {return false;}
+  received_headers.push_back(*header);
+  return send_datagram(gcs.fd, uav_address, empty_command_json("ack"));
+}
+}  // namespace
+
+TEST(SimulatedGroundStationTest, CompletesPayloadlessMissionOverLoopbackUdp)
+{
+  auto gcs = make_loopback_endpoint();
+  auto uav = make_loopback_endpoint();
+  ASSERT_GE(gcs.fd, 0);
+  ASSERT_GE(uav.fd, 0);
+
+  GroundStationConfig udp_config;
+  udp_config.bind_ip = "127.0.0.1";
+  udp_config.bind_port = ntohs(uav.address.sin_port);
+  udp_config.remote_ip = "127.0.0.1";
+  udp_config.remote_port = ntohs(gcs.address.sin_port);
+  udp_config.whitelist_ip = "127.0.0.1";
+  udp_config.whitelist_port = ntohs(gcs.address.sin_port);
+  udp_config.event_retry_period_s = 0.05;
+  // 临时端点仅用于分配可用端口；实际绑定必须由被测 GroundStationLink 独占。
+  uav.close_socket();
+  GroundStationLink link(udp_config);
+  ASSERT_TRUE(link.bound());
+
+  PwmGripperConfig gripper_config;
+  gripper_config.enabled = false;
+  gripper_config.release_delay_ms = 10;
+  gripper_config.release_hold_ms = 10;
+  PwmGripper gripper(gripper_config);
+  EXPECT_FALSE(gripper.enabled());
+
+  SafetyConfig safety;
+  safety.setpoint_warmup_s = 0.05;
+  safety.max_flight_seconds = 60.0;
+  safety.target_xy_max_speed_m_s = 3.0;
+  safety.target_xy_max_accel_m_s2 = 6.0;
+  safety.max_z_setpoint_rate_m_s = 2.0;
+  safety.max_z_setpoint_accel_m_s2 = 4.0;
+  safety.target_tolerance_m = 0.03;
+  MissionConfig mission;
+  mission.takeoff_height_m = 1.5;
+  mission.height_stable_seconds = 3.0;
+  mission.standoff_m = 0.10;
+  mission.match_tolerance_m = 0.02;
+  mission.car_status_timeout_s = 0.20;
+  mission.max_distance_m = 3.0;
+  Navigation navigation(safety, mission);
+
+  NavigationInput input;
+  input.dt = 0.05;
+  input.preflight_ready = true;
+  input.lcp_healthy = true;
+  input.flight_healthy = true;
+  input.telemetry.local_x_m = 0.0;
+  input.telemetry.local_y_m = 0.0;
+  input.telemetry.local_z_m = 0.0;
+  input.telemetry.orientation = {0.0, 0.0, 0.0, 1.0};
+  input.controller.mode = "MANUAL";
+  input.controller.armed = false;
+
+  double now = 0.0;
+  std::vector<std::string> received_headers;
+  bool transport_ok = true;
+  const auto tick = [&]() {
+      input.now = now;
+      input.events = link.poll(now);
+      const auto gripper_state = gripper.update(now);
+      input.gripper_succeeded = gripper_state == ReleaseState::succeeded;
+      input.gripper_failed = gripper_state == ReleaseState::failed;
+      const NavigationDecision decision = navigation.update(input);
+      if (decision.release_gripper && !gripper.begin_release(now)) {transport_ok = false;}
+      for (const OutgoingMessage & message : decision.messages) {
+        if (!link.send(message, now) || !receive_event_and_ack(gcs, uav.address, received_headers)) {
+          transport_ok = false;
+        }
+      }
+      follow_setpoint(input.telemetry, decision.setpoint);
+      now += input.dt;
+      return decision;
+    };
+  const auto send_gcs = [&](const std::string & json) {
+      if (!send_datagram(gcs.fd, uav.address, json)) {transport_ok = false;}
+    };
+  // 离散控制命令在虚拟实机时间中至少等待 4 秒；car_status 是连续状态上报，不使用该节奏。
+  const auto wait_before_mission_command = [&]() {
+      const double wait_started_at = now;
+      while (now - wait_started_at < kMissionCommandWaitSeconds) {tick();}
+    };
+  // 等待投放确认期间保持发送 car_status，避免因状态超时而丢失停靠目标。
+  const auto wait_before_match_command = [&](double car_x_m, double car_y_m) {
+      const double wait_started_at = now;
+      while (now - wait_started_at < kMissionCommandWaitSeconds) {
+        send_gcs(car_status_json(input.telemetry, car_x_m, car_y_m));
+        tick();
+      }
+    };
+
+  // 预检成功后发送 ok_wait；下一周期接收其 ACK，再发送起飞命令。
+  tick();
+  ASSERT_TRUE(transport_ok);
+  ASSERT_EQ(received_headers, std::vector<std::string>({"ok_wait"}));
+  tick();
+  EXPECT_EQ(link.pending_event_count(), 0U);
+
+  wait_before_mission_command();
+  send_gcs(empty_command_json("run_plan1"));
+  tick();
+  tick();
+  input.controller.mode = "OFFBOARD";
+  input.controller.armed = true;
+  for (int count = 0; count < 4 && navigation.phase() != "climb"; ++count) {tick();}
+  ASSERT_EQ(navigation.phase(), "climb");
+  for (int count = 0; count < 200 && navigation.phase() == "climb"; ++count) {tick();}
+  ASSERT_EQ(navigation.phase(), "height_stabilizing");
+  const double height_stabilizing_started_at = input.now;
+  for (int count = 0; count < 59; ++count) {
+    tick();
+    EXPECT_EQ(navigation.phase(), "height_stabilizing");
+    EXPECT_EQ(received_headers, std::vector<std::string>({"ok_wait"}));
+  }
+  for (int count = 0; count < 4 && navigation.phase() == "height_stabilizing"; ++count) {tick();}
+  EXPECT_GE(input.now - height_stabilizing_started_at, mission.height_stable_seconds);
+  ASSERT_TRUE(transport_ok);
+  ASSERT_EQ(navigation.phase(), "tracking");
+  ASSERT_EQ(received_headers, std::vector<std::string>({"ok_wait", "ok_height"}));
+  tick();
+  EXPECT_EQ(link.pending_event_count(), 0U);
+
+  // 右前方在协议的机体系 +X 前方、逆时针为正约定下为 -60 度。
+  const double first_direction_rad = -60.0 * kPi / 180.0;
+  const double first_target_x_m = std::cos(first_direction_rad);
+  const double first_target_y_m = std::sin(first_direction_rad);
+  const double first_car_x_m = (1.0 + mission.standoff_m) * std::cos(first_direction_rad);
+  const double first_car_y_m = (1.0 + mission.standoff_m) * std::sin(first_direction_rad);
+  const std::string first_car_status = car_status_json(
+    input.telemetry, first_car_x_m, first_car_y_m);
+  EXPECT_NE(first_car_status.find("\"distance\":1.100000000"), std::string::npos);
+  EXPECT_NE(first_car_status.find("\"angle\":-60.000000000"), std::string::npos);
+
+  // 虚拟车辆固定在第一段目标外的停靠距离处，连续 1 秒发送真实的相对极坐标。
+  for (int count = 0; count < 20; ++count) {
+    send_gcs(car_status_json(input.telemetry, first_car_x_m, first_car_y_m));
+    tick();
+  }
+  ASSERT_TRUE(transport_ok);
+  EXPECT_NEAR(navigation.planner().target_x_m(), first_target_x_m, 1e-6);
+  EXPECT_NEAR(navigation.planner().target_y_m(), first_target_y_m, 1e-6);
+
+  // 第一段已将机头指向 -60 度；第二段“正前方”沿该当前航向再前进 0.5 m。
+  const double second_target_x_m = 1.5 * std::cos(first_direction_rad);
+  const double second_target_y_m = 1.5 * std::sin(first_direction_rad);
+  const double second_car_x_m = (1.5 + mission.standoff_m) * std::cos(first_direction_rad);
+  const double second_car_y_m = (1.5 + mission.standoff_m) * std::sin(first_direction_rad);
+  for (int count = 0; count < 200; ++count) {
+    send_gcs(car_status_json(input.telemetry, second_car_x_m, second_car_y_m));
+    tick();
+    if (std::hypot(input.telemetry.local_x_m - second_target_x_m,
+        input.telemetry.local_y_m - second_target_y_m) <= safety.target_tolerance_m) {
+      break;
+    }
+  }
+  ASSERT_TRUE(transport_ok);
+  EXPECT_NEAR(input.telemetry.local_x_m, second_target_x_m, safety.target_tolerance_m);
+  EXPECT_NEAR(input.telemetry.local_y_m, second_target_y_m, safety.target_tolerance_m);
+
+  // 目标车辆已位于停靠距离，允许模拟投放；禁用 PWM 仍将按定时状态机报告成功。
+  send_gcs(car_status_json(input.telemetry, second_car_x_m, second_car_y_m));
+  tick();
+  wait_before_match_command(second_car_x_m, second_car_y_m);
+  send_gcs(car_status_json(input.telemetry, second_car_x_m, second_car_y_m));
+  tick();
+  send_gcs(empty_command_json("match_car_ok"));
+  const NavigationDecision match_decision = tick();
+  ASSERT_EQ(navigation.phase(), "throwing") << "link rejection=" << link.last_rejection()
+    << ", navigation rejection=" << (match_decision.rejections.empty() ? "none" : match_decision.rejections.front());
+  for (int count = 0; count < 20 && navigation.phase() == "throwing"; ++count) {tick();}
+  ASSERT_TRUE(transport_ok);
+  ASSERT_EQ(navigation.phase(), "awaiting_b_ok");
+  ASSERT_EQ(received_headers, std::vector<std::string>({"ok_wait", "ok_height", "ok_throw"}));
+  EXPECT_EQ(gripper.state(), ReleaseState::succeeded);
+  tick();
+  EXPECT_EQ(link.pending_event_count(), 0U);
+
+  wait_before_mission_command();
+  send_gcs(empty_command_json("b_ok"));
+  tick();
+  ASSERT_TRUE(transport_ok);
+  ASSERT_EQ(navigation.phase(), "returning");
+  ASSERT_EQ(received_headers, std::vector<std::string>({"ok_wait", "ok_height", "ok_throw", "ok_return"}));
+  tick();
+  EXPECT_EQ(link.pending_event_count(), 0U);
+
+  for (int count = 0; count < 200 && navigation.phase() == "returning"; ++count) {tick();}
+  ASSERT_TRUE(transport_ok);
+  ASSERT_EQ(navigation.phase(), "downing");
+  EXPECT_NEAR(input.telemetry.local_x_m, 0.0, safety.target_tolerance_m);
+  EXPECT_NEAR(input.telemetry.local_y_m, 0.0, safety.target_tolerance_m);
+  ASSERT_EQ(received_headers,
+    std::vector<std::string>({"ok_wait", "ok_height", "ok_throw", "ok_return", "ok_downing"}));
+  tick();
+  EXPECT_EQ(link.pending_event_count(), 0U);
+
+  input.telemetry.landed_state = MAV_LANDED_STATE_ON_GROUND;
+  tick();
+  ASSERT_EQ(navigation.phase(), "disarming");
+  input.controller.armed = false;
+  tick();
+  ASSERT_EQ(navigation.phase(), "manual_request_pending");
+  input.controller.mode = "MANUAL";
+  tick();
+  ASSERT_TRUE(transport_ok);
+  EXPECT_EQ(navigation.phase(), "manual");
+  ASSERT_EQ(received_headers,
+    std::vector<std::string>({"ok_wait", "ok_height", "ok_throw", "ok_return", "ok_downing", "ok_down"}));
+  tick();
+  EXPECT_EQ(link.pending_event_count(), 0U);
+}
+
+int main(int argc, char ** argv)
+{
+  ::testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}

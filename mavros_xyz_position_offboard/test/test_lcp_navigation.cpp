@@ -260,6 +260,21 @@ TEST(NavigationV2Test, CompleteMissionUsesPolarTrackingAndOrderedEvents)
     follow_planner(navigation, input);
     decision = navigation.update(input);
   }
+  ASSERT_EQ(navigation.phase(), "height_stabilizing");
+  const double height_stabilizing_started_at = input.now;
+  for (int i = 0; i < 59; ++i) {
+    input.now += 0.05;
+    follow_planner(navigation, input);
+    decision = navigation.update(input);
+    EXPECT_EQ(navigation.phase(), "height_stabilizing");
+    EXPECT_FALSE(has_message(decision, MessageType::ok_height));
+  }
+  for (int i = 0; i < 4 && navigation.phase() == "height_stabilizing"; ++i) {
+    input.now += 0.05;
+    follow_planner(navigation, input);
+    decision = navigation.update(input);
+  }
+  EXPECT_GE(input.now - height_stabilizing_started_at, mission.height_stable_seconds);
   ASSERT_EQ(navigation.phase(), "tracking");
   EXPECT_TRUE(has_message(decision, MessageType::ok_height));
 
@@ -315,7 +330,8 @@ TEST(NavigationV2Test, StaleCarHoldsPositionAndFailedGripperCanRetry)
   input.events.clear(); input.now = 0.03; navigation.update(input);
   input.controller.mode = "OFFBOARD"; input.now = 0.04; navigation.update(input);
   input.controller.armed = true; input.now = 0.05; navigation.update(input);
-  for (int i = 0; i < 800 && navigation.phase() == "climb"; ++i) {
+  for (int i = 0; i < 800 &&
+    (navigation.phase() == "climb" || navigation.phase() == "height_stabilizing"); ++i) {
     input.now += 0.05; follow_planner(navigation, input); navigation.update(input);
   }
   ASSERT_EQ(navigation.phase(), "tracking");
@@ -493,6 +509,29 @@ TEST(InitializationTest, LcpInitializationStillRequiresFreshPostRequestSamples)
   EXPECT_TRUE(initialization.lcp_ready(2.3));
 }
 
+TEST(InitializationTest, LcpStartPrerequisitesPermitGroundCommissioningWithoutBattery)
+{
+  auto node = std::make_shared<rclcpp::Node>(
+    "mavros_xyz_lcp_start_gate_test", rclcpp::NodeOptions().use_global_arguments(false));
+  AppOptions options;
+  options.range_topic = "/test/range";
+  options.optical_flow_topic = "/test/flow";
+  options.lcp_status_topic = "/test/lcp/status";
+  options.lcp_odometry_topic = "/test/lcp/odometry";
+  options.lcp_start_service = "/test/lcp/start";
+  SafetyConfig config;
+  Initialization initialization(*node, options, config);
+  initialization.update_state(true, false, "MANUAL", 0, 10.0);
+  initialization.update_landed(
+    mavros_xyz_position_offboard::common::MAV_LANDED_STATE_ON_GROUND, 10.0);
+  initialization.update_battery(true, 0.0, NAN, 10.0);
+  EXPECT_TRUE(initialization.lcp_start_prerequisite_errors(10.1).empty());
+  EXPECT_FALSE(initialization.preflight_errors(10.1).empty());
+
+  initialization.update_state(true, true, "MANUAL", 0, 10.2);
+  EXPECT_FALSE(initialization.lcp_start_prerequisite_errors(10.2).empty());
+}
+
 TEST(LcpVisionBridgeTest, ConvertsNwuToEnu)
 {
   nav_msgs::msg::Odometry source;
@@ -507,7 +546,7 @@ TEST(LcpVisionBridgeTest, ConvertsNwuToEnu)
   EXPECT_DOUBLE_EQ(output.pose.pose.position.y, 2.0);
 }
 
-TEST(OffboardMappingTest, PositionTargetUsesLocalNedFullPositionHold)
+TEST(OffboardMappingTest, PositionTargetPreservesRosEnuForMavrosConversion)
 {
   mavros_xyz_position_offboard::common::PositionSetpoint setpoint;
   setpoint.x_m = 1.0; setpoint.y_m = 2.0; setpoint.z_m = 3.0;
@@ -517,6 +556,10 @@ TEST(OffboardMappingTest, PositionTargetUsesLocalNedFullPositionHold)
   EXPECT_EQ(target.coordinate_frame, mavros_msgs::msg::PositionTarget::FRAME_LOCAL_NED);
   EXPECT_EQ(target.type_mask & mavros_msgs::msg::PositionTarget::IGNORE_PX, 0U);
   EXPECT_EQ(target.type_mask & mavros_msgs::msg::PositionTarget::IGNORE_YAW, 0U);
+  EXPECT_DOUBLE_EQ(target.position.x, 1.0);
+  EXPECT_DOUBLE_EQ(target.position.y, 2.0);
+  EXPECT_DOUBLE_EQ(target.position.z, 3.0);
+  EXPECT_NEAR(target.yaw, 0.0, 1e-6);
 }
 
 }  // namespace

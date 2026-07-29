@@ -375,9 +375,9 @@ TEST(NavigationV2Test, PreflightLossBeforeArmForcesManualAndDisarm)
   navigation.update(input);
   ASSERT_EQ(navigation.phase(), "arming_request_pending");
 
-  // 模拟模式切换前预检丢失；不得将预解锁回退误判为需要 AUTO.LAND 的飞行阶段。
+  // 模拟尚未解锁时预检丢失；仍应执行既有的地面安全回退。
   input.controller.mode = "OFFBOARD";
-  input.controller.armed = true;
+  input.controller.armed = false;
   input.preflight_ready = false;
   input.now = 0.05;
   const auto decision = navigation.update(input);
@@ -396,6 +396,108 @@ TEST(NavigationV2Test, PreflightLossBeforeArmForcesManualAndDisarm)
   input.now = 0.10;
   navigation.update(input);
   EXPECT_EQ(navigation.phase(), "manual");
+}
+
+TEST(NavigationV2Test, ArmedConfirmationIgnoresGroundPreflightAndStartsClimb)
+{
+  SafetyConfig safety;
+  safety.setpoint_warmup_s = 0.01;
+  MissionConfig mission;
+  mission.takeoff_height_m = 1.5;
+  Navigation navigation(safety, mission);
+  auto input = base_input(0.0);
+  navigation.update(input);
+  input.now = 0.01;
+  navigation.update(input);
+  input.now = 0.02;
+  input.events = {event(MessageType::run_plan1, input.now)};
+  navigation.update(input);
+  input.events.clear();
+  input.controller.mode = "OFFBOARD";
+  input.now = 0.03;
+  navigation.update(input);
+  ASSERT_EQ(navigation.phase(), "arming_request_pending");
+
+  input.controller.armed = true;
+  input.preflight_ready = false;
+  input.now = 0.04;
+  const auto decision = navigation.update(input);
+  EXPECT_EQ(navigation.phase(), "climb");
+  ASSERT_TRUE(decision.target_mode);
+  EXPECT_EQ(*decision.target_mode, "OFFBOARD");
+  ASSERT_TRUE(decision.arm_intent);
+  EXPECT_TRUE(*decision.arm_intent);
+  ASSERT_TRUE(decision.control.origin);
+  ASSERT_TRUE(decision.control.mission_goal);
+  EXPECT_NEAR(decision.control.origin->x_m, 0.0, 1e-9);
+  EXPECT_NEAR(decision.control.origin->y_m, 0.0, 1e-9);
+  EXPECT_NEAR(decision.control.origin->z_m, 0.0, 1e-9);
+  EXPECT_NEAR(decision.control.mission_goal->z_m, mission.takeoff_height_m, 1e-9);
+  EXPECT_FALSE(std::find(decision.rejections.begin(), decision.rejections.end(),
+    "preflight_lost_before_arm") != decision.rejections.end());
+}
+
+TEST(NavigationV2Test, FlightHealthFailureAfterArmRequestsAutoLand)
+{
+  SafetyConfig safety;
+  safety.setpoint_warmup_s = 0.01;
+  Navigation navigation(safety);
+  auto input = base_input(0.0);
+  navigation.update(input);
+  input.now = 0.01;
+  navigation.update(input);
+  input.now = 0.02;
+  input.events = {event(MessageType::run_plan1, input.now)};
+  navigation.update(input);
+  input.events.clear();
+  input.controller.mode = "OFFBOARD";
+  input.now = 0.03;
+  navigation.update(input);
+  ASSERT_EQ(navigation.phase(), "arming_request_pending");
+
+  input.controller.armed = true;
+  input.flight_healthy = false;
+  input.health_errors = {"range data stale"};
+  input.now = 0.04;
+  const auto decision = navigation.update(input);
+  EXPECT_EQ(navigation.phase(), "landing");
+  ASSERT_TRUE(decision.target_mode);
+  EXPECT_EQ(*decision.target_mode, "AUTO.LAND");
+  ASSERT_TRUE(decision.arm_intent);
+  EXPECT_TRUE(*decision.arm_intent);
+  EXPECT_FALSE(decision.control.origin);
+  EXPECT_FALSE(std::find(decision.rejections.begin(), decision.rejections.end(),
+    "preflight_lost_before_arm") != decision.rejections.end());
+}
+
+TEST(NavigationV2Test, OffboardLossAfterArmRequestsAutoLand)
+{
+  SafetyConfig safety;
+  safety.setpoint_warmup_s = 0.01;
+  Navigation navigation(safety);
+  auto input = base_input(0.0);
+  navigation.update(input);
+  input.now = 0.01;
+  navigation.update(input);
+  input.now = 0.02;
+  input.events = {event(MessageType::run_plan1, input.now)};
+  navigation.update(input);
+  input.events.clear();
+  input.controller.mode = "OFFBOARD";
+  input.now = 0.03;
+  navigation.update(input);
+  ASSERT_EQ(navigation.phase(), "arming_request_pending");
+
+  input.controller.armed = true;
+  input.controller.mode = "POSCTL";
+  input.now = 0.04;
+  const auto decision = navigation.update(input);
+  EXPECT_EQ(navigation.phase(), "landing");
+  ASSERT_TRUE(decision.target_mode);
+  EXPECT_EQ(*decision.target_mode, "AUTO.LAND");
+  ASSERT_TRUE(decision.arm_intent);
+  EXPECT_TRUE(*decision.arm_intent);
+  EXPECT_FALSE(decision.control.origin);
 }
 
 TEST(NavigationV2Test, LcpLossDuringClimbDoesNotInterruptClimb)
@@ -902,6 +1004,25 @@ TEST(InitializationTest, LcpStartPrerequisitesPermitGroundCommissioningWithoutBa
 
   initialization.update_state(true, true, "MANUAL", 0, 10.2);
   EXPECT_FALSE(initialization.lcp_start_prerequisite_errors(10.2).empty());
+}
+
+TEST(InitializationTest, ArmedTelemetryProducesFlightErrorsBeforeStateMachineEntersFlight)
+{
+  auto node = std::make_shared<rclcpp::Node>(
+    "mavros_xyz_armed_health_snapshot_test", rclcpp::NodeOptions().use_global_arguments(false));
+  AppOptions options;
+  options.range_topic = "/test/range";
+  options.optical_flow_topic = "/test/flow";
+  options.lcp_status_topic = "/test/lcp/status";
+  options.lcp_odometry_topic = "/test/lcp/odometry";
+  options.lcp_start_service = "/test/lcp/start";
+  SafetyConfig config;
+  Initialization initialization(*node, options, config);
+  initialization.update_state(true, true, "OFFBOARD", 0, 10.0);
+
+  const auto snapshot = initialization.health_snapshot(10.1, false, NAN, NAN);
+  EXPECT_TRUE(snapshot.telemetry.armed);
+  EXPECT_FALSE(snapshot.flight_errors.empty());
 }
 
 TEST(SafetyConfigTest, DefaultBatteryTelemetryTimeoutIsFiveSeconds)

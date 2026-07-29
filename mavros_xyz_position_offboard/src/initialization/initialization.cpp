@@ -517,7 +517,7 @@ HealthSnapshot Initialization::health_snapshot(
   HealthSnapshot snapshot;
   snapshot.telemetry = telemetry_;
   snapshot.preflight_errors = preflight_errors(now);
-  if (in_flight) {
+  if (in_flight || telemetry_.armed) {
     snapshot.flight_errors = flight_errors(
       now, commanded_x_m, commanded_y_m, require_offboard, at_hover);
   }

@@ -145,10 +145,12 @@ LSLIDAR process already owns the same serial device or ROS interfaces. When a ve
 instance is already connected, retain it and start only the LSLIDAR/application portion with
 `start_mavros:=false`. For an isolated no-battery sensor check, also use `udp_enabled:=false`.
 
-If preflight becomes invalid after `run_plan1` but before climb, the navigation state clears the
-task and reuses its existing `manual_request_pending` safety path to request Disarm plus `MANUAL`.
-It emits the machine-readable rejection `preflight_lost_before_arm`; audit records include both
-`preflight_errors` and `flight_errors` for diagnosis.
+If preflight becomes invalid after `run_plan1` and before ARM is confirmed, the navigation state
+clears the task and reuses its existing `manual_request_pending` safety path to request Disarm plus
+`MANUAL`. It emits the machine-readable rejection `preflight_lost_before_arm`. Once ARM is
+confirmed, preflight is no longer used: loss of OFFBOARD or flight health keeps the vehicle armed
+and requests `AUTO.LAND`. Audit records include both `preflight_errors` and `flight_errors` for
+diagnosis.
 
 Do not set `gripper_pwm.enabled:true` until a bench calibration has recorded the correct
 `chip_path`, `channel`, period, idle duty, and release duty. Enabled mode also requires a readable

@@ -527,8 +527,14 @@ NavigationDecision Navigation::update(const NavigationInput & input)
   } else if (phase_ == "offboard_request_pending") {
     if (input.controller.mode == "OFFBOARD") {transition("arming_request_pending", input.now);}
   } else if (phase_ == "arming_request_pending") {
-    if (input.controller.mode != "OFFBOARD") {transition("offboard_request_pending", input.now);}
-    else if (input.controller.armed && input.preflight_ready) {
+    if (!input.controller.armed) {
+      if (input.controller.mode != "OFFBOARD") {transition("offboard_request_pending", input.now);}
+    } else if (input.controller.mode != "OFFBOARD") {
+      begin_landing(input.now, "offboard_mode_lost");
+    } else if (!input.flight_healthy) {
+      begin_landing(input.now,
+        input.health_errors.empty() ? "flight_health_failure" : input.health_errors.front());
+    } else {
       // The flight origin is immutable and is not created by ground setpoint warmup.
       planner_.latch(input.telemetry.local_x_m, input.telemetry.local_y_m,
         input.telemetry.local_z_m, input.telemetry.orientation);
@@ -617,7 +623,7 @@ NavigationDecision Navigation::update(const NavigationInput & input)
   }
 
   const bool post_run_prearm_phase = phase_ == "offboard_request_pending" || phase_ == "arming_request_pending";
-  if (post_run_prearm_phase && !input.preflight_ready) {
+  if (post_run_prearm_phase && !input.controller.armed && !input.preflight_ready) {
     // 已发出的 OFFBOARD/ARM 服务请求不能撤销；复用既有安全收尾状态显式反向请求。
     reset();
     transition("manual_request_pending", input.now);

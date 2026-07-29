@@ -5,7 +5,6 @@
 
 #include <cmath>
 #include <cstring>
-#include <iomanip>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -37,7 +36,6 @@ using mavros_xyz_position_offboard::navigation::Navigation;
 using mavros_xyz_position_offboard::navigation::NavigationDecision;
 using mavros_xyz_position_offboard::navigation::NavigationInput;
 
-constexpr double kPi = 3.14159265358979323846;
 constexpr double kMissionCommandWaitSeconds = 4.0;
 
 struct UdpEndpoint
@@ -134,31 +132,6 @@ std::optional<std::string> event_header(const std::string & json)
   return root["header"].asString();
 }
 
-/// 将角度归一化到协议规定的 [-180, 180] 范围。
-double normalize_degrees(double degrees)
-{
-  while (degrees > 180.0) {degrees -= 360.0;}
-  while (degrees < -180.0) {degrees += 360.0;}
-  return degrees;
-}
-
-/// 根据虚拟车辆的世界坐标生成相对 UAV 机体的 car_status JSON。
-std::string car_status_json(const Telemetry & telemetry, double car_x_m, double car_y_m)
-{
-  const double dx = car_x_m - telemetry.local_x_m;
-  const double dy = car_y_m - telemetry.local_y_m;
-  const double distance = std::hypot(dx, dy);
-  const double world_bearing = std::atan2(dy, dx);
-  const double body_bearing = mavros_xyz_position_offboard::common::yaw_from_quaternion(
-    telemetry.orientation);
-  const double angle_degrees = normalize_degrees((world_bearing - body_bearing) * 180.0 / kPi);
-  std::ostringstream stream;
-  stream << std::fixed << std::setprecision(9)
-         << "{\"header\":\"car_status\",\"data\":{\"distance\":" << distance
-         << ",\"angle\":" << angle_degrees << "}}";
-  return stream.str();
-}
-
 /// 生成空 data 的 GCS 命令对象。
 std::string empty_command_json(const std::string & header)
 {
@@ -226,10 +199,9 @@ TEST(SimulatedGroundStationTest, CompletesPayloadlessMissionOverLoopbackUdp)
   MissionConfig mission;
   mission.takeoff_height_m = 1.5;
   mission.height_stable_seconds = 3.0;
-  mission.standoff_m = 0.10;
-  mission.match_tolerance_m = 0.02;
-  mission.car_status_timeout_s = 0.20;
-  mission.max_distance_m = 3.0;
+  mission.right_shift_m = 0.375;
+  mission.forward_distance_m = 1.0;
+  mission.match_hold_seconds = 0.5;
   Navigation navigation(safety, mission);
 
   NavigationInput input;
@@ -267,18 +239,10 @@ TEST(SimulatedGroundStationTest, CompletesPayloadlessMissionOverLoopbackUdp)
   const auto send_gcs = [&](const std::string & json) {
       if (!send_datagram(gcs.fd, uav.address, json)) {transport_ok = false;}
     };
-  // 离散控制命令在虚拟实机时间中至少等待 4 秒；car_status 是连续状态上报，不使用该节奏。
+  // 离散控制命令在虚拟实机时间中至少等待 4 秒。
   const auto wait_before_mission_command = [&]() {
       const double wait_started_at = now;
       while (now - wait_started_at < kMissionCommandWaitSeconds) {tick();}
-    };
-  // 等待投放确认期间保持发送 car_status，避免因状态超时而丢失停靠目标。
-  const auto wait_before_match_command = [&](double car_x_m, double car_y_m) {
-      const double wait_started_at = now;
-      while (now - wait_started_at < kMissionCommandWaitSeconds) {
-        send_gcs(car_status_json(input.telemetry, car_x_m, car_y_m));
-        tick();
-      }
     };
 
   // 预检成功后先保持 Init 设定点，预热完成才发送 ok_wait。
@@ -309,58 +273,53 @@ TEST(SimulatedGroundStationTest, CompletesPayloadlessMissionOverLoopbackUdp)
   for (int count = 0; count < 4 && navigation.phase() == "height_stabilizing"; ++count) {tick();}
   EXPECT_GE(input.now - height_stabilizing_started_at, mission.height_stable_seconds);
   ASSERT_TRUE(transport_ok);
-  ASSERT_EQ(navigation.phase(), "tracking");
+  ASSERT_EQ(navigation.phase(), "right_shift");
   ASSERT_EQ(received_headers, std::vector<std::string>({"ok_wait", "ok_height"}));
   tick();
   EXPECT_EQ(link.pending_event_count(), 0U);
 
-  // 右前方在协议的机体系 +X 前方、逆时针为正约定下为 -60 度。
-  const double first_direction_rad = -60.0 * kPi / 180.0;
-  const double first_target_x_m = std::cos(first_direction_rad);
-  const double first_target_y_m = std::sin(first_direction_rad);
-  const double first_car_x_m = (1.0 + mission.standoff_m) * std::cos(first_direction_rad);
-  const double first_car_y_m = (1.0 + mission.standoff_m) * std::sin(first_direction_rad);
-  const std::string first_car_status = car_status_json(
-    input.telemetry, first_car_x_m, first_car_y_m);
-  EXPECT_NE(first_car_status.find("\"distance\":1.100000000"), std::string::npos);
-  EXPECT_NE(first_car_status.find("\"angle\":-60.000000000"), std::string::npos);
-
-  // 虚拟车辆固定在第一段目标外的停靠距离处，连续 1 秒发送真实的相对极坐标。
-  for (int count = 0; count < 20; ++count) {
-    send_gcs(car_status_json(input.telemetry, first_car_x_m, first_car_y_m));
-    tick();
-  }
+  // The simulated GCS compares the initial coordinates with the post-shift coordinates.
+  const double alignment_start_x_m = 0.0;
+  const double alignment_start_y_m = 0.0;
+  for (int count = 0; count < 200 && navigation.phase() == "right_shift"; ++count) {tick();}
   ASSERT_TRUE(transport_ok);
-  EXPECT_NEAR(navigation.planner().target_x_m(), first_target_x_m, 1e-6);
-  EXPECT_NEAR(navigation.planner().target_y_m(), first_target_y_m, 1e-6);
+  ASSERT_EQ(navigation.phase(), "waiting_go_ahead");
+  const double right_shift_m = alignment_start_y_m - input.telemetry.local_y_m;
+  EXPECT_NEAR(input.telemetry.local_x_m, alignment_start_x_m, safety.target_tolerance_m);
+  EXPECT_GE(right_shift_m, 0.35);
+  EXPECT_LE(right_shift_m, 0.40);
+  const bool black_line_centered = true;  // Vision pipeline verdict supplied to the GCS.
+  ASSERT_TRUE(black_line_centered);
 
-  // 第一段已将机头指向 -60 度；第二段“正前方”沿该当前航向再前进 0.5 m。
-  const double second_target_x_m = 1.5 * std::cos(first_direction_rad);
-  const double second_target_y_m = 1.5 * std::sin(first_direction_rad);
-  const double second_car_x_m = (1.5 + mission.standoff_m) * std::cos(first_direction_rad);
-  const double second_car_y_m = (1.5 + mission.standoff_m) * std::sin(first_direction_rad);
-  for (int count = 0; count < 200; ++count) {
-    send_gcs(car_status_json(input.telemetry, second_car_x_m, second_car_y_m));
+  send_gcs(empty_command_json("go_ahead_ok"));
+  tick();
+  ASSERT_TRUE(transport_ok);
+  ASSERT_EQ(navigation.phase(), "pursuing_car");
+  EXPECT_NEAR(navigation.planner().target_x_m(), mission.forward_distance_m, 1e-6);
+  EXPECT_NEAR(navigation.planner().target_y_m(), -mission.right_shift_m, 1e-6);
+
+  // GCS-owned vision locates the car and sends match only once horizontal distance is below 0.1 m.
+  const double car_x_m = 0.60;
+  const double car_y_m = -mission.right_shift_m;
+  bool match_sent = false;
+  double match_command_at = 0.0;
+  NavigationDecision match_decision;
+  for (int count = 0; count < 200 && !match_sent; ++count) {
     tick();
-    if (std::hypot(input.telemetry.local_x_m - second_target_x_m,
-        input.telemetry.local_y_m - second_target_y_m) <= safety.target_tolerance_m) {
-      break;
+    if (std::hypot(input.telemetry.local_x_m - car_x_m,
+        input.telemetry.local_y_m - car_y_m) < 0.10) {
+      match_command_at = now;
+      send_gcs(empty_command_json("match_car_ok"));
+      match_decision = tick();
+      match_sent = true;
     }
   }
-  ASSERT_TRUE(transport_ok);
-  EXPECT_NEAR(input.telemetry.local_x_m, second_target_x_m, safety.target_tolerance_m);
-  EXPECT_NEAR(input.telemetry.local_y_m, second_target_y_m, safety.target_tolerance_m);
-
-  // 目标车辆已位于停靠距离，允许模拟投放；禁用 PWM 仍将按定时状态机报告成功。
-  send_gcs(car_status_json(input.telemetry, second_car_x_m, second_car_y_m));
-  tick();
-  wait_before_match_command(second_car_x_m, second_car_y_m);
-  send_gcs(car_status_json(input.telemetry, second_car_x_m, second_car_y_m));
-  tick();
-  send_gcs(empty_command_json("match_car_ok"));
-  const NavigationDecision match_decision = tick();
-  ASSERT_EQ(navigation.phase(), "throwing") << "link rejection=" << link.last_rejection()
+  ASSERT_TRUE(match_sent);
+  ASSERT_EQ(navigation.phase(), "match_hold") << "link rejection=" << link.last_rejection()
     << ", navigation rejection=" << (match_decision.rejections.empty() ? "none" : match_decision.rejections.front());
+  for (int count = 0; count < 20 && navigation.phase() == "match_hold"; ++count) {tick();}
+  EXPECT_GE(now - match_command_at, mission.match_hold_seconds);
+  ASSERT_EQ(navigation.phase(), "throwing");
   for (int count = 0; count < 20 && navigation.phase() == "throwing"; ++count) {tick();}
   ASSERT_TRUE(transport_ok);
   ASSERT_EQ(navigation.phase(), "awaiting_b_ok");

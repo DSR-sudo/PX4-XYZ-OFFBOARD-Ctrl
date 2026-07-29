@@ -22,11 +22,7 @@ ApplicationNode::ApplicationNode(
   const common::AppOptions & options, const common::SafetyConfig & config)
 : Node("mavros_native_xyz_position"), options_(options), config_(config),
   initialization_(*this, options_, config_), mission_config_(load_mission_config()),
-  ground_station_([this]() {
-      auto value = load_ground_station_config();
-      value.max_tracking_distance_m = mission_config_.max_distance_m;
-      return value;
-    }()), navigation_(config_, mission_config_), offboard_(*this, options_),
+  ground_station_(load_ground_station_config()), navigation_(config_, mission_config_), offboard_(*this, options_),
   lcp_vision_bridge_(*this, options_), z_config_(load_z_config()), gripper_(load_gripper_config()),
   artifact_log_(options_.artifact_dir, options_.output == "jsonl")
 {
@@ -64,10 +60,11 @@ navigation::MissionConfig ApplicationNode::load_mission_config()
   value.takeoff_height_m = declare_parameter<double>("mission.takeoff_height_m", value.takeoff_height_m);
   value.height_stable_seconds = declare_parameter<double>(
     "mission.height_stable_seconds", value.height_stable_seconds);
-  value.standoff_m = declare_parameter<double>("tracking.standoff_m", value.standoff_m);
-  value.match_tolerance_m = declare_parameter<double>("tracking.match_tolerance_m", value.match_tolerance_m);
-  value.car_status_timeout_s = declare_parameter<double>("tracking.car_status_timeout_s", value.car_status_timeout_s);
-  value.max_distance_m = declare_parameter<double>("tracking.max_distance_m", value.max_distance_m);
+  value.right_shift_m = declare_parameter<double>("mission.right_shift_m", value.right_shift_m);
+  value.forward_distance_m = declare_parameter<double>(
+    "mission.forward_distance_m", value.forward_distance_m);
+  value.match_hold_seconds = declare_parameter<double>(
+    "mission.match_hold_seconds", value.match_hold_seconds);
   value.validate();
   return value;
 }

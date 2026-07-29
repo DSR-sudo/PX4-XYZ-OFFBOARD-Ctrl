@@ -13,7 +13,7 @@ namespace mavros_xyz_position_offboard::communication
 enum class MessageType
 {
   run_plan1,
-  car_status,
+  go_ahead_ok,
   match_car_ok,
   b_ok,
   ack,
@@ -32,19 +32,12 @@ std::string to_string(MessageType type);
 /// True only for the ordered, ACK-required UAV event headers.
 bool is_discrete_event(MessageType type);
 
-struct CarStatus
-{
-  double distance_m{0.0};
-  double angle_deg{0.0};
-};
-
 struct ProtocolEvent
 {
   MessageType type{MessageType::invalid};
   double received_at{0.0};
   bool accepted{false};
   std::string rejection_reason{};
-  std::optional<CarStatus> car_status{};
 };
 
 /// A ROS header represented without a ROS dependency in the protocol value layer.

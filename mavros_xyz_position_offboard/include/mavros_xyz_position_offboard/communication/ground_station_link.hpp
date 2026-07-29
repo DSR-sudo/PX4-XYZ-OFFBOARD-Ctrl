@@ -21,9 +21,8 @@ struct GroundStationConfig
   std::string whitelist_ip{"192.168.10.59"};
   int whitelist_port{5005};
   double event_retry_period_s{0.5};
-  double max_tracking_distance_m{5.0};
 
-  /// Validates endpoint, retry and incoming car-status limits.
+  /// Validates endpoint and ordered-event retry configuration.
   void validate() const;
 };
 

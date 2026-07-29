@@ -31,3 +31,9 @@ python3 /home/pi/px4-test-tools/mavros_xyz_position_offboard/test/simulated_grou
   --uav-port 5005 \
   --command-wait-s 4.0 \
   --max-duration-s 180.0
+
+  python3 /home/pi/px4-test-tools/mavros_xyz_position_offboard/test/simulated_ground_station_udp.py \
+  --bind-ip 127.0.0.1 --bind-port 5006 \
+  --uav-ip 127.0.0.1 --uav-port 5005 \
+  --command-wait-s 4.0 --max-duration-s 180.0 \
+  --line-centered

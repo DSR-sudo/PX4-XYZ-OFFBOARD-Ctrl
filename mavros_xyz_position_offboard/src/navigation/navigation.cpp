@@ -228,19 +228,19 @@ common::PositionSetpoint TrajectoryPlanner::current() const
   return {x_m_, y_m_, command_z_m_, orientation_, vertical_rate_m_s_};
 }
 
-/// 校验任务的起飞、跟车、匹配和安全半径参数。
+/// 校验任务的起飞、右移、前飞和匹配等待参数。
 void MissionConfig::validate() const
 {
   const double values[] = {
-    takeoff_height_m, height_stable_seconds, standoff_m, match_tolerance_m,
-    car_status_timeout_s, max_distance_m};
+    takeoff_height_m, height_stable_seconds, right_shift_m, forward_distance_m,
+    match_hold_seconds};
   for (const double value : values) {
     if (!common::finite(value) || value <= 0.0) {
       throw std::invalid_argument("mission configuration values must be finite and positive");
     }
   }
-  if (standoff_m > max_distance_m) {
-    throw std::invalid_argument("tracking standoff must not exceed maximum distance");
+  if (right_shift_m < 0.35 || right_shift_m > 0.40) {
+    throw std::invalid_argument("right shift must be within 0.35..0.40 m");
   }
 }
 
@@ -258,9 +258,6 @@ void Navigation::reset()
   phase_ = "waiting_preflight";
   phase_started_at_ = 0.0;
   flight_started_at_.reset();
-  latest_car_status_.reset();
-  latest_car_status_at_.reset();
-  car_target_pending_ = false;
   normal_completion_ = false;
   control_ = {};
   pending_messages_.clear();
@@ -385,72 +382,55 @@ void Navigation::clear_hold()
   control_.mission_paused = false;
 }
 
-/// LCP 恢复后禁止恢复超时前的车辆目标，必须等待新 car_status。
+/// LCP 恢复后从冻结的实测位置连续重规划到中断前的任务目标。
 void Navigation::resume_hold(double now)
 {
-  const std::string resume = control_.hold_resume_phase.empty() ? "tracking" : control_.hold_resume_phase;
-  if (resume == "waiting_car_status") {
-    control_.hold_reason = "car_status_timeout";
-    control_.hold_resume_phase = "waiting_car_status";
-    control_.mission_paused = true;
-    transition(resume, now);
-    return;
-  }
+  const std::string resume = control_.hold_resume_phase.empty() ? "pursuing_car" : control_.hold_resume_phase;
   plan_to_mission_goal();
   clear_hold();
   transition(resume, now);
 }
 
-/// 根据最新车辆距离和相对方位创建新的受限跟车任务最终目标。
-bool Navigation::apply_car_target(const NavigationInput & input)
+/// 使用锁存起飞航向的右侧方向，为地面站的黑线对线检查规划横移。
+void Navigation::begin_right_shift()
 {
-  if (!latest_car_status_ || !planner_.latched() || !control_.origin) {return false;}
-  const auto & car = *latest_car_status_;
-  if (!common::finite(input.telemetry.local_x_m) || !common::finite(input.telemetry.local_y_m)) {
-    reject("tracking_local_pose_invalid");
-    return false;
+  if (!control_.origin || !control_.mission_goal) {
+    throw std::logic_error("right shift requires a latched mission origin and climb goal");
   }
-  double vehicle_yaw = 0.0;
-  try {
-    vehicle_yaw = common::yaw_from_quaternion(common::normalize_quaternion(
-      input.telemetry.orientation.x, input.telemetry.orientation.y,
-      input.telemetry.orientation.z, input.telemetry.orientation.w));
-  } catch (const std::invalid_argument &) {
-    reject("tracking_yaw_invalid");
-    return false;
-  }
-  constexpr double kPi = 3.14159265358979323846;
-  const double target_yaw = vehicle_yaw + car.angle_deg * kPi / 180.0;
-  const double travel_m = car.distance_m - mission_.standoff_m;
-  const double target_x = input.telemetry.local_x_m + travel_m * std::cos(target_yaw);
-  const double target_y = input.telemetry.local_y_m + travel_m * std::sin(target_yaw);
-  if (std::hypot(target_x - control_.origin->x_m, target_y - control_.origin->y_m) > mission_.max_distance_m) {
-    reject("tracking_target_out_of_safety_envelope");
-    return false;
-  }
-  const double target_z = control_.mission_goal ? control_.mission_goal->z_m : planner_.current().z_m;
-  set_mission_goal({target_x, target_y, target_z,
-    {0.0, 0.0, std::sin(0.5 * target_yaw), std::cos(0.5 * target_yaw)}, 0.0});
+  const double yaw = common::yaw_from_quaternion(control_.origin->orientation);
+  auto goal = *control_.mission_goal;
+  goal.x_m = control_.origin->x_m + mission_.right_shift_m * std::sin(yaw);
+  goal.y_m = control_.origin->y_m - mission_.right_shift_m * std::cos(yaw);
+  goal.orientation = control_.origin->orientation;
+  set_mission_goal(goal);
   plan_to_mission_goal();
-  return true;
 }
 
-/// 接收时间而不是旧目标决定车辆状态能否继续驱动任务。
-bool Navigation::car_status_fresh(double now) const
+/// 从横移后的目标沿锁存起飞航向前飞；距离由部署参数限制。
+void Navigation::begin_forward_pursuit()
 {
-  return latest_car_status_at_ && now >= *latest_car_status_at_ &&
-    now - *latest_car_status_at_ <= mission_.car_status_timeout_s;
+  if (!control_.mission_goal || !control_.origin) {
+    throw std::logic_error("forward pursuit requires a right-shift mission goal");
+  }
+  const double yaw = common::yaw_from_quaternion(control_.origin->orientation);
+  auto goal = *control_.mission_goal;
+  goal.x_m += mission_.forward_distance_m * std::cos(yaw);
+  goal.y_m += mission_.forward_distance_m * std::sin(yaw);
+  goal.orientation = control_.origin->orientation;
+  set_mission_goal(goal);
+  plan_to_mission_goal();
 }
 
 /// 爬升不依赖运行期 LCP，其余需要位置任务语义的阶段必须冻结。
 bool Navigation::lcp_required_in_phase() const
 {
-  return phase_ == "height_stabilizing" || phase_ == "tracking" ||
-    phase_ == "waiting_car_status" || phase_ == "throwing" ||
+  return phase_ == "height_stabilizing" || phase_ == "right_shift" ||
+    phase_ == "waiting_go_ahead" || phase_ == "pursuing_car" || phase_ == "match_hold" ||
+    phase_ == "throwing" ||
     phase_ == "awaiting_b_ok" || phase_ == "returning";
 }
 
-/// 按当前任务阶段处理 ACK、跟车、投放和返航协议事件。
+/// 按当前任务阶段处理 ACK、前飞放行、匹配、投放和返航协议事件。
 void Navigation::process_events(const NavigationInput & input)
 {
   for (const auto & event : input.events) {
@@ -459,12 +439,6 @@ void Navigation::process_events(const NavigationInput & input)
       continue;
     }
     if (event.type == communication::MessageType::ack) {continue;}
-    if (event.type == communication::MessageType::car_status) {
-      latest_car_status_ = event.car_status;
-      latest_car_status_at_ = event.received_at;
-      if (phase_ == "tracking" || phase_ == "waiting_car_status") {car_target_pending_ = true;}
-      continue;
-    }
     if (event.type == communication::MessageType::run_plan1) {
       if (phase_ == "waiting_run_plan1") {
         transition("offboard_request_pending", input.now);
@@ -474,14 +448,25 @@ void Navigation::process_events(const NavigationInput & input)
       }
       continue;
     }
+    if (event.type == communication::MessageType::go_ahead_ok) {
+      if (phase_ == "waiting_go_ahead") {
+        begin_forward_pursuit();
+        transition("pursuing_car", input.now);
+      } else if (phase_ != "pursuing_car" && phase_ != "match_hold" && phase_ != "throwing" &&
+        phase_ != "awaiting_b_ok" && phase_ != "returning" && phase_ != "downing" &&
+        phase_ != "disarming" && phase_ != "manual_request_pending" && phase_ != "manual") {
+        reject("go_ahead_ok_not_allowed_in_phase");
+      }
+      continue;
+    }
     if (event.type == communication::MessageType::match_car_ok) {
-      const bool matched = car_status_fresh(input.now) && latest_car_status_ &&
-        std::abs(latest_car_status_->distance_m - mission_.standoff_m) <= mission_.match_tolerance_m;
-      if (phase_ == "tracking" && matched) {
-        pending_release_gripper_ = true;
-        transition("throwing", input.now);
-      } else if (phase_ != "throwing") {
-        reject("match_car_ok_requires_fresh_standoff");
+      if (phase_ == "pursuing_car") {
+        // Ground station owns vision and distance verification; preserve the forward goal for retries.
+        enter_hold(input, "match_hold", "match_confirmed_hold", "pursuing_car");
+      } else if (phase_ != "match_hold" && phase_ != "throwing" && phase_ != "awaiting_b_ok" &&
+        phase_ != "returning" && phase_ != "downing" && phase_ != "disarming" &&
+        phase_ != "manual_request_pending" && phase_ != "manual") {
+        reject("match_car_ok_not_allowed_in_phase");
       }
       continue;
     }
@@ -562,31 +547,26 @@ NavigationDecision Navigation::update(const NavigationInput & input)
       phase_started_at_ = input.now;
     } else if (input.now - phase_started_at_ >= mission_.height_stable_seconds) {
       emit(communication::MessageType::ok_height);
-      transition("tracking", input.now);
+      begin_right_shift();
+      transition("right_shift", input.now);
     }
-  } else if (phase_ == "tracking") {
-    if (car_target_pending_) {
-      apply_car_target(input);
-      car_target_pending_ = false;
+  } else if (phase_ == "right_shift") {
+    if (planner_.target_reached() && stable_at(input.telemetry, planner_.current())) {
+      transition("waiting_go_ahead", input.now);
     }
-    if (!car_status_fresh(input.now)) {
-      // Preserve the old goal for audit only; it must never be executed after timeout.
-      enter_hold(input, "waiting_car_status", "car_status_timeout", "waiting_car_status");
-    }
-  } else if (phase_ == "waiting_car_status") {
-    if (car_target_pending_) {
-      const bool applied = car_status_fresh(input.now) && apply_car_target(input);
-      car_target_pending_ = false;
-      if (applied) {
-        clear_hold();
-        transition("tracking", input.now);
-      }
+  } else if (phase_ == "match_hold") {
+    if (input.now - phase_started_at_ >= mission_.match_hold_seconds) {
+      pending_release_gripper_ = true;
+      transition("throwing", input.now);
     }
   } else if (phase_ == "throwing") {
     if (input.gripper_failed) {
       reject("gripper_release_failed");
-      transition("tracking", input.now);
+      plan_to_mission_goal();
+      clear_hold();
+      transition("pursuing_car", input.now);
     } else if (input.gripper_succeeded) {
+      clear_hold();
       emit(communication::MessageType::ok_throw);
       transition("awaiting_b_ok", input.now);
     }
@@ -666,15 +646,17 @@ NavigationDecision Navigation::update(const NavigationInput & input)
     control_.commanded_setpoint = decision.setpoint;
   }
   if (phase_ == "offboard_request_pending" || phase_ == "arming_request_pending" || phase_ == "climb" ||
-    phase_ == "height_stabilizing" ||
-    phase_ == "tracking" || phase_ == "throwing" || phase_ == "awaiting_b_ok" || phase_ == "returning" ||
+    phase_ == "height_stabilizing" || phase_ == "right_shift" || phase_ == "waiting_go_ahead" ||
+    phase_ == "pursuing_car" || phase_ == "match_hold" || phase_ == "throwing" ||
+    phase_ == "awaiting_b_ok" || phase_ == "returning" ||
     phase_ == "lcp_hold" || phase_ == "downing") {
     decision.target_mode = "OFFBOARD";
   }
   if (phase_ == "landing" && !landing_reason_.empty()) {decision.target_mode = "AUTO.LAND";}
   if (phase_ == "arming_request_pending" || phase_ == "climb" || phase_ == "height_stabilizing" ||
-    phase_ == "tracking" ||
-    phase_ == "throwing" || phase_ == "awaiting_b_ok" || phase_ == "returning" || phase_ == "lcp_hold" ||
+    phase_ == "right_shift" || phase_ == "waiting_go_ahead" || phase_ == "pursuing_car" ||
+    phase_ == "match_hold" || phase_ == "throwing" || phase_ == "awaiting_b_ok" ||
+    phase_ == "returning" || phase_ == "lcp_hold" ||
     phase_ == "downing" || phase_ == "landing") {
     decision.arm_intent = true;
   }

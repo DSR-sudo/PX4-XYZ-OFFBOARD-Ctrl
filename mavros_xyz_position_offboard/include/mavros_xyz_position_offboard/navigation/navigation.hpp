@@ -124,12 +124,11 @@ struct MissionConfig
 {
   double takeoff_height_m{1.5};
   double height_stable_seconds{3.0};
-  double standoff_m{0.10};
-  double match_tolerance_m{0.10};
-  double car_status_timeout_s{0.5};
-  double max_distance_m{5.0};
+  double right_shift_m{0.375};
+  double forward_distance_m{5.0};
+  double match_hold_seconds{0.5};
 
-  /// 校验起飞、跟车和距离限制参数均为有效的正值。
+  /// 校验起飞、右移、前飞和匹配等待参数。
   void validate() const;
 };
 
@@ -158,7 +157,7 @@ struct ControlState
   std::optional<common::PositionSetpoint> mission_goal{};
   /// 最近一次交给 Offboard 发布的 ENU XYZ+yaw 命令。
   std::optional<common::PositionSetpoint> commanded_setpoint{};
-  /// LCP 或跟车数据失效时锁定的实测 XYZ 与最近命令偏航。
+  /// LCP 失效或匹配等待时锁定的实测 XYZ 与最近命令偏航。
   std::optional<common::PositionSetpoint> hold_setpoint{};
   std::string hold_reason{};
   std::string hold_resume_phase{};
@@ -225,7 +224,7 @@ private:
     const std::string & reason, const std::optional<std::string> & resume_phase = std::nullopt);
   /// 清除保持元数据，不触碰任务最终目标。
   void clear_hold();
-  /// 从冻结位置连续重规划到任务最终目标，或恢复等待新车辆状态。
+  /// 从冻结位置连续重规划到任务最终目标。
   void resume_hold(double now);
   /// 固定水平位置、规划返回初始化 Z，并进入正常或故障降落阶段。
   void begin_landing(double now, const std::string & reason = {});
@@ -235,10 +234,10 @@ private:
   bool stable_at(const common::Telemetry & telemetry, const common::PositionSetpoint & target) const;
   /// 判断实测偏航角是否已接近目标世界航向。
   bool actual_yaw_within(const common::Telemetry & telemetry, double yaw_rad, double tolerance_rad) const;
-  /// 依据最新 car_status 生成一次受安全半径保护的 ENU 跟踪任务最终目标。
-  bool apply_car_target(const NavigationInput & input);
-  /// 判断最后一条车辆状态在本周期是否仍然新鲜。
-  bool car_status_fresh(double now) const;
+  /// 以锁存的初始偏航为基准规划 35--40 cm 的右移对线动作。
+  void begin_right_shift();
+  /// 从右移终点沿锁存的初始航向规划受限的前飞追车动作。
+  void begin_forward_pursuit();
   /// 判断阶段是否必须因 LCP 不健康冻结位置。
   bool lcp_required_in_phase() const;
 
@@ -248,9 +247,6 @@ private:
   std::string phase_{"waiting_preflight"};
   double phase_started_at_{0.0};
   std::optional<double> flight_started_at_{};
-  std::optional<communication::CarStatus> latest_car_status_{};
-  std::optional<double> latest_car_status_at_{};
-  bool car_target_pending_{false};
   bool normal_completion_{false};
   ControlState control_{};
   std::vector<communication::OutgoingMessage> pending_messages_{};

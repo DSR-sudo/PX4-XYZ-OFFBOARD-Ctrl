@@ -21,8 +21,8 @@ Initialization -- health/Z ----------+
   IP/port allowlist and the complete V2 object shape, and sends only to the fixed remote.
 - `Navigation` is a pure C++ state machine. It keeps an immutable ARM-time `origin`, a task
   `mission_goal`, the published `commanded_setpoint`, and a separate temporary `hold_setpoint`.
-  It converts `car_status.distance/angle` to a local-ENU mission goal using measured vehicle
-  position and yaw.
+  It plans the bounded right shift and straight pursuit from the ARM-time heading; GCS vision
+  remains responsible for alignment and car-distance decisions.
 - `Offboard` sends internal ENU position/yaw setpoints unchanged to MAVROS `PositionTarget`.
   MAVROS 2.14 `SetpointRawPlugin::local_cb()` converts the ROS ENU input to PX4 `LOCAL_NED`;
   the application must not convert it a second time.
@@ -36,7 +36,8 @@ Mission order:
 ```text
 waiting_preflight -> ground-hold warmup -> ok_wait -> waiting_run_plan1
 -> run_plan1 -> OFFBOARD/ARM -> latch origin and climb 1.5 m -> hold stable for 3 s -> ok_height
--> tracking -> PWM release -> ok_throw -> b_ok -> ok_return
+-> right-shift 0.375 m -> wait for go_ahead_ok -> bounded forward pursuit
+-> GCS distance match (<0.1 m) -> hold 0.5 s -> PWM release -> ok_throw -> b_ok -> ok_return
 -> return Init XY + world yaw 0 -> ok_downing -> descend Init Z -> Disarm -> MANUAL -> ok_down
 ```
 
@@ -53,10 +54,8 @@ Every packet has exactly this root shape:
 {"header":"<name>","data":{}}
 ```
 
-GCS sends `run_plan1`, `match_car_ok`, `b_ok`, and `ack` with an empty `data` object; it sends
-`car_status` with exactly `distance` (m) and `angle` (degrees). Distance is the horizontal UAV
-to vehicle separation. Angle is measured from body `+X`, counter-clockwise positive, in
-`[-180, 180]`.
+GCS sends `run_plan1`, `go_ahead_ok`, `match_car_ok`, `b_ok`, and `ack` with an empty `data`
+object. `car_status` is no longer an accepted UAV command.
 
 UAV discrete events are `ok_wait`, `ok_height`, `ok_throw`, `ok_return`, `ok_downing`, and
 `ok_down`. They are ordered in an ACK queue. The UAV sends the earliest unsatisfied event right
@@ -68,11 +67,14 @@ GCS may apply its own map or business condition before sending `b_ok`. The UAV k
 relative local coordinates, accepts `b_ok` in `awaiting_b_ok`, and then returns to its latched
 Init XY origin. `position_z_m`, `z_valid`, and the selected Z source are unrelated to `b_ok`.
 
-`car_status` expires after `tracking.car_status_timeout_s` (default `0.5`). The UAV freezes at
-measured XYZ and enters `waiting_car_status`; the previous goal remains audit-only and is never
-resumed. Only a new fresh status creates a new mission goal. `match_car_ok` is accepted only in
-tracking with a fresh status inside `tracking.standoff_m +/- tracking.match_tolerance_m`;
-duplicate commands are phase-idempotent and cannot re-arm, release twice, or restart return.
+After `ok_height`, the UAV translates `mission.right_shift_m` (validated to 0.35--0.40 m) to its
+initial-heading right side and waits. The GCS must compare the initial and translated `xyzstatus`
+coordinates and independently verify that the black line is centered in its video before sending
+`go_ahead_ok`. The UAV then flies its bounded `mission.forward_distance_m` path. The GCS owns car
+recognition and the `<0.1 m` distance decision; it sends `match_car_ok` only after that check.
+The UAV holds the confirmed position for `mission.match_hold_seconds` (default `0.5`) before the
+disabled-by-default gripper release path. Duplicate commands are phase-idempotent and cannot
+re-arm, release twice, or restart return.
 
 ## LCP and Z
 
@@ -112,7 +114,8 @@ loopback. No automated test drives a real PWM pin.
 
 Load [config/udp_ground_station.yaml](config/udp_ground_station.yaml) with ROS parameters. It
 contains the UDP allowlist/fixed remote, the `mission.takeoff_height_m: 1.5` and
-`mission.height_stable_seconds: 3.0` gate, tracking, Z, and PWM defaults. The 3-second timer only
+`mission.height_stable_seconds: 3.0` gate, right-shift/forward/match defaults, Z, and PWM
+defaults. The 3-second timer only
 accumulates while measured XYZ remains within `--target-tolerance`; leaving the tolerance returns
 the state machine to climb and restarts the timer.
 
@@ -155,7 +158,7 @@ diagnosis.
 Do not set `gripper_pwm.enabled:true` until a bench calibration has recorded the correct
 `chip_path`, `channel`, period, idle duty, and release duty. Enabled mode also requires a readable
 `gripper_pwm.pinmux_path` containing `gripper_pwm.pinmux_expected`; failure to export the PWM,
-write period/duty/enable, check permissions, or verify pinmux leaves the task in tracking and
+write period/duty/enable, check permissions, or verify pinmux resumes bounded pursuit and
 withholds `ok_throw`. A later `match_car_ok` retries the release.
 
 Run in this order: no-prop bench and standalone PWM calibration, PX4 SITL, then controlled flight.

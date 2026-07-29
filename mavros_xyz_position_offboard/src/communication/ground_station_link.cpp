@@ -70,12 +70,6 @@ bool only_members(const Json::Value & value, const std::vector<std::string> & al
   return true;
 }
 
-/// 判断 JSON 值是否为有限数值。
-bool finite_number(const Json::Value & value)
-{
-  return value.isNumeric() && std::isfinite(value.asDouble());
-}
-
 /// 将有限浮点值编码为 JSON 数值文本。
 std::string number(double value)
 {
@@ -127,7 +121,7 @@ std::string to_string(MessageType type)
 {
   switch (type) {
     case MessageType::run_plan1: return "run_plan1";
-    case MessageType::car_status: return "car_status";
+    case MessageType::go_ahead_ok: return "go_ahead_ok";
     case MessageType::match_car_ok: return "match_car_ok";
     case MessageType::b_ok: return "b_ok";
     case MessageType::ack: return "ack";
@@ -150,7 +144,7 @@ bool is_discrete_event(MessageType type)
          type == MessageType::ok_downing || type == MessageType::ok_down;
 }
 
-/// 校验 UDP 端点、重传周期和跟车距离上限配置。
+/// 校验 UDP 端点和重传周期配置。
 void GroundStationConfig::validate() const
 {
   if (!valid_ipv4(bind_ip) || !valid_ipv4(remote_ip) || !valid_ipv4(whitelist_ip)) {
@@ -159,9 +153,8 @@ void GroundStationConfig::validate() const
   if (!valid_port(bind_port) || !valid_port(remote_port) || !valid_port(whitelist_port)) {
     throw std::invalid_argument("UDP ports must be within 1..65535");
   }
-  if (!std::isfinite(event_retry_period_s) || !std::isfinite(max_tracking_distance_m) ||
-    event_retry_period_s <= 0.0 || max_tracking_distance_m <= 0.0) {
-    throw std::invalid_argument("UDP retry period and tracking distance must be finite and positive");
+  if (!std::isfinite(event_retry_period_s) || event_retry_period_s <= 0.0) {
+    throw std::invalid_argument("UDP retry period must be finite and positive");
   }
 }
 
@@ -232,24 +225,14 @@ ProtocolEvent GroundStationLink::decode_datagram(
   event.received_at = now;
   const std::string header = root["header"].asString();
   const auto & data = root["data"];
-  if (header == "run_plan1" || header == "match_car_ok" || header == "b_ok" || header == "ack") {
+  if (header == "run_plan1" || header == "go_ahead_ok" || header == "match_car_ok" ||
+    header == "b_ok" || header == "ack") {
     if (!data.empty()) {return reject("nonempty_event_data", now);}
     event.type = header == "run_plan1" ? MessageType::run_plan1 :
+      (header == "go_ahead_ok" ? MessageType::go_ahead_ok :
       (header == "match_car_ok" ? MessageType::match_car_ok :
-      (header == "b_ok" ? MessageType::b_ok : MessageType::ack));
+      (header == "b_ok" ? MessageType::b_ok : MessageType::ack)));
     if (event.type == MessageType::ack) {acknowledge_earliest();}
-  } else if (header == "car_status") {
-    if (!only_members(data, {"distance", "angle"}) || !data.isMember("distance") ||
-      !data.isMember("angle") || !finite_number(data["distance"]) || !finite_number(data["angle"])) {
-      return reject("invalid_car_status_data", now);
-    }
-    const double distance = data["distance"].asDouble();
-    const double angle = data["angle"].asDouble();
-    if (distance < 0.0 || distance > config_.max_tracking_distance_m || angle < -180.0 || angle > 180.0) {
-      return reject("car_status_out_of_range", now);
-    }
-    event.type = MessageType::car_status;
-    event.car_status = CarStatus{distance, angle};
   } else {
     return reject("unknown_or_wrong_direction_header", now);
   }

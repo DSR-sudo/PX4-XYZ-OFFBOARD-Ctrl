@@ -56,8 +56,8 @@ UAV 读取 `udp.bind_*`、`udp.remote_*`、`udp.whitelist_*` 参数。入站数�
 | 方向 | 消息 | 含义 |
 | --- | --- | --- |
 | GCS -> UAV | `run_plan1` | 在 `ok_wait` 后启动设定点预热、OFFBOARD、ARM 和 1.5 m 爬升。 |
-| GCS -> UAV | `car_status` | 提供 `distance`（m）和相对机体 `+X` 的 `angle`（度）。 |
-| GCS -> UAV | `match_car_ok` | 仅在新鲜且满足停靠距离的跟车状态下请求投放。 |
+| GCS -> UAV | `go_ahead_ok` | 仅在坐标右移 0.35--0.40 m 且图传黑线居中后放行前飞。 |
+| GCS -> UAV | `match_car_ok` | GCS 图传识别小车并确认水平距离 `<0.1 m` 后请求投放。 |
 | GCS -> UAV | `b_ok` | 在成功投放后启动返航。 |
 | GCS -> UAV | `ack` | 确认当前最早的未确认 `ok_*` 事件。 |
 | UAV -> GCS | `ok_wait`、`ok_height`、`ok_throw`、`ok_return`、`ok_downing`、`ok_down` | 有序、需要 ACK 的离散阶段事件。 |
@@ -67,10 +67,12 @@ UAV 读取 `udp.bind_*`、`udp.remote_*`、`udp.whitelist_*` 参数。入站数�
 `udp.event_retry_period_s`（默认 `0.5 s`）重发，直至收到 `{"header":"ack","data":{}}`。
 `xyzstatus` 不进入该队列，不能 ACK。
 
-`car_status.angle` 以当前机体/航向 `+X` 为零度、逆时针为正，范围为 `[-180, 180]`。收到新鲜
-样本时，UAV 计算车辆方位并保持 `tracking.standoff_m`（默认 `0.10 m`）距离；超过
-`tracking.car_status_timeout_s`（默认 `0.5 s`）未收到有效样本时，UAV 固定在实测 XY，
-不会外推车辆运动。
+UAV 不再接收 `car_status`。到达高度并稳定 3 s 后，UAV 按锁存起飞航向右移
+`mission.right_shift_m`（强制限制为 0.35--0.40 m）。GCS 对比移前/移后 `xyzstatus` 坐标，
+并独立验证图传黑线位于视觉中心后发送 `go_ahead_ok`。UAV 随后沿初始航向前飞，最大距离由
+`mission.forward_distance_m`（默认 `5.0 m`）限制；GCS 持续计算图传中小车和飞机的距离，在
+`<0.1 m` 时发送 `match_car_ok`。UAV 保持当前位置 `mission.match_hold_seconds`（默认 `0.5 s`）
+后进入默认禁用夹爪的投放流程。
 
 ## 任务状态机
 
@@ -82,15 +84,16 @@ UAV 读取 `udp.bind_*`、`udp.remote_*`、`udp.whitelist_*` 参数。入站数�
   -> 等待 run_plan1
   -> 设定点预热 -> OFFBOARD -> 普通 ARM
   -> 相对 Init 爬升 1.5 m、发送 ok_height
-  -> 根据 car_status 跟车
-  -> match_car_ok 通过停靠门限 -> PWM 投放 -> ok_throw
+  -> 右移 0.35--0.40 m，等待 go_ahead_ok
+  -> 受限前飞，GCS 距离 <0.1 m 后发送 match_car_ok
+  -> 保持 0.5 s -> PWM 投放 -> ok_throw
   -> b_ok -> 返航 Init XY、世界偏航 0 -> ok_return
   -> 开始下降 -> ok_downing
   -> 着陆 -> 普通 Disarm -> MANUAL -> ok_down
 ```
 
-`Navigation` 对 XY 和 Z 使用五次多项式轨迹，并通过延长轨迹时间限制速度和加速度。跟车目标始终
-限制在距 Init XY 的 `tracking.max_distance_m` 内。LCP 在爬升、跟车、投放或返航阶段失效时，
+`Navigation` 对 XY 和 Z 使用五次多项式轨迹，并通过延长轨迹时间限制速度和加速度。前飞目标由
+`mission.forward_distance_m` 限制。LCP 在爬升、右移、前飞、投放或返航阶段失效时，
 任务会冻结可靠位置；超过 LCP 保持超时、飞控模式丢失、飞行健康失败或最大飞行时间后，进入安全
 降落路径。
 

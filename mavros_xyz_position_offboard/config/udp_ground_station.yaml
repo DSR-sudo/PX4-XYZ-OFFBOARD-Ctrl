@@ -13,12 +13,12 @@ mavros_native_xyz_position:
     mission:
       takeoff_height_m: 1.5
       height_stable_seconds: 3.0
-
-    tracking:
-      standoff_m: 0.10
-      match_tolerance_m: 0.10
-      car_status_timeout_s: 0.5
-      max_distance_m: 5.0
+      # Initial-heading body-right translation used for black-line alignment.
+      right_shift_m: 0.375
+      # Bounded straight-line pursuit after the GCS sends go_ahead_ok.
+      forward_distance_m: 5.0
+      # Hold at the GCS-confirmed vehicle match point before release.
+      match_hold_seconds: 0.5
 
     z:
       prefer_range: false

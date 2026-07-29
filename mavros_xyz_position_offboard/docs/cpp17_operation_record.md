@@ -10,7 +10,7 @@
 | `gripper/` | Non-blocking Pi Linux PWM sysfs adapter with testable chip-path root. |
 | `initialization/` | Existing MAVROS telemetry, preflight/flight health, LCP start, RangeGuard, and ROS source timestamps. |
 | `bridge/` | Existing LCP NWU-to-ENU external-vision publisher. |
-| `config/udp_ground_station.yaml` | UDP, tracking, Z source, and PWM parameters. |
+| `config/udp_ground_station.yaml` | UDP, mission motion, Z source, and PWM parameters. |
 
 No module creates an internal ROS topic. The ROS executor remains single-threaded.
 
@@ -35,10 +35,9 @@ is copied into one `xyzstatus` datagram immediately. It is independent of event 
 | `udp.event_retry_period_s` | `0.5` | Retry period for the oldest unacknowledged `ok_*`. |
 | `--setpoint-warmup` / `setpoint_warmup_s` | `2.0` | Init-hold setpoint publication time before `ok_wait`. |
 | `mission.takeoff_height_m` | `1.5` | Relative MAVROS local-Z climb from Init. |
-| `tracking.standoff_m` | `0.10` | Required horizontal UAV-to-car separation. |
-| `tracking.match_tolerance_m` | `0.10` | Acceptance tolerance for `match_car_ok`. |
-| `tracking.car_status_timeout_s` | `0.5` | Freshness limit; stale status freezes measured XY. |
-| `tracking.max_distance_m` | `5.0` | Maximum tracking target radius from Init XY and inbound distance bound. |
+| `mission.right_shift_m` | `0.375` | Initial-heading right shift; startup validation restricts it to 0.35--0.40 m. |
+| `mission.forward_distance_m` | `5.0` | Bounded straight-line distance after GCS `go_ahead_ok`. |
+| `mission.match_hold_seconds` | `0.5` | Wait at the GCS-confirmed match point before release. |
 | `z.prefer_range` | `false` | Select Range-relative Z after field calibration. |
 | `z.source_timeout_s` | `0.5` | Freshness limit for pose/Range Z sources. |
 | `z.range_cross_check_max_delta_m` | `0.30` | Maximum local-vs-Range relative-Z disagreement. |
@@ -62,7 +61,7 @@ check fields.
 
 When enabled, preparation performs pinmux text validation, chip/channel existence or export,
 sysfs permission/open checks, period write, idle duty write, and enable. Any failure reports
-`failed`, does not send `ok_throw`, and returns the mission to tracking for a fresh
+`failed`, does not send `ok_throw`, and resumes bounded pursuit for a fresh
 `match_car_ok` retry. No automatic test uses `/sys/class/pwm`.
 
 ## Build and Acceptance
@@ -90,7 +89,9 @@ values and the event order.
   before `ok_wait`, so `run_plan1` directly requests OFFBOARD/ARM and climb.
 - Duplicated `run_plan1`, `match_car_ok`, and `b_ok` do not repeat ARM, PWM release, return, or
   landing actions.
-- `car_status` is never extrapolated after its timeout; target radius is bounded from Init.
+- `go_ahead_ok` is accepted only after the bounded 0.35--0.40 m right shift has completed.
+- `match_car_ok` is accepted only during bounded forward pursuit; the GCS owns black-line, car,
+  and `<0.1 m` distance verification.
 - LCP failure during climb does not interrupt climb. Later LCP failure holds the measured
   position until recovery, then resumes the interrupted final target; mode/flight-health loss
   and max-flight timeout retain their existing safe paths.

@@ -11,11 +11,11 @@
 namespace mavros_xyz_position_offboard::navigation
 {
 
-/// Pure bounded XYZ+yaw trajectory generator. It has no task or protocol state.
+/// 纯值类型的有界 XYZ 加偏航轨迹生成器，不包含任务或协议状态。
 class TrajectoryPlanner
 {
 public:
-  /// 使用统一安全配置创建无任务状态的 XYZ+yaw 轨迹规划器。
+  /// 使用统一安全配置创建无任务状态的 XYZ 加偏航轨迹规划器。
   explicit TrajectoryPlanner(const common::SafetyConfig & config);
 
   /// 清除锁存位置和轨迹，使规划器回到未初始化状态。
@@ -40,7 +40,7 @@ public:
   void set_ground_target();
   /// 将输出姿态改为指定世界偏航角。
   void set_yaw_rad(double yaw_rad);
-  /// 同时开始到绝对 local ENU XYZ 目标的有界五次轨迹。
+  /// 同时开始到绝对本地 ENU XYZ 目标的有界五次轨迹。
   void set_target(double x_m, double y_m, double z_m);
 
   /// 按 dt 推进 XY/Z 轨迹并返回下一条内部位置设定点。
@@ -80,7 +80,7 @@ public:
   double command_z_m() const {return command_z_m_;}
   /// 返回当前命令垂直速度。
   double vertical_rate_m_s() const {return vertical_rate_m_s_;}
-  /// 返回用于发布 yaw 的当前姿态四元数。
+  /// 返回用于发布偏航角的当前姿态四元数。
   const common::Quaternion & orientation() const {return orientation_;}
 
 private:
@@ -129,6 +129,20 @@ struct ControllerFeedback
   std::string arm_request_status{"never_requested"};
 };
 
+/// 与部署 YAML 文件共享默认值的任务参数。
+struct MissionConfig
+{
+  double takeoff_height_m{1.5};
+  double standoff_m{0.10};
+  double match_tolerance_m{0.10};
+  double car_status_timeout_s{0.5};
+  double max_distance_m{5.0};
+
+  /// 校验起飞、跟车和距离限制参数均为有效的正值。
+  void validate() const;
+};
+
+/// 导航状态机在一个控制周期内消费的健康、协议和飞控反馈。
 struct NavigationInput
 {
   double now{0.0};
@@ -140,8 +154,11 @@ struct NavigationInput
   std::vector<std::string> health_errors{};
   std::vector<communication::ProtocolEvent> events{};
   ControllerFeedback controller{};
+  bool gripper_succeeded{false};
+  bool gripper_failed{false};
 };
 
+/// 导航状态机为当前控制周期生成的控制与通信决策。
 struct NavigationDecision
 {
   std::string phase{"waiting_preflight"};
@@ -150,27 +167,24 @@ struct NavigationDecision
   std::optional<bool> arm_intent{};
   std::vector<communication::OutgoingMessage> messages{};
   std::vector<std::string> rejections{};
-  std::size_t waypoint_index{0};
-  std::optional<double> ack_age_s{};
+  bool release_gripper{false};
 };
 
-/// Pure mission state machine. It depends only on values and parsed protocol events.
+/// 纯值类型任务状态机，只依赖输入值和已解析的协议事件。
 class Navigation
 {
 public:
   /// 使用安全配置创建纯值类型任务状态机及其轨迹规划器。
-  explicit Navigation(const common::SafetyConfig & config);
+  explicit Navigation(const common::SafetyConfig & config, MissionConfig mission = {});
   /// 消费一个周期的健康、协议和飞控反馈，返回完整任务决策。
   NavigationDecision update(const NavigationInput & input);
-  /// 清空任务、轨迹、批次、航点和 hold 上下文并返回预检等待阶段。
+  /// 清空任务、轨迹和保持上下文，并返回预检等待阶段。
   void reset();
 
   /// 返回当前协议任务阶段名称。
   const std::string & phase() const {return phase_;}
   /// 返回只读轨迹规划器，供组装层读取原点和当前控制目标。
   const TrajectoryPlanner & planner() const {return planner_;}
-  /// 返回当前活动航点索引；任务完成时等于航点总数。
-  std::size_t waypoint_index() const {return waypoint_index_;}
 
 private:
   /// 切换任务阶段、记录阶段开始时间并清除稳定计时。
@@ -181,11 +195,7 @@ private:
   void reject(const std::string & reason);
   /// 按当前任务阶段处理已解析且去重的地面站协议事件。
   void process_events(const NavigationInput & input);
-  /// 清空当前三类导航配置副本，避免残缺批次继续生效。
-  void reset_batch();
-  /// 校验三份配置一致性、构建航点队列并启动受支持任务。
-  bool finish_batch(double now);
-  /// 保存恢复目标并在指定 link/LCP hold 阶段冻结可靠实测位置。
+  /// 保存恢复目标，并在指定的链路/LCP 保持阶段冻结可靠实测位置。
   void enter_hold(const NavigationInput & input, const std::string & hold_phase);
   /// 从冻结位置连续重规划到保存目标并恢复被中断阶段。
   void resume_hold(double now);
@@ -195,26 +205,28 @@ private:
   bool actual_xy_within(const common::Telemetry & telemetry, double x, double y, double tolerance) const;
   /// 判断实测 XYZ 是否位于稳定阶段要求的位置容差内。
   bool stable_at(const common::Telemetry & telemetry, const common::PositionSetpoint & target) const;
+  /// 判断实测偏航角是否已接近目标世界航向。
+  bool actual_yaw_within(const common::Telemetry & telemetry, double yaw_rad, double tolerance_rad) const;
+  /// 依据最新 car_status 生成一次受安全半径保护的 ENU 跟踪目标。
+  void apply_car_target(const NavigationInput & input);
 
   const common::SafetyConfig & config_;
+  const MissionConfig mission_;
   TrajectoryPlanner planner_;
   std::string phase_{"waiting_preflight"};
   double phase_started_at_{0.0};
-  bool preflight_sent_{false};
-  double takeoff_height_m_{0.0};
-  std::vector<communication::ProtocolEvent> and_point_packets_{};
-  std::vector<communication::ProtocolEvent> nfz_packets_{};
-  std::vector<communication::ProtocolEvent> plan_packets_{};
-  std::vector<communication::Point3> waypoints_{};
-  std::size_t waypoint_index_{0};
-  std::optional<double> last_ack_at_{};
-  std::optional<double> stable_since_{};
   std::optional<double> flight_started_at_{};
-  std::optional<communication::Point3> held_target_{};
+  std::optional<communication::CarStatus> latest_car_status_{};
+  std::optional<double> latest_car_status_at_{};
+  bool car_target_pending_{false};
+  bool car_hold_{false};
+  bool normal_completion_{false};
+  std::optional<common::PositionSetpoint> held_target_{};
   std::string hold_resume_phase_{};
   std::vector<communication::OutgoingMessage> pending_messages_{};
   std::vector<std::string> pending_rejections_{};
   std::string landing_reason_{};
+  bool pending_release_gripper_{false};
 };
 
-}  // namespace mavros_xyz_position_offboard::navigation
+}  // mavros_xyz_position_offboard::navigation 命名空间

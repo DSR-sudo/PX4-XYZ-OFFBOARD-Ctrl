@@ -48,6 +48,13 @@ struct PositionSetpoint
   double vertical_rate_m_s{0.0};
 };
 
+/// Original ROS time retained with a sensor sample for protocol forwarding.
+struct RosTimestamp
+{
+  std::int32_t sec{0};
+  std::uint32_t nanosec{0};
+};
+
 struct RangeResult
 {
   bool accepted{false};
@@ -130,6 +137,7 @@ struct Telemetry
   int landed_state{0};
 
   std::optional<double> local_pose_at{};
+  std::optional<RosTimestamp> local_pose_stamp{};
   double local_x_m{NAN};
   double local_y_m{NAN};
   double local_z_m{NAN};
@@ -152,6 +160,7 @@ struct Telemetry
   bool estimator_accel_error{false};
 
   std::optional<double> range_at{};
+  std::optional<RosTimestamp> range_stamp{};
   double range_m{NAN};
   double range_min_m{NAN};
   double range_max_m{NAN};

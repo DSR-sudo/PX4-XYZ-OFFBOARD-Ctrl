@@ -1,85 +1,94 @@
-# C++17 ROS 2 包操作记录
+# C++17 Operation Record: UAV JSON V2 Refactor
 
-## 目录与职责
+## Components
 
-| 路径 | 职责 |
+| Path | Responsibility |
 | --- | --- |
-| `application/` | 唯一 `ApplicationNode`，组装各层并执行固定 20 Hz 单线程循环。 |
-| `initialization/` | ROS 遥测、预检、飞行健康快照和 LCP 初始化服务。 |
-| `communication/` | JSON V1 DTO/codec、UDP socket、白名单、去重和周期状态。 |
-| `navigation/` | 无 ROS 的任务状态机和 `TrajectoryPlanner`。 |
-| `offboard/` | MAVROS PositionTarget、SetMode 和 CommandBool 执行适配器。 |
-| `bridge/` | LCP NWU 到 MAVROS ENU vision pose。 |
-| `common/` | CLI、安全配置、值类型和 artifact 日志。 |
-| `config/udp_ground_station.yaml` | 固定端点、白名单、状态周期和目标安全包络。 |
+| `application/` | Single `ApplicationNode`, fixed 20 Hz loop, LCP Debug subscription, Init-Z latching, component assembly. |
+| `communication/` | Strict V2 value types, non-blocking fixed-remote UDP, source allowlist, ordered event ACK queue, `xyzstatus` encoder. |
+| `navigation/` | ROS-free V2 mission state machine and bounded XY/Z quintic planner. |
+| `gripper/` | Non-blocking Pi Linux PWM sysfs adapter with testable chip-path root. |
+| `initialization/` | Existing MAVROS telemetry, preflight/flight health, LCP start, RangeGuard, and ROS source timestamps. |
+| `bridge/` | Existing LCP NWU-to-ENU external-vision publisher. |
+| `config/udp_ground_station.yaml` | UDP, tracking, Z source, and PWM parameters. |
 
-唯一节点名保持 `mavros_native_xyz_position`，唯一执行器保持
-`SingleThreadedExecutor`。模块间不创建内部 ROS 话题。
+No module creates an internal ROS topic. The ROS executor remains single-threaded.
 
-## 构建、测试与安装入口
+## Control Loop
+
+Each timer cycle retains this order:
+
+1. Poll LCP-start/MAVROS service futures and readable UDP datagrams.
+2. Capture one immutable health snapshot and request LCP initialization when eligible.
+3. Advance PWM state and call `Navigation::update` with health, protocol events, and gripper result.
+4. Apply the idempotent setpoint/mode/arm intent to MAVROS.
+5. Start a requested PWM release, queue each `ok_*`, and retry the earliest queued event.
+6. Write audit status (`px4.mavros_native_xyz.v2`).
+
+`/lcp/debug` is callback-driven rather than timer-driven: each new `lslidar_msgs/LcpDebug` sample
+is copied into one `xyzstatus` datagram immediately. It is independent of event retries.
+
+## Parameters
+
+| Parameter | Default | Meaning |
+| --- | ---: | --- |
+| `udp.event_retry_period_s` | `0.5` | Retry period for the oldest unacknowledged `ok_*`. |
+| `mission.takeoff_height_m` | `1.5` | Relative MAVROS local-Z climb from Init. |
+| `tracking.standoff_m` | `0.10` | Required horizontal UAV-to-car separation. |
+| `tracking.match_tolerance_m` | `0.10` | Acceptance tolerance for `match_car_ok`. |
+| `tracking.car_status_timeout_s` | `0.5` | Freshness limit; stale status freezes measured XY. |
+| `tracking.max_distance_m` | `5.0` | Maximum tracking target radius from Init XY and inbound distance bound. |
+| `z.prefer_range` | `false` | Select Range-relative Z after field calibration. |
+| `z.source_timeout_s` | `0.5` | Freshness limit for pose/Range Z sources. |
+| `z.range_cross_check_max_delta_m` | `0.30` | Maximum local-vs-Range relative-Z disagreement. |
+| `gripper_pwm.enabled` | `false` | Enables physical sysfs output only after calibration. |
+| `gripper_pwm.release_delay_ms` | `500` | Delay before changing to release duty. |
+
+The existing `udp.bind_*`, `remote_*`, and `whitelist_*` parameters are unchanged. The YAML
+also defines PWM `chip_path`, `channel`, `period_ns`, idle/release duty, hold time, and pinmux
+check fields.
+
+## PWM Procedure
+
+1. Keep `gripper_pwm.enabled:false` for all normal software builds and SITL.
+2. With propellers removed, identify the Linux PWM chip/channel and verify pinmux manually.
+3. Measure safe idle and release pulse widths for the actual gripper; set a period larger than
+   both duties.
+4. Set `pinmux_path` to the readable pinctrl inspection file and `pinmux_expected` to the exact
+   expected token. Set a non-production temporary chip root first when testing.
+5. Enable PWM and verify exported channel, `period`, `duty_cycle`, `enable`, release delay,
+   hold, and idle restoration before connecting a payload.
+
+When enabled, preparation performs pinmux text validation, chip/channel existence or export,
+sysfs permission/open checks, period write, idle duty write, and enable. Any failure reports
+`failed`, does not send `ok_throw`, and returns the mission to tracking for a fresh
+`match_car_ok` retry. No automatic test uses `/sys/class/pwm`.
+
+## Build and Acceptance
 
 ```bash
 cd /home/pi/px4-test-tools
 source /opt/ros/jazzy/setup.bash
-colcon build --packages-select mavros_xyz_position_offboard
-colcon test --packages-select mavros_xyz_position_offboard
-colcon test-result --all --verbose
+source /home/pi/LSLIDARN10P/install/setup.bash
+colcon build --packages-select mavros_xyz_position_offboard --parallel-workers 1
 source install/setup.bash
-ros2 run mavros_xyz_position_offboard mavros_xyz_position_node --help
+colcon test --packages-select mavros_xyz_position_offboard --event-handlers console_direct+
+colcon test-result --all --verbose
 ```
 
-本包没有 `lslidar_msgs` 依赖，不需要 LSLIDAR overlay。测试覆盖 LCP 初始化基线、NWU/ENU
-转换、五次轨迹约束、全部 V1 输入消息、白名单/版本/去重/乱序/畸形包、三份配置一致性、
-OFFBOARD/ARM 确认、ACK hold/恢复、PositionTarget mask、OFFBOARD 结构边界和 CLI 门禁。
+The source overlay is required because this package depends on `lslidar_msgs`. Execute field
+acceptance in three stages: no-prop/PWM bench, PX4 SITL, then controlled flight. Capture both
+UDP datagrams and ROS timestamps from `/lcp/debug`, local pose, and Range to verify packet field
+values and the event order.
 
-## 控制循环
+## Safety Invariants
 
-每个 wall timer tick 的顺序不可调整：
-
-1. `Initialization::poll_lcp_start`、`Offboard::poll`、`GroundStationLink::poll`；
-2. `Initialization::health_snapshot` 复制本周期不可变遥测与健康结论；
-3. `Navigation::update` 生成阶段、设定点、模式/ARM 意图和业务输出；
-4. `Offboard::apply` 发布设定点并按限频规则提交异步服务请求；
-5. `GroundStationLink` 发送业务消息以及周期 XYZ/电池状态；
-6. 写入 `px4.mavros_native_xyz.v1` 状态日志。
-
-日志新增 `navigation_batch.waypoint_index`、`ack_age_s`、
-`communication_rejection` 和 `navigation_rejections`。服务 response 不代表飞控已经执行；
-Navigation 只认下一条 MAVROS state 中的实际 mode/armed 值。
-
-## UDP 现场检查
-
-安装后的参数文件位于：
-
-```text
-share/mavros_xyz_position_offboard/config/udp_ground_station.yaml
-```
-
-修改参数后必须重启节点。确认地面站数据报源地址和源端口都匹配白名单；`seq` 只需唯一，
-无需按到达顺序递增。批次发送顺序建议为三份 `navigation_and_point`、三份
-`navigation_nfz`、三份 `navigation_plan`、一个 `navigation_fly_plan_send_ok`，飞行期间
-至少 2 Hz 发送 `ACK`。
-
-节点不会对输入数据报返回逐包 ACK。用抓包检查时，只应看到阶段业务消息和按
-`udp.status_period_s` 发送的 `xyz_state`/`battery_state`。
-
-## 控制授权和现场边界
-
-CLI 三层确认保持不变：
-
-1. PositionTarget publisher 的原生 XYZ、streaming 风险、LOCAL_NED 和传感器来源确认；
-2. SetMode client 的 OFFBOARD 和 disarmed mode switch 确认；
-3. CommandBool client 的有界飞行、普通 ARM、桨叶/场地/急停/电池和 PX4 XY 融合证据确认。
-
-缺少任何同层配套参数会在节点创建前拒绝。连接实机前仍需重新核对 FCU URL、Range
-方向、光流来源、LCP 状态、地面站固定端点、空间隔离及 PX4 原生融合证据。本文记录的
-构建/单元测试不等同于带桨飞行验收。
-
-## 故障行为
-
-- ACK 年龄超过 2 秒：`link_hold`，冻结实测 XY/命令 Z；ACK 恢复后连续重规划。
-- LCP 失效：`lcp_hold`；恢复后继续原目标，超时请求安全降落。
-- 飞行健康门禁持续失败超过 grace、OFFBOARD 丢失或最大飞行时间超限：安全降落；模式
-  丢失不抢回 OFFBOARD。
-- 正常任务完成：等待 `ok_fly_plan_succeed`，随后回到初始化 Z、Disarm，确认后请求
-  `MANUAL`。
+- Existing CLI acknowledgements remain the only route to setpoint publication, mode request, and
+  normal ARM/Disarm requests.
+- Duplicated `run_plan1`, `match_car_ok`, and `b_ok` do not repeat ARM, PWM release, return, or
+  landing actions.
+- `car_status` is never extrapolated after its timeout; target radius is bounded from Init.
+- LCP failure holds then enters safe landing after the existing timeout; mode/flight-health loss
+  and max-flight timeout retain their existing safe paths.
+- Normal completion means descend to Init, PX4 Disarm, and `MANUAL`; it never shuts down the Pi
+  or removes FCU power.

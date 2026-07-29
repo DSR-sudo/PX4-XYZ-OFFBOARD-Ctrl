@@ -8,10 +8,32 @@ mavros_native_xyz_position:
       remote_port: 5005
       whitelist_ip: 192.168.10.59
       whitelist_port: 5005
-      status_period_s: 0.5
-      relative_x_min_m: 0.0
-      relative_x_max_m: 4.0
-      relative_y_min_m: 0.0
-      relative_y_max_m: 5.0
-      absolute_z_min_m: 0.20
-      absolute_z_max_m: 1.00
+      event_retry_period_s: 0.5
+
+    mission:
+      takeoff_height_m: 1.5
+
+    tracking:
+      standoff_m: 0.10
+      match_tolerance_m: 0.10
+      car_status_timeout_s: 0.5
+      max_distance_m: 5.0
+
+    z:
+      prefer_range: false
+      source_timeout_s: 0.5
+      range_cross_check_max_delta_m: 0.30
+
+    gripper_pwm:
+      # Disabled is a timed no-op for SITL and prevents all physical GPIO output.
+      enabled: false
+      chip_path: /sys/class/pwm/pwmchip0
+      channel: 0
+      period_ns: 20000000
+      idle_duty_ns: 1500000
+      release_duty_ns: 2000000
+      release_delay_ms: 500
+      release_hold_ms: 500
+      # These must be site-specific and non-empty before enabled:true is accepted.
+      pinmux_path: ""
+      pinmux_expected: ""

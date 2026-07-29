@@ -15,6 +15,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(mavros_msgs REQUIRED)
+find_package(lslidar_msgs REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(JSONCPP REQUIRED IMPORTED_TARGET jsoncpp)
 
@@ -25,6 +26,7 @@ add_library(${PROJECT_NAME}_core
   src/bridge/lcp_vision_bridge.cpp
   src/application/application_node.cpp
   src/communication/ground_station_link.cpp
+  src/gripper/pwm_gripper.cpp
   src/initialization/initialization.cpp
   src/navigation/navigation.cpp
   src/offboard/offboard.cpp)
@@ -32,7 +34,7 @@ target_include_directories(${PROJECT_NAME}_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 ament_target_dependencies(${PROJECT_NAME}_core
-  rclcpp geometry_msgs nav_msgs sensor_msgs std_msgs std_srvs mavros_msgs)
+  rclcpp geometry_msgs nav_msgs sensor_msgs std_msgs std_srvs mavros_msgs lslidar_msgs)
 target_link_libraries(${PROJECT_NAME}_core PkgConfig::JSONCPP)
 target_compile_options(${PROJECT_NAME}_core PRIVATE -Wall -Wextra -Wpedantic)
 
@@ -54,7 +56,7 @@ if(BUILD_TESTING)
   ament_add_gtest(test_lcp_navigation test/test_lcp_navigation.cpp SKIP_LINKING_MAIN_LIBRARIES)
   if(TARGET test_lcp_navigation)
     target_link_libraries(test_lcp_navigation ${PROJECT_NAME}_core)
-    ament_target_dependencies(test_lcp_navigation rclcpp)
+    ament_target_dependencies(test_lcp_navigation rclcpp lslidar_msgs)
     target_compile_definitions(test_lcp_navigation PRIVATE MAVROS_XYZ_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     target_compile_options(test_lcp_navigation PRIVATE -Wall -Wextra -Wpedantic)
   endif()

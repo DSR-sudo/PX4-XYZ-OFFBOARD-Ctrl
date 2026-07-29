@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 
 namespace mavros_xyz_position_offboard::application
 {
@@ -20,10 +21,18 @@ double ApplicationNode::monotonic_now()
 ApplicationNode::ApplicationNode(
   const common::AppOptions & options, const common::SafetyConfig & config)
 : Node("mavros_native_xyz_position"), options_(options), config_(config),
-  initialization_(*this, options_, config_), ground_station_(load_ground_station_config()),
-  navigation_(config_), offboard_(*this, options_), lcp_vision_bridge_(*this, options_),
+  initialization_(*this, options_, config_), mission_config_(load_mission_config()),
+  ground_station_([this]() {
+      auto value = load_ground_station_config();
+      value.max_tracking_distance_m = mission_config_.max_distance_m;
+      return value;
+    }()), navigation_(config_, mission_config_), offboard_(*this, options_),
+  lcp_vision_bridge_(*this, options_), z_config_(load_z_config()), gripper_(load_gripper_config()),
   artifact_log_(options_.artifact_dir, options_.output == "jsonl")
 {
+  const auto lcp_qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable().durability_volatile();
+  lcp_debug_subscription_ = create_subscription<lslidar_msgs::msg::LcpDebug>(
+    "/lcp/debug", lcp_qos, std::bind(&ApplicationNode::lcp_debug_callback, this, std::placeholders::_1));
   timer_ = create_wall_timer(
     std::chrono::duration<double>(1.0 / config_.publish_rate_hz),
     std::bind(&ApplicationNode::tick, this));
@@ -43,15 +52,115 @@ communication::GroundStationConfig ApplicationNode::load_ground_station_config()
   value.remote_port = declare_parameter<int>("udp.remote_port", value.remote_port);
   value.whitelist_ip = declare_parameter<std::string>("udp.whitelist_ip", value.whitelist_ip);
   value.whitelist_port = declare_parameter<int>("udp.whitelist_port", value.whitelist_port);
-  value.status_period_s = declare_parameter<double>("udp.status_period_s", value.status_period_s);
-  value.relative_x_min_m = declare_parameter<double>("udp.relative_x_min_m", value.relative_x_min_m);
-  value.relative_x_max_m = declare_parameter<double>("udp.relative_x_max_m", value.relative_x_max_m);
-  value.relative_y_min_m = declare_parameter<double>("udp.relative_y_min_m", value.relative_y_min_m);
-  value.relative_y_max_m = declare_parameter<double>("udp.relative_y_max_m", value.relative_y_max_m);
-  value.absolute_z_min_m = declare_parameter<double>("udp.absolute_z_min_m", value.absolute_z_min_m);
-  value.absolute_z_max_m = declare_parameter<double>("udp.absolute_z_max_m", value.absolute_z_max_m);
+  value.event_retry_period_s = declare_parameter<double>(
+    "udp.event_retry_period_s", value.event_retry_period_s);
   value.validate();
   return value;
+}
+
+navigation::MissionConfig ApplicationNode::load_mission_config()
+{
+  navigation::MissionConfig value;
+  value.takeoff_height_m = declare_parameter<double>("mission.takeoff_height_m", value.takeoff_height_m);
+  value.standoff_m = declare_parameter<double>("tracking.standoff_m", value.standoff_m);
+  value.match_tolerance_m = declare_parameter<double>("tracking.match_tolerance_m", value.match_tolerance_m);
+  value.car_status_timeout_s = declare_parameter<double>("tracking.car_status_timeout_s", value.car_status_timeout_s);
+  value.max_distance_m = declare_parameter<double>("tracking.max_distance_m", value.max_distance_m);
+  value.validate();
+  return value;
+}
+
+void ApplicationNode::ZConfig::validate() const
+{
+  if (!std::isfinite(source_timeout_s) || !std::isfinite(range_cross_check_max_delta_m) ||
+    source_timeout_s <= 0.0 || range_cross_check_max_delta_m <= 0.0) {
+    throw std::invalid_argument("Z source timeout and range cross-check delta must be finite and positive");
+  }
+}
+
+ApplicationNode::ZConfig ApplicationNode::load_z_config()
+{
+  ZConfig value;
+  value.prefer_range = declare_parameter<bool>("z.prefer_range", value.prefer_range);
+  value.source_timeout_s = declare_parameter<double>("z.source_timeout_s", value.source_timeout_s);
+  value.range_cross_check_max_delta_m = declare_parameter<double>(
+    "z.range_cross_check_max_delta_m", value.range_cross_check_max_delta_m);
+  value.validate();
+  return value;
+}
+
+gripper::PwmGripperConfig ApplicationNode::load_gripper_config()
+{
+  gripper::PwmGripperConfig value;
+  value.enabled = declare_parameter<bool>("gripper_pwm.enabled", value.enabled);
+  value.chip_path = declare_parameter<std::string>("gripper_pwm.chip_path", value.chip_path);
+  value.channel = declare_parameter<int>("gripper_pwm.channel", value.channel);
+  value.period_ns = static_cast<std::uint64_t>(declare_parameter<int64_t>(
+    "gripper_pwm.period_ns", static_cast<int64_t>(value.period_ns)));
+  value.idle_duty_ns = static_cast<std::uint64_t>(declare_parameter<int64_t>(
+    "gripper_pwm.idle_duty_ns", static_cast<int64_t>(value.idle_duty_ns)));
+  value.release_duty_ns = static_cast<std::uint64_t>(declare_parameter<int64_t>(
+    "gripper_pwm.release_duty_ns", static_cast<int64_t>(value.release_duty_ns)));
+  value.release_delay_ms = declare_parameter<int>("gripper_pwm.release_delay_ms", value.release_delay_ms);
+  value.release_hold_ms = declare_parameter<int>("gripper_pwm.release_hold_ms", value.release_hold_ms);
+  value.pinmux_path = declare_parameter<std::string>("gripper_pwm.pinmux_path", value.pinmux_path);
+  value.pinmux_expected = declare_parameter<std::string>("gripper_pwm.pinmux_expected", value.pinmux_expected);
+  value.validate();
+  return value;
+}
+
+void ApplicationNode::latch_init_height(const common::Telemetry & telemetry)
+{
+  if (!init_local_z_m_ && common::finite(telemetry.local_z_m)) {init_local_z_m_ = telemetry.local_z_m;}
+  if (!init_range_m_ && common::finite(telemetry.range_m) && !initialization_.range_fault()) {
+    init_range_m_ = telemetry.range_m;
+  }
+}
+
+void ApplicationNode::lcp_debug_callback(const lslidar_msgs::msg::LcpDebug::SharedPtr message)
+{
+  const double now = monotonic_now();
+  communication::XyzStatus status;
+  status.header = {message->header.stamp.sec, message->header.stamp.nanosec, message->header.frame_id};
+  status.status = message->status;
+  status.map_locked = message->map_locked;
+  status.pose_valid = message->pose_valid;
+  status.position_x_m = message->position_x_m;
+  status.position_y_m = message->position_y_m;
+  status.yaw_rad = message->yaw_rad;
+  status.front_distance_m = message->front_distance_m;
+  status.rear_distance_m = message->rear_distance_m;
+  status.left_distance_m = message->left_distance_m;
+  status.right_distance_m = message->right_distance_m;
+  status.map_size_x_m = message->map_size_x_m;
+  status.map_size_y_m = message->map_size_y_m;
+
+  const auto & telemetry = initialization_.telemetry();
+  const bool local_fresh = init_local_z_m_ && telemetry.local_pose_stamp &&
+    !common::stale(telemetry.local_pose_at, now, z_config_.source_timeout_s) &&
+    common::finite(telemetry.local_z_m);
+  const bool range_fresh = init_range_m_ && telemetry.range_stamp && !initialization_.range_fault() &&
+    !common::stale(telemetry.range_at, now, z_config_.source_timeout_s) && common::finite(telemetry.range_m);
+  const std::optional<double> local_z = local_fresh ?
+    std::optional<double>(telemetry.local_z_m - *init_local_z_m_) : std::nullopt;
+  const std::optional<double> range_z = range_fresh ?
+    std::optional<double>(telemetry.range_m - *init_range_m_) : std::nullopt;
+  const bool sources_valid = local_z && range_z &&
+    std::abs(*local_z - *range_z) <= z_config_.range_cross_check_max_delta_m;
+
+  if (sources_valid) {
+    const bool use_range = z_config_.prefer_range;
+    status.position_z_m = use_range ? range_z : local_z;
+    status.z_source = use_range ? "range" : "local_pose";
+    status.z_source_stamp = use_range ? telemetry.range_stamp : telemetry.local_pose_stamp;
+    status.z_valid = true;
+  }
+  // Invalid Z intentionally retains every LCP field and the protocol's null/none metadata.
+  try {
+    ground_station_.send_xyzstatus(status);
+  } catch (const std::exception & error) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "xyzstatus rejected: %s", error.what());
+  }
 }
 
 /// 执行“轮询、快照、导航、飞控、通信、日志”的单线程控制周期。
@@ -68,7 +177,7 @@ void ApplicationNode::tick()
   auto protocol_events = ground_station_.poll(now);
 
   const bool in_flight = navigation_.phase() != "waiting_preflight" &&
-    navigation_.phase() != "waiting_start" && navigation_.phase() != "setpoint_warmup" &&
+    navigation_.phase() != "waiting_run_plan1" && navigation_.phase() != "setpoint_warmup" &&
     navigation_.phase() != "offboard_request_pending" &&
     navigation_.phase() != "arming_request_pending" && navigation_.phase() != "manual";
   double hold_x = NAN;
@@ -110,18 +219,21 @@ void ApplicationNode::tick()
   input.events = std::move(protocol_events);
   input.controller = {controller.connected, controller.armed, controller.mode,
     controller.mode_request.state, controller.arm_request.state};
+  const auto gripper_state = gripper_.update(now);
+  input.gripper_succeeded = gripper_state == gripper::ReleaseState::succeeded;
+  input.gripper_failed = gripper_state == gripper::ReleaseState::failed;
   const auto decision = navigation_.update(input);
-  if (navigation_.planner().latched()) {
-    ground_station_.set_navigation_origin(
-      navigation_.planner().origin_x_m(), navigation_.planner().origin_y_m());
-  }
 
   // 4. Apply the idempotent execution intent to MAVROS.
   offboard_.apply({decision.setpoint, decision.target_mode, decision.arm_intent}, now);
 
   // 5. Send business messages and periodic telemetry through the communication layer.
-  for (const auto & message : decision.messages) {ground_station_.send(message);}
-  ground_station_.send_status_if_due(health.telemetry, now);
+  if (decision.release_gripper) {gripper_.begin_release(now);}
+  for (const auto & message : decision.messages) {
+    if (message.type == communication::MessageType::ok_wait) {latch_init_height(health.telemetry);}
+    ground_station_.send(message, now);
+  }
+  ground_station_.retry_events(now);
 
   // 6. Emit the unified audit status.
   emit_status(now, health, decision);
@@ -135,11 +247,10 @@ void ApplicationNode::emit_status(
   if (now - last_log_at_ < options_.status_period) {return;}
   last_log_at_ = now;
   std::ostringstream stream;
-  stream << "{\"schema\":\"px4.mavros_native_xyz.v1\",\"phase\":\""
+  stream << "{\"schema\":\"px4.mavros_native_xyz.v2\",\"phase\":\""
          << common::json_escape(decision.phase) << "\",\"monotonic_s\":"
-         << std::setprecision(12) << now << ",\"navigation_batch\":{\"waypoint_index\":"
-         << decision.waypoint_index << "},\"ack_age_s\":";
-  if (decision.ack_age_s) {stream << *decision.ack_age_s;} else {stream << "null";}
+         << std::setprecision(12) << now << ",\"pending_event_count\":"
+         << ground_station_.pending_event_count();
   stream << ",\"communication_rejection\":\""
          << common::json_escape(ground_station_.last_rejection()) << "\",\"navigation_rejections\":[";
   for (std::size_t i = 0; i < decision.rejections.size(); ++i) {
@@ -148,8 +259,7 @@ void ApplicationNode::emit_status(
   }
   stream << "],\"telemetry\":" << initialization_.telemetry_json(now) << "}";
   artifact_log_.write(stream.str());
-  std::cout << "phase=" << decision.phase << " waypoint=" << decision.waypoint_index
-            << " ack_age=" << (decision.ack_age_s ? std::to_string(*decision.ack_age_s) : "n/a")
+  std::cout << "phase=" << decision.phase << " pending_events=" << ground_station_.pending_event_count()
             << " errors=" << health.flight_errors.size() << std::endl;
 }
 

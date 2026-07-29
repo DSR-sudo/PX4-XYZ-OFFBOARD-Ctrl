@@ -91,7 +91,9 @@ public:
   /// 写入飞行器落地状态。
   void update_landed(int landed_state, double now);
   /// 写入本地位置及姿态四元数。
-  void update_local_pose(double x_m, double y_m, double z_m, const common::Quaternion & orientation, double now);
+  void update_local_pose(
+    double x_m, double y_m, double z_m, const common::Quaternion & orientation, double now,
+    std::optional<common::RosTimestamp> stamp = std::nullopt);
   /// 写入本地 XYZ 速度。
   void update_local_velocity(double x_m_s, double y_m_s, double z_m_s, double now);
   /// 写入估计器有效性与故障标志。
@@ -100,7 +102,9 @@ public:
     bool pos_horiz_rel_valid, bool pos_horiz_abs_valid, bool pos_vert_abs_valid,
     bool pos_vert_agl_valid, bool const_pos_mode, bool gps_glitch, bool accel_error, double now);
   /// 写入测距消息，并执行边界、跳变和恢复检查。
-  common::RangeResult update_range(double range_m, double declared_min_m, double declared_max_m, double now);
+  common::RangeResult update_range(
+    double range_m, double declared_min_m, double declared_max_m, double now,
+    std::optional<common::RosTimestamp> stamp = std::nullopt);
   /// 写入光流积分、质量和距离遥测。
   void update_optical_flow(
     std::uint32_t integration_time_us, double integrated_x_rad, double integrated_y_rad, int quality,

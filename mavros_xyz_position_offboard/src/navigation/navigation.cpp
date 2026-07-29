@@ -213,53 +213,61 @@ common::PositionSetpoint TrajectoryPlanner::current() const
   return {x_m_, y_m_, command_z_m_, orientation_, vertical_rate_m_s_};
 }
 
-/// 保存统一安全配置并创建同生命周期的纯轨迹规划器。
-Navigation::Navigation(const common::SafetyConfig & config) : config_(config), planner_(config) {}
+/// 校验任务的起飞、跟车、匹配和安全半径参数。
+void MissionConfig::validate() const
+{
+  const double values[] = {takeoff_height_m, standoff_m, match_tolerance_m, car_status_timeout_s, max_distance_m};
+  for (const double value : values) {
+    if (!common::finite(value) || value <= 0.0) {
+      throw std::invalid_argument("mission configuration values must be finite and positive");
+    }
+  }
+  if (standoff_m > max_distance_m) {
+    throw std::invalid_argument("tracking standoff must not exceed maximum distance");
+  }
+}
 
-/// 将任务状态机及全部跨周期上下文恢复到 waiting_preflight 初始状态。
+/// 保存安全与任务配置，并初始化对应的轨迹规划器。
+Navigation::Navigation(const common::SafetyConfig & config, MissionConfig mission)
+: config_(config), mission_(std::move(mission)), planner_(config)
+{
+  mission_.validate();
+}
+
+/// 清除任务执行上下文并恢复到等待预检阶段。
 void Navigation::reset()
 {
   planner_.reset();
   phase_ = "waiting_preflight";
   phase_started_at_ = 0.0;
-  preflight_sent_ = false;
-  takeoff_height_m_ = 0.0;
-  reset_batch();
-  waypoints_.clear();
-  waypoint_index_ = 0;
-  last_ack_at_.reset();
-  stable_since_.reset();
   flight_started_at_.reset();
+  latest_car_status_.reset();
+  latest_car_status_at_.reset();
+  car_target_pending_ = false;
+  car_hold_ = false;
+  normal_completion_ = false;
   held_target_.reset();
   hold_resume_phase_.clear();
   pending_messages_.clear();
   pending_rejections_.clear();
   landing_reason_.clear();
+  pending_release_gripper_ = false;
 }
 
-/// 原子更新阶段名称、阶段开始时间，并取消上一阶段的稳定计时。
+/// 切换任务阶段，并记录新阶段的开始时间。
 void Navigation::transition(const std::string & phase, double now)
 {
   phase_ = phase;
   phase_started_at_ = now;
-  stable_since_.reset();
 }
 
-/// 将 Navigation 产生的一条业务消息加入当前周期输出。
-void Navigation::emit(communication::MessageType type) {pending_messages_.push_back({type, {}});}
+/// 将一条待发送的 GCS 协议消息加入本周期输出队列。
+void Navigation::emit(communication::MessageType type) {pending_messages_.push_back({type});}
 
-/// 将协议或阶段拒绝原因加入当前周期审计输出。
+/// 将机器可读的拒绝原因加入本周期输出队列。
 void Navigation::reject(const std::string & reason) {pending_rejections_.push_back(reason);}
 
-/// 清空三类导航配置副本，确保失败批次不能与后续批次混合。
-void Navigation::reset_batch()
-{
-  and_point_packets_.clear();
-  nfz_packets_.clear();
-  plan_packets_.clear();
-}
-
-/// 使用 MAVROS 实测 local ENU XY 计算到目标的欧氏距离并应用闭区间容差。
+/// 判断实测本地 XY 与目标点的欧氏距离是否在给定容差内。
 bool Navigation::actual_xy_within(
   const common::Telemetry & telemetry, double x, double y, double tolerance) const
 {
@@ -267,7 +275,7 @@ bool Navigation::actual_xy_within(
          std::hypot(telemetry.local_x_m - x, telemetry.local_y_m - y) <= tolerance;
 }
 
-/// 同时检查实测 XY 欧氏距离和 Z 误差是否满足稳定位置容差。
+/// 判断实测 XY 和 Z 是否均已达到设定点稳定容差。
 bool Navigation::stable_at(
   const common::Telemetry & telemetry, const common::PositionSetpoint & target) const
 {
@@ -276,7 +284,20 @@ bool Navigation::stable_at(
          std::abs(telemetry.local_z_m - target.z_m) <= config_.target_tolerance_m;
 }
 
-/// 保存正常或故障降落原因，固定 XY 并规划下降到初始化 Z。
+/// 判断实测姿态换算出的偏航角是否接近目标偏航角。
+bool Navigation::actual_yaw_within(
+  const common::Telemetry & telemetry, double yaw_rad, double tolerance_rad) const
+{
+  try {
+    const double actual = common::yaw_from_quaternion(common::normalize_quaternion(
+      telemetry.orientation.x, telemetry.orientation.y, telemetry.orientation.z, telemetry.orientation.w));
+    return std::abs(std::atan2(std::sin(actual - yaw_rad), std::cos(actual - yaw_rad))) <= tolerance_rad;
+  } catch (const std::invalid_argument &) {
+    return false;
+  }
+}
+
+/// 固定当前水平位置、规划下降到初始高度并进入降落阶段。
 void Navigation::begin_landing(double now, const std::string & reason)
 {
   if (planner_.latched()) {
@@ -284,15 +305,15 @@ void Navigation::begin_landing(double now, const std::string & reason)
     planner_.set_ground_target();
   }
   landing_reason_ = reason;
+  normal_completion_ = false;
   transition("landing", now);
 }
 
-/// 保存当前活动目标，在可靠实测 XY 和当前命令 Z 建立 link/LCP 冻结状态。
+/// 保存当前目标并冻结轨迹，以便在健康状态恢复后连续继续任务。
 void Navigation::enter_hold(const NavigationInput & input, const std::string & hold_phase)
 {
-  if (!planner_.latched()) {return;}
-  held_target_ = communication::Point3{
-    planner_.target_x_m(), planner_.target_y_m(), planner_.target_z_m()};
+  if (!planner_.latched() || phase_ == hold_phase) {return;}
+  held_target_ = planner_.current();
   hold_resume_phase_ = phase_;
   if (common::finite(input.telemetry.local_x_m) && common::finite(input.telemetry.local_y_m)) {
     planner_.freeze_xy_at(input.telemetry.local_x_m, input.telemetry.local_y_m);
@@ -303,111 +324,105 @@ void Navigation::enter_hold(const NavigationInput & input, const std::string & h
   transition(hold_phase, input.now);
 }
 
-/// 从冻结设定点连续重规划到保存目标，并返回被中断的任务阶段。
+/// 恢复保存的目标与阶段，并从冻结位置重新规划轨迹。
 void Navigation::resume_hold(double now)
 {
   if (held_target_) {
     planner_.set_target(held_target_->x_m, held_target_->y_m, held_target_->z_m);
+    planner_.set_yaw_rad(common::yaw_from_quaternion(held_target_->orientation));
   }
-  const std::string resume = hold_resume_phase_.empty() ? "run_fly_plan" : hold_resume_phase_;
+  const std::string resume = hold_resume_phase_.empty() ? "tracking" : hold_resume_phase_;
   held_target_.reset();
   hold_resume_phase_.clear();
+  car_hold_ = false;
   transition(resume, now);
 }
 
-/// 验证三类数据各恰好三份且完全一致，构建航点队列并启动 plan_mode=1 任务。
-bool Navigation::finish_batch(double now)
+/// 根据最新车辆距离和相对方位生成受安全半径保护的跟车目标。
+void Navigation::apply_car_target(const NavigationInput & input)
 {
-  const auto same_and_point = [this]() {
-      if (and_point_packets_.size() != 3U) {return false;}
-      const auto & first = and_point_packets_.front();
-      for (const auto & packet : and_point_packets_) {
-        if (packet.plan_mode != first.plan_mode || packet.final_point != first.final_point) {return false;}
-      }
-      return true;
-    };
-  const auto same_points = [](const std::vector<communication::ProtocolEvent> & packets) {
-      if (packets.size() != 3U) {return false;}
-      for (const auto & packet : packets) {if (packet.points != packets.front().points) {return false;}}
-      return true;
-    };
-  if (!same_and_point() || !same_points(nfz_packets_) || !same_points(plan_packets_)) {
-    reject("navigation_batch_incomplete_or_inconsistent");
-    reset_batch();
-    return false;
+  if (!latest_car_status_ || !planner_.latched()) {return;}
+  const auto & car = *latest_car_status_;
+  if (!common::finite(input.telemetry.local_x_m) || !common::finite(input.telemetry.local_y_m)) {
+    reject("tracking_local_pose_invalid");
+    return;
   }
-  const auto & mission = and_point_packets_.front();
-  if (!mission.plan_mode || *mission.plan_mode != 1) {
-    reject("autonomous_planning_not_supported");
-    reset_batch();
-    return false;
+  double vehicle_yaw = 0.0;
+  try {
+    vehicle_yaw = common::yaw_from_quaternion(common::normalize_quaternion(
+      input.telemetry.orientation.x, input.telemetry.orientation.y,
+      input.telemetry.orientation.z, input.telemetry.orientation.w));
+  } catch (const std::invalid_argument &) {
+    reject("tracking_yaw_invalid");
+    return;
   }
-  waypoints_ = plan_packets_.front().points;
-  if (!mission.final_point) {
-    reject("navigation_final_point_missing");
-    reset_batch();
-    return false;
+  constexpr double kPi = 3.14159265358979323846;
+  const double target_yaw = vehicle_yaw + car.angle_deg * kPi / 180.0;
+  const double travel_m = car.distance_m - mission_.standoff_m;
+  const double target_x = input.telemetry.local_x_m + travel_m * std::cos(target_yaw);
+  const double target_y = input.telemetry.local_y_m + travel_m * std::sin(target_yaw);
+  if (std::hypot(target_x - planner_.origin_x_m(), target_y - planner_.origin_y_m()) > mission_.max_distance_m) {
+    reject("tracking_target_out_of_safety_envelope");
+    return;
   }
-  if (waypoints_.empty() || !(waypoints_.back() == *mission.final_point)) {
-    waypoints_.push_back(*mission.final_point);
-  }
-  waypoint_index_ = 0;
-  planner_.set_target(waypoints_[0].x_m, waypoints_[0].y_m, waypoints_[0].z_m);
-  last_ack_at_ = now;
-  emit(communication::MessageType::ok_receive);
-  transition("run_fly_plan", now);
-  reset_batch();
-  return true;
+  planner_.set_xy_target(target_x, target_y);
+  planner_.set_yaw_rad(target_yaw);
+  car_hold_ = false;
 }
 
-/// 处理 ACK、start、任务完成确认及当前阶段允许的导航批次消息。
+/// 按当前任务阶段处理 ACK、跟车、投放和返航协议事件。
 void Navigation::process_events(const NavigationInput & input)
 {
   for (const auto & event : input.events) {
-    if (!event.accepted) {if (!event.rejection_reason.empty()) {reject(event.rejection_reason);} continue;}
-    if (event.type == communication::MessageType::ack) {
-      last_ack_at_ = input.now;
+    if (!event.accepted) {
+      if (!event.rejection_reason.empty()) {reject(event.rejection_reason);}
       continue;
     }
-    if (event.type == communication::MessageType::start) {
-      if (phase_ != "waiting_start" || !event.height_start_m) {
-        reject("start_not_allowed_in_phase");
-      } else {
-        takeoff_height_m_ = *event.height_start_m;
+    if (event.type == communication::MessageType::ack) {continue;}
+    if (event.type == communication::MessageType::car_status) {
+      latest_car_status_ = event.car_status;
+      latest_car_status_at_ = event.received_at;
+      if (phase_ == "tracking") {car_target_pending_ = true;}
+      continue;
+    }
+    if (event.type == communication::MessageType::run_plan1) {
+      if (phase_ == "waiting_run_plan1") {
         planner_.set_relative_target(0.0);
         transition("setpoint_warmup", input.now);
+      } else if (phase_ != "setpoint_warmup" && phase_ != "offboard_request_pending" &&
+        phase_ != "arming_request_pending" && phase_ != "climb") {
+        reject("run_plan1_not_allowed_in_phase");
       }
       continue;
     }
-    if (event.type == communication::MessageType::ok_fly_plan_succeed) {
-      if (phase_ == "awaiting_fly_plan_succeed") {begin_landing(input.now);}
-      else {reject("ok_fly_plan_succeed_not_allowed_in_phase");}
+    if (event.type == communication::MessageType::match_car_ok) {
+      const bool fresh = latest_car_status_at_ && input.now >= *latest_car_status_at_ &&
+        input.now - *latest_car_status_at_ <= mission_.car_status_timeout_s;
+      const bool matched = fresh && latest_car_status_ &&
+        std::abs(latest_car_status_->distance_m - mission_.standoff_m) <= mission_.match_tolerance_m;
+      if (phase_ == "tracking" && matched) {
+        pending_release_gripper_ = true;
+        transition("throwing", input.now);
+      } else if (phase_ != "throwing") {
+        reject("match_car_ok_requires_fresh_standoff");
+      }
       continue;
     }
-    if (phase_ != "waiting_navigation_config") {
-      reject("navigation_config_not_allowed_in_phase");
-      continue;
-    }
-    auto append = [this](std::vector<communication::ProtocolEvent> & packets,
-        const communication::ProtocolEvent & value) {
-        if (packets.size() >= 3U) {
-          reject("navigation_batch_count_exceeded");
-          reset_batch();
-          return;
-        }
-        packets.push_back(value);
-      };
-    switch (event.type) {
-      case communication::MessageType::navigation_and_point: append(and_point_packets_, event); break;
-      case communication::MessageType::navigation_nfz: append(nfz_packets_, event); break;
-      case communication::MessageType::navigation_plan: append(plan_packets_, event); break;
-      case communication::MessageType::navigation_fly_plan_send_ok: finish_batch(input.now); break;
-      default: reject("message_not_allowed_in_phase"); break;
+    if (event.type == communication::MessageType::b_ok) {
+      if (phase_ == "awaiting_b_ok") {
+        planner_.set_xy_target(planner_.origin_x_m(), planner_.origin_y_m());
+        planner_.set_yaw_rad(0.0);
+        emit(communication::MessageType::ok_return);
+        transition("returning", input.now);
+      } else if (phase_ != "returning" && phase_ != "downing" && phase_ != "disarming" &&
+        phase_ != "manual_request_pending" && phase_ != "manual") {
+        reject("b_ok_not_allowed_in_phase");
+      }
     }
   }
 }
 
-/// 推进完整任务和故障状态机，生成本周期设定点、模式、ARM 与 GCS 输出意图。
+/// 推进完整任务状态机，输出位置、飞控模式、解锁和通信决策。
 NavigationDecision Navigation::update(const NavigationInput & input)
 {
   if (!common::finite(input.now) || !common::finite(input.dt) || input.dt <= 0.0) {
@@ -415,6 +430,7 @@ NavigationDecision Navigation::update(const NavigationInput & input)
   }
   pending_messages_.clear();
   pending_rejections_.clear();
+  pending_release_gripper_ = false;
   process_events(input);
 
   if (phase_ == "waiting_preflight") {
@@ -422,9 +438,8 @@ NavigationDecision Navigation::update(const NavigationInput & input)
       common::finite(input.telemetry.local_y_m) && common::finite(input.telemetry.local_z_m)) {
       planner_.latch(input.telemetry.local_x_m, input.telemetry.local_y_m,
         input.telemetry.local_z_m, input.telemetry.orientation);
-      planner_.set_yaw_rad(1.57079632679489661923);
-      if (!preflight_sent_) {emit(communication::MessageType::ok_preflight); preflight_sent_ = true;}
-      transition("waiting_start", input.now);
+      emit(communication::MessageType::ok_wait);
+      transition("waiting_run_plan1", input.now);
     }
   } else if (phase_ == "setpoint_warmup") {
     if (input.now - phase_started_at_ >= config_.setpoint_warmup_s) {
@@ -435,85 +450,85 @@ NavigationDecision Navigation::update(const NavigationInput & input)
   } else if (phase_ == "arming_request_pending") {
     if (input.controller.mode != "OFFBOARD") {transition("offboard_request_pending", input.now);}
     else if (input.controller.armed) {
-      emit(communication::MessageType::ok_flight);
-      planner_.set_relative_target(takeoff_height_m_);
+      planner_.set_relative_target(mission_.takeoff_height_m);
       flight_started_at_ = input.now;
       transition("climb", input.now);
     }
   } else if (phase_ == "climb") {
     if (planner_.target_reached() && stable_at(input.telemetry, planner_.current())) {
-      transition("stabilize", input.now);
+      emit(communication::MessageType::ok_height);
+      transition("tracking", input.now);
     }
-  } else if (phase_ == "stabilize") {
-    if (stable_at(input.telemetry, planner_.current())) {
-      if (!stable_since_) {stable_since_ = input.now;}
-      if (input.now - *stable_since_ >= config_.hold_seconds) {
-        emit(communication::MessageType::wait_plan);
-        transition("waiting_navigation_config", input.now);
-      }
-    } else {stable_since_.reset();}
-  } else if (phase_ == "run_fly_plan") {
-    if (!input.lcp_healthy) {
-      enter_hold(input, "lcp_hold");
-    } else if (last_ack_at_ && input.now - *last_ack_at_ > 2.0) {
-      enter_hold(input, "link_hold");
-    } else if (!waypoints_.empty() && planner_.xy_target_reached() &&
-      actual_xy_within(input.telemetry, waypoints_[waypoint_index_].x_m,
-        waypoints_[waypoint_index_].y_m, 0.2)) {
-      ++waypoint_index_;
-      if (waypoint_index_ >= waypoints_.size()) {
-        planner_.hold_xy();
-        planner_.freeze_z();
-        emit(communication::MessageType::ok_fly_plan);
-        transition("awaiting_fly_plan_succeed", input.now);
+  } else if (phase_ == "tracking") {
+    if (car_target_pending_) {
+      apply_car_target(input);
+      car_target_pending_ = false;
+    }
+    const bool fresh = latest_car_status_at_ && input.now >= *latest_car_status_at_ &&
+      input.now - *latest_car_status_at_ <= mission_.car_status_timeout_s;
+    if (!fresh && !car_hold_) {
+      if (common::finite(input.telemetry.local_x_m) && common::finite(input.telemetry.local_y_m)) {
+        planner_.freeze_xy_at(input.telemetry.local_x_m, input.telemetry.local_y_m);
       } else {
-        const auto & target = waypoints_[waypoint_index_];
-        planner_.set_target(target.x_m, target.y_m, target.z_m);
+        planner_.hold_xy();
       }
+      car_hold_ = true;
     }
-  } else if (phase_ == "link_hold") {
-    if (last_ack_at_ && input.now - *last_ack_at_ <= 2.0) {resume_hold(input.now);}
+  } else if (phase_ == "throwing") {
+    if (input.gripper_failed) {
+      reject("gripper_release_failed");
+      transition("tracking", input.now);
+    } else if (input.gripper_succeeded) {
+      emit(communication::MessageType::ok_throw);
+      transition("awaiting_b_ok", input.now);
+    }
+  } else if (phase_ == "returning") {
+    if (planner_.target_reached() && actual_xy_within(
+        input.telemetry, planner_.origin_x_m(), planner_.origin_y_m(), config_.target_tolerance_m) &&
+      actual_yaw_within(input.telemetry, 0.0, 0.10)) {
+      planner_.hold_xy();
+      planner_.set_ground_target();
+      normal_completion_ = true;
+      emit(communication::MessageType::ok_downing);
+      transition("downing", input.now);
+    }
   } else if (phase_ == "lcp_hold") {
     if (input.lcp_healthy) {resume_hold(input.now);}
     else if (input.now - phase_started_at_ > config_.lcp_unhealthy_hold_timeout_s) {
       begin_landing(input.now, "lcp_unhealthy_timeout");
     }
-  } else if (phase_ == "landing") {
+  } else if (phase_ == "downing" || phase_ == "landing") {
     const bool on_ground = input.telemetry.landed_state == common::MAV_LANDED_STATE_ON_GROUND;
     const bool at_origin = common::finite(input.telemetry.local_z_m) && planner_.latched() &&
       std::abs(input.telemetry.local_z_m - planner_.origin_z_m()) <= config_.touchdown_z_tolerance_m;
     if (on_ground || (planner_.target_reached() && at_origin)) {transition("disarming", input.now);}
   } else if (phase_ == "disarming") {
     if (!input.controller.armed) {transition("manual_request_pending", input.now);}
-  } else if (phase_ == "manual_request_pending") {
-    if (input.controller.mode == "MANUAL") {transition("manual", input.now);}
+  } else if (phase_ == "manual_request_pending" && input.controller.mode == "MANUAL") {
+    if (normal_completion_) {emit(communication::MessageType::ok_down);}
+    transition("manual", input.now);
   }
 
-  const bool prearm_phase = phase_ == "waiting_start" || phase_ == "setpoint_warmup" ||
+  const bool prearm_phase = phase_ == "waiting_run_plan1" || phase_ == "setpoint_warmup" ||
     phase_ == "offboard_request_pending" || phase_ == "arming_request_pending";
-  if (prearm_phase && !input.preflight_ready) {
-    planner_.reset();
-    preflight_sent_ = false;
-    transition("waiting_preflight", input.now);
-  }
+  if (prearm_phase && !input.preflight_ready) {reset();}
 
-  const bool lcp_required_phase = phase_ == "climb" || phase_ == "stabilize" ||
-    phase_ == "waiting_navigation_config" || phase_ == "run_fly_plan" ||
-    phase_ == "link_hold" || phase_ == "awaiting_fly_plan_succeed";
-  if (lcp_required_phase && !input.lcp_healthy) {enter_hold(input, "lcp_hold");}
+  const bool lcp_required = phase_ == "climb" || phase_ == "tracking" || phase_ == "throwing" ||
+    phase_ == "awaiting_b_ok" || phase_ == "returning";
+  if (lcp_required && !input.lcp_healthy) {enter_hold(input, "lcp_hold");}
 
-  const bool airborne_phase = phase_ != "waiting_preflight" && phase_ != "waiting_start" &&
+  const bool airborne = phase_ != "waiting_preflight" && phase_ != "waiting_run_plan1" &&
     phase_ != "setpoint_warmup" && phase_ != "offboard_request_pending" &&
     phase_ != "arming_request_pending" && phase_ != "manual";
-  if (airborne_phase && phase_ != "landing" && phase_ != "disarming" &&
+  if (airborne && phase_ != "landing" && phase_ != "downing" && phase_ != "disarming" &&
     phase_ != "manual_request_pending" && !input.flight_healthy) {
     begin_landing(input.now, input.health_errors.empty() ? "flight_health_failure" : input.health_errors.front());
   }
-  if (airborne_phase && phase_ != "landing" && phase_ != "disarming" &&
+  if (airborne && phase_ != "landing" && phase_ != "downing" && phase_ != "disarming" &&
     phase_ != "manual_request_pending" && input.controller.mode != "OFFBOARD") {
     begin_landing(input.now, "offboard_mode_lost");
   }
-  if (flight_started_at_ && airborne_phase && phase_ != "landing" &&
+  if (flight_started_at_ && airborne && phase_ != "landing" && phase_ != "downing" &&
     input.now - *flight_started_at_ > config_.max_flight_seconds) {
     begin_landing(input.now, "maximum_flight_time_exceeded");
   }
@@ -522,21 +537,19 @@ NavigationDecision Navigation::update(const NavigationInput & input)
   decision.phase = phase_;
   decision.messages = pending_messages_;
   decision.rejections = pending_rejections_;
-  decision.waypoint_index = waypoint_index_;
-  if (last_ack_at_ && input.now >= *last_ack_at_) {decision.ack_age_s = input.now - *last_ack_at_;}
-  if (planner_.latched() && phase_ != "waiting_preflight" && phase_ != "waiting_start" && phase_ != "manual") {
+  decision.release_gripper = pending_release_gripper_;
+  if (planner_.latched() && phase_ != "waiting_preflight" && phase_ != "waiting_run_plan1" && phase_ != "manual") {
     decision.setpoint = planner_.update(input.dt);
   }
-  if (phase_ == "offboard_request_pending" || phase_ == "arming_request_pending" ||
-    phase_ == "climb" || phase_ == "stabilize" || phase_ == "waiting_navigation_config" ||
-    phase_ == "run_fly_plan" || phase_ == "link_hold" || phase_ == "lcp_hold" ||
-    phase_ == "awaiting_fly_plan_succeed" || (phase_ == "landing" && landing_reason_ != "offboard_mode_lost")) {
+  if (phase_ == "offboard_request_pending" || phase_ == "arming_request_pending" || phase_ == "climb" ||
+    phase_ == "tracking" || phase_ == "throwing" || phase_ == "awaiting_b_ok" || phase_ == "returning" ||
+    phase_ == "lcp_hold" || phase_ == "downing") {
     decision.target_mode = "OFFBOARD";
   }
   if (phase_ == "landing" && !landing_reason_.empty()) {decision.target_mode = "AUTO.LAND";}
-  if (phase_ == "arming_request_pending" || phase_ == "climb" || phase_ == "stabilize" ||
-    phase_ == "waiting_navigation_config" || phase_ == "run_fly_plan" || phase_ == "link_hold" ||
-    phase_ == "lcp_hold" || phase_ == "awaiting_fly_plan_succeed" || phase_ == "landing") {
+  if (phase_ == "arming_request_pending" || phase_ == "climb" || phase_ == "tracking" ||
+    phase_ == "throwing" || phase_ == "awaiting_b_ok" || phase_ == "returning" || phase_ == "lcp_hold" ||
+    phase_ == "downing" || phase_ == "landing") {
     decision.arm_intent = true;
   }
   if (phase_ == "disarming") {decision.arm_intent = false;}
@@ -544,4 +557,4 @@ NavigationDecision Navigation::update(const NavigationInput & input)
   return decision;
 }
 
-}  // namespace mavros_xyz_position_offboard::navigation
+}  // mavros_xyz_position_offboard::navigation 命名空间

@@ -172,9 +172,10 @@ void Initialization::update_landed(int landed_state, double now) {telemetry_.lan
 
 /// 记录本地位置、姿态及其接收时间。
 void Initialization::update_local_pose(
-  double x_m, double y_m, double z_m, const common::Quaternion & orientation, double now)
+  double x_m, double y_m, double z_m, const common::Quaternion & orientation, double now,
+  std::optional<common::RosTimestamp> stamp)
 {
-  telemetry_.local_pose_at = now; telemetry_.local_x_m = x_m; telemetry_.local_y_m = y_m; telemetry_.local_z_m = z_m; telemetry_.orientation = orientation;
+  telemetry_.local_pose_at = now; telemetry_.local_pose_stamp = stamp; telemetry_.local_x_m = x_m; telemetry_.local_y_m = y_m; telemetry_.local_z_m = z_m; telemetry_.orientation = orientation;
 }
 
 /// 记录本地线速度及其接收时间。
@@ -197,9 +198,11 @@ void Initialization::update_estimator(
 }
 
 /// 记录 Range 消息并交由 RangeGuard 判定有效性。
-common::RangeResult Initialization::update_range(double range_m, double declared_min_m, double declared_max_m, double now)
+common::RangeResult Initialization::update_range(
+  double range_m, double declared_min_m, double declared_max_m, double now,
+  std::optional<common::RosTimestamp> stamp)
 {
-  telemetry_.range_at = now; telemetry_.range_m = range_m; telemetry_.range_min_m = declared_min_m; telemetry_.range_max_m = declared_max_m;
+  telemetry_.range_at = now; telemetry_.range_stamp = stamp; telemetry_.range_m = range_m; telemetry_.range_min_m = declared_min_m; telemetry_.range_max_m = declared_max_m;
   return range_guard_.observe(range_m, declared_min_m, declared_max_m, now);
 }
 
@@ -520,7 +523,8 @@ void Initialization::extended_state_callback(const mavros_msgs::msg::ExtendedSta
 void Initialization::local_pose_callback(const geometry_msgs::msg::PoseStamped::SharedPtr message)
 {
   const auto & p = message->pose.position; const auto & q = message->pose.orientation;
-  update_local_pose(p.x, p.y, p.z, {q.x, q.y, q.z, q.w}, monotonic_now());
+  update_local_pose(p.x, p.y, p.z, {q.x, q.y, q.z, q.w}, monotonic_now(),
+    common::RosTimestamp{message->header.stamp.sec, message->header.stamp.nanosec});
 }
 /// 提取 TwistStamped 的线速度并写入遥测。
 void Initialization::local_velocity_callback(const geometry_msgs::msg::TwistStamped::SharedPtr message)
@@ -536,7 +540,11 @@ void Initialization::estimator_callback(const mavros_msgs::msg::EstimatorStatus:
     message->accel_error_status_flag, monotonic_now());
 }
 /// 将 Range 消息交由 update_range 和 RangeGuard 处理。
-void Initialization::range_callback(const sensor_msgs::msg::Range::SharedPtr message) {update_range(message->range, message->min_range, message->max_range, monotonic_now());}
+void Initialization::range_callback(const sensor_msgs::msg::Range::SharedPtr message)
+{
+  update_range(message->range, message->min_range, message->max_range, monotonic_now(),
+    common::RosTimestamp{message->header.stamp.sec, message->header.stamp.nanosec});
+}
 /// 提取 OpticalFlowRad 中用于安全判定和日志的字段。
 void Initialization::optical_flow_callback(const mavros_msgs::msg::OpticalFlowRad::SharedPtr message)
 {

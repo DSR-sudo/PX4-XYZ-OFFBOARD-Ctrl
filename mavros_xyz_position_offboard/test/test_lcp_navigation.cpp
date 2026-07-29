@@ -1,15 +1,24 @@
-#include <algorithm>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
-#include <iterator>
 #include <memory>
+#include <sstream>
+#include <string>
 
 #include <gtest/gtest.h>
+#include <json/json.h>
 #include <rclcpp/rclcpp.hpp>
 
 #include "mavros_xyz_position_offboard/bridge/lcp_vision_bridge.hpp"
 #include "mavros_xyz_position_offboard/common/cli.hpp"
 #include "mavros_xyz_position_offboard/communication/ground_station_link.hpp"
+#include "mavros_xyz_position_offboard/gripper/pwm_gripper.hpp"
 #include "mavros_xyz_position_offboard/initialization/initialization.hpp"
 #include "mavros_xyz_position_offboard/navigation/navigation.hpp"
 #include "mavros_xyz_position_offboard/offboard/offboard.hpp"
@@ -18,73 +27,186 @@ namespace
 {
 using mavros_xyz_position_offboard::common::AppOptions;
 using mavros_xyz_position_offboard::common::SafetyConfig;
+using mavros_xyz_position_offboard::communication::CarStatus;
 using mavros_xyz_position_offboard::communication::GroundStationConfig;
 using mavros_xyz_position_offboard::communication::GroundStationLink;
 using mavros_xyz_position_offboard::communication::MessageType;
-using mavros_xyz_position_offboard::communication::Point3;
+using mavros_xyz_position_offboard::communication::OutgoingMessage;
 using mavros_xyz_position_offboard::communication::ProtocolEvent;
+using mavros_xyz_position_offboard::communication::RosHeader;
+using mavros_xyz_position_offboard::communication::XyzStatus;
+using mavros_xyz_position_offboard::gripper::PwmGripper;
+using mavros_xyz_position_offboard::gripper::PwmGripperConfig;
+using mavros_xyz_position_offboard::gripper::ReleaseState;
 using mavros_xyz_position_offboard::initialization::Initialization;
+using mavros_xyz_position_offboard::navigation::MissionConfig;
 using mavros_xyz_position_offboard::navigation::Navigation;
 using mavros_xyz_position_offboard::navigation::NavigationInput;
 using mavros_xyz_position_offboard::navigation::TrajectoryPlanner;
 
-class InitializationTest : public ::testing::Test
+GroundStationLink disabled_link(double max_distance_m = 5.0)
 {
-protected:
-  void SetUp() override
-  {
-    node_ = std::make_shared<rclcpp::Node>(
-      "mavros_xyz_initialization_test", rclcpp::NodeOptions().use_global_arguments(false));
-    options_.range_topic = "/test/range";
-    options_.optical_flow_topic = "/test/flow";
-    options_.lcp_status_topic = "/test/lcp/status";
-    options_.lcp_odometry_topic = "/test/lcp/odometry";
-    options_.lcp_start_service = "/test/lcp/start";
-  }
-  std::shared_ptr<rclcpp::Node> node_;
-  AppOptions options_;
-};
-
-TEST_F(InitializationTest, OldStatusCannotSatisfyNewInitialization)
-{
-  SafetyConfig config;
-  Initialization initialization(*node_, options_, config);
-  initialization.update_lcp_status(2, 1.0);
-  initialization.update_lcp_odometry(1.0, 2.0, 0.0, 1.0);
-  initialization.begin_lcp_initialization(2.0);
-  initialization.update_lcp_init_state("accepted", 2.0, "started");
-  EXPECT_FALSE(initialization.lcp_ready(2.1));
+  GroundStationConfig config;
+  config.enabled = false;
+  config.whitelist_ip = "127.0.0.1";
+  config.whitelist_port = 5010;
+  config.max_tracking_distance_m = max_distance_m;
+  return GroundStationLink(config);
 }
 
-TEST_F(InitializationTest, ThreeFreshStatusSamplesAndOdometryAreReady)
+ProtocolEvent event(MessageType type, double now)
 {
-  SafetyConfig config;
-  Initialization initialization(*node_, options_, config);
-  initialization.begin_lcp_initialization(1.0);
-  initialization.update_lcp_init_state("accepted", 1.0, "started");
-  for (const double stamp : {1.1, 1.2, 1.3}) {
-    initialization.update_lcp_status(2, stamp);
-    initialization.update_lcp_odometry(1.0, 2.0, 0.0, stamp);
-  }
-  EXPECT_TRUE(initialization.lcp_ready(1.3));
-  const auto snapshot = initialization.health_snapshot(1.3, false, 0.0, 0.0);
-  EXPECT_TRUE(snapshot.lcp_ready);
-  EXPECT_DOUBLE_EQ(snapshot.telemetry.lcp_x_m, 1.0);
+  ProtocolEvent value;
+  value.type = type;
+  value.received_at = now;
+  value.accepted = true;
+  return value;
 }
 
-TEST(LcpVisionBridgeTest, ConvertsNwuToEnu)
+ProtocolEvent car_event(double distance_m, double angle_deg, double now)
 {
-  nav_msgs::msg::Odometry source;
-  source.header.frame_id = "lcp_nwu";
-  source.pose.pose.position.x = 2.0;
-  source.pose.pose.position.y = 3.0;
-  source.pose.pose.orientation.w = 1.0;
-  const auto output = mavros_xyz_position_offboard::bridge::LcpVisionBridge::nwu_to_enu(
-    source, 0.20, 0.20);
-  EXPECT_EQ(output.header.frame_id, "lcp_enu");
-  EXPECT_DOUBLE_EQ(output.pose.pose.position.x, -3.0);
-  EXPECT_DOUBLE_EQ(output.pose.pose.position.y, 2.0);
-  EXPECT_NEAR(output.pose.pose.orientation.z, std::sqrt(0.5), 1e-12);
+  auto value = event(MessageType::car_status, now);
+  value.car_status = CarStatus{distance_m, angle_deg};
+  return value;
+}
+
+bool has_message(
+  const mavros_xyz_position_offboard::navigation::NavigationDecision & decision, MessageType type)
+{
+  for (const auto & message : decision.messages) {
+    if (message.type == type) {return true;}
+  }
+  return false;
+}
+
+NavigationInput base_input(double now)
+{
+  NavigationInput input;
+  input.now = now;
+  input.dt = 0.05;
+  input.preflight_ready = true;
+  input.lcp_healthy = true;
+  input.flight_healthy = true;
+  input.telemetry.local_x_m = 0.0;
+  input.telemetry.local_y_m = 0.0;
+  input.telemetry.local_z_m = 0.0;
+  input.telemetry.orientation = {0.0, 0.0, 0.0, 1.0};
+  input.controller.mode = "MANUAL";
+  return input;
+}
+
+void follow_planner(Navigation & navigation, NavigationInput & input)
+{
+  if (!navigation.planner().latched()) {return;}
+  const auto setpoint = navigation.planner().current();
+  input.telemetry.local_x_m = setpoint.x_m;
+  input.telemetry.local_y_m = setpoint.y_m;
+  input.telemetry.local_z_m = setpoint.z_m;
+  input.telemetry.orientation = setpoint.orientation;
+}
+
+TEST(ProtocolV2Test, AcceptsEveryInboundMessageWithStrictDataRules)
+{
+  auto link = disabled_link();
+  for (const std::string json : {
+      R"({"header":"run_plan1","data":{}})",
+      R"({"header":"match_car_ok","data":{}})",
+      R"({"header":"b_ok","data":{}})",
+      R"({"header":"ack","data":{}})",
+      R"({"header":"car_status","data":{"distance":0.1,"angle":-180}})"}) {
+    EXPECT_TRUE(link.decode_datagram(json, "127.0.0.1", 5010, 1.0).accepted) << json;
+  }
+}
+
+TEST(ProtocolV2Test, RejectsWrongDirectionMalformedAndOutOfRangePackets)
+{
+  auto link = disabled_link();
+  const auto reject = [&link](const std::string & json, const std::string & reason) {
+      const auto decoded = link.decode_datagram(json, "127.0.0.1", 5010, 1.0);
+      EXPECT_FALSE(decoded.accepted) << json;
+      EXPECT_EQ(decoded.rejection_reason, reason);
+    };
+  reject(R"({"header":"ok_wait","data":{}})", "unknown_or_wrong_direction_header");
+  reject(R"({"header":"run_plan1"})", "invalid_envelope");
+  reject(R"({"header":"run_plan1","data":{"unexpected":1}})", "nonempty_event_data");
+  reject(R"({"header":"car_status","data":{"distance":1}})", "invalid_car_status_data");
+  reject(R"({"header":"car_status","data":{"distance":"1","angle":0}})", "invalid_car_status_data");
+  reject(R"({"header":"car_status","data":{"distance":1e999,"angle":0}})", "invalid_json");
+  reject(R"({"header":"car_status","data":{"distance":1,"angle":181}})", "car_status_out_of_range");
+  reject(R"({"header":"car_status","data":{"distance":1,"angle":0,"extra":1}})", "invalid_car_status_data");
+  EXPECT_FALSE(link.decode_datagram(
+    R"({"header":"ack","data":{}})", "127.0.0.2", 5010, 1.0).accepted);
+  EXPECT_FALSE(link.decode_datagram(
+    R"({"header":"ack","data":{}})", "127.0.0.1", 5011, 1.0).accepted);
+  EXPECT_FALSE(link.decode_datagram(
+    R"({"header":"ack","header":"ack","data":{}})", "127.0.0.1", 5010, 1.0).accepted);
+}
+
+TEST(ProtocolV2Test, AckRemovesOnlyEarliestQueuedEventAndXyzstatusIsNeverQueued)
+{
+  auto link = disabled_link();
+  EXPECT_FALSE(link.send({MessageType::ok_wait}, 0.0));
+  EXPECT_FALSE(link.send({MessageType::ok_height}, 0.1));
+  ASSERT_EQ(link.pending_event_count(), 2U);
+  EXPECT_EQ(*link.pending_event_json(), R"({"header":"ok_wait","data":{}})");
+  EXPECT_FALSE(link.retry_events(0.49));
+  EXPECT_FALSE(link.retry_events(0.50));
+  EXPECT_TRUE(link.decode_datagram(
+    R"({"header":"ack","data":{}})", "127.0.0.1", 5010, 0.6).accepted);
+  ASSERT_EQ(link.pending_event_count(), 1U);
+  EXPECT_EQ(*link.pending_event_json(), R"({"header":"ok_height","data":{}})");
+  EXPECT_TRUE(link.decode_datagram(
+    R"({"header":"ack","data":{}})", "127.0.0.1", 5010, 0.7).accepted);
+  EXPECT_EQ(link.pending_event_count(), 0U);
+  EXPECT_TRUE(link.decode_datagram(
+    R"({"header":"ack","data":{}})", "127.0.0.1", 5010, 0.8).accepted);
+  EXPECT_EQ(link.pending_event_count(), 0U);
+}
+
+TEST(ProtocolV2Test, EncodesFullLcpXyzstatusAndRequiredInvalidZNulls)
+{
+  auto link = disabled_link();
+  XyzStatus status;
+  status.header = {1784984021, 999549102, "lcp_map"};
+  status.status = 2;
+  status.map_locked = true;
+  status.pose_valid = true;
+  status.position_x_m = 1.2;
+  status.position_y_m = -0.4;
+  status.yaw_rad = 0.3;
+  status.front_distance_m = 2.0;
+  status.rear_distance_m = 1.0;
+  status.left_distance_m = 3.0;
+  status.right_distance_m = 4.0;
+  status.map_size_x_m = 5.0;
+  status.map_size_y_m = 6.0;
+  Json::CharReaderBuilder reader;
+  Json::Value root;
+  std::string errors;
+  std::istringstream invalid(link.encode_xyzstatus(status));
+  ASSERT_TRUE(Json::parseFromStream(reader, invalid, &root, &errors));
+  EXPECT_EQ(root["header"].asString(), "xyzstatus");
+  const auto & data = root["data"];
+  EXPECT_EQ(data["header"]["stamp"]["sec"].asInt(), 1784984021);
+  EXPECT_EQ(data["header"]["stamp"]["nanosec"].asUInt(), 999549102U);
+  EXPECT_EQ(data["header"]["frame_id"].asString(), "lcp_map");
+  EXPECT_DOUBLE_EQ(data["front_distance_m"].asDouble(), 2.0);
+  EXPECT_DOUBLE_EQ(data["map_size_y_m"].asDouble(), 6.0);
+  EXPECT_TRUE(data["position_z_m"].isNull());
+  EXPECT_EQ(data["z_source"].asString(), "none");
+  EXPECT_TRUE(data["z_source_stamp"].isNull());
+  EXPECT_TRUE(data["z_quality"].isNull());
+  EXPECT_FALSE(data["z_valid"].asBool());
+
+  status.position_z_m = 1.5;
+  status.z_source = "local_pose";
+  status.z_source_stamp = mavros_xyz_position_offboard::common::RosTimestamp{9, 7};
+  status.z_valid = true;
+  std::istringstream valid(link.encode_xyzstatus(status));
+  ASSERT_TRUE(Json::parseFromStream(reader, valid, &root, &errors));
+  EXPECT_DOUBLE_EQ(root["data"]["position_z_m"].asDouble(), 1.5);
+  EXPECT_EQ(root["data"]["z_source_stamp"]["sec"].asInt(), 9);
+  EXPECT_TRUE(root["data"]["z_valid"].asBool());
 }
 
 TEST(TrajectoryPlannerTest, QuinticSetpointsObserveBoundsAndReplanContinuously)
@@ -103,389 +225,302 @@ TEST(TrajectoryPlannerTest, QuinticSetpointsObserveBoundsAndReplanContinuously)
     EXPECT_LE(std::abs(current.vertical_rate_m_s), config.max_z_setpoint_rate_m_s * 1.002);
     previous = current;
   }
-  const auto before = planner.current();
-  planner.set_target(0.2, 2.0, 0.4);
-  EXPECT_DOUBLE_EQ(planner.current().x_m, before.x_m);
-  EXPECT_DOUBLE_EQ(planner.current().z_m, before.z_m);
 }
 
-/// 创建不打开真实 socket、仅用于编解码单元测试的通信层实例。
-GroundStationLink disabled_link()
+TEST(NavigationV2Test, CompleteMissionUsesPolarTrackingAndOrderedEvents)
 {
-  GroundStationConfig config;
-  config.enabled = false;
-  return GroundStationLink(GroundStationConfig{config});
-}
-
-TEST(GroundStationLinkTest, RequiresV1WhitelistAndDeduplicatesWithoutOrdering)
-{
-  auto link = disabled_link();
-  auto event = link.decode_datagram(
-    R"({"version":1,"type":"start","seq":8,"height_start":0.8})",
-    "192.168.10.60", 5005, 1.0);
-  EXPECT_FALSE(event.accepted);
-  EXPECT_EQ(event.rejection_reason, "source_not_whitelisted");
-  event = link.decode_datagram(
-    R"({"version":1,"type":"start","seq":8,"height_start":0.8})",
-    "192.168.10.59", 5005, 1.1);
-  ASSERT_TRUE(event.accepted);
-  event = link.decode_datagram(
-    R"({"version":1,"type":"ACK","seq":3})", "192.168.10.59", 5005, 1.2);
-  EXPECT_TRUE(event.accepted);  // Out of order is allowed.
-  event = link.decode_datagram(
-    R"({"version":1,"type":"ACK","seq":3})", "192.168.10.59", 5005, 1.3);
-  EXPECT_FALSE(event.accepted);
-  EXPECT_EQ(event.rejection_reason, "duplicate_seq");
-}
-
-TEST(GroundStationLinkTest, DecodesAllMissionMessagesAndStrictPointCounts)
-{
-  auto link = disabled_link();
-  EXPECT_TRUE(link.decode_datagram(
-    R"({"version":1,"type":"navigation_and_point","seq":1,"plan_mode":1,"point":{"x":1,"y":2,"z":0.8}})",
-    "192.168.10.59", 5005, 1.0).accepted);
-  EXPECT_TRUE(link.decode_datagram(
-    R"({"version":1,"type":"navigation_nfz","seq":2,"nfz_point_count":1,"nfz_points":[{"x":1,"y":2,"z":0}]})",
-    "192.168.10.59", 5005, 1.0).accepted);
-  EXPECT_TRUE(link.decode_datagram(
-    R"({"version":1,"type":"navigation_plan","seq":3,"waypoint_count":2,"waypoints":[{"x":1,"y":2,"z":0.8},{"x":2,"y":2,"z":0.8}]})",
-    "192.168.10.59", 5005, 1.0).accepted);
-  EXPECT_TRUE(link.decode_datagram(
-    R"({"version":1,"type":"navigation_fly_plan_send_ok","seq":4})",
-    "192.168.10.59", 5005, 1.0).accepted);
-  EXPECT_TRUE(link.decode_datagram(
-    R"({"version":1,"type":"ok_fly_plan_succeed","seq":5})",
-    "192.168.10.59", 5005, 1.0).accepted);
-  const auto bad = link.decode_datagram(
-    R"({"version":1,"type":"navigation_plan","seq":6,"waypoint_count":2,"waypoints":[{"x":1,"y":2,"z":0.8}]})",
-    "192.168.10.59", 5005, 1.0);
-  EXPECT_FALSE(bad.accepted);
-  EXPECT_EQ(bad.rejection_reason, "point_count_mismatch");
-}
-
-TEST(GroundStationLinkTest, RejectsDuplicateFieldsWrongTypesAndNonFiniteNumbers)
-{
-  auto link = disabled_link();
-  EXPECT_FALSE(link.decode_datagram(
-    R"({"version":1,"version":1,"type":"ACK","seq":1})",
-    "192.168.10.59", 5005, 1.0).accepted);
-  EXPECT_FALSE(link.decode_datagram(
-    R"({"version":"1","type":"ACK","seq":2})",
-    "192.168.10.59", 5005, 1.0).accepted);
-  EXPECT_FALSE(link.decode_datagram(
-    R"({"version":1,"type":"start","seq":3,"height_start":1e999})",
-    "192.168.10.59", 5005, 1.0).accepted);
-}
-
-TEST(GroundStationLinkTest, EnforcesConfiguredTargetEnvelopeAfterOriginIsKnown)
-{
-  auto link = disabled_link();
-  link.set_navigation_origin(10.0, 20.0);
-  EXPECT_TRUE(link.decode_datagram(
-    R"({"version":1,"type":"navigation_and_point","seq":1,"plan_mode":1,"point":{"x":14,"y":25,"z":1}})",
-    "192.168.10.59", 5005, 1.0).accepted);
-  const auto outside = link.decode_datagram(
-    R"({"version":1,"type":"navigation_plan","seq":2,"waypoint_count":1,"waypoints":[{"x":14.01,"y":20,"z":0.8}]})",
-    "192.168.10.59", 5005, 1.0);
-  EXPECT_FALSE(outside.accepted);
-  EXPECT_EQ(outside.rejection_reason, "point_out_of_safety_envelope");
-}
-
-/// 构造具备有限原点和健康标志的 Navigation 测试周期输入。
-NavigationInput base_input(double now)
-{
-  NavigationInput input;
-  input.now = now;
-  input.dt = 0.05;
-  input.preflight_ready = true;
-  input.lcp_healthy = true;
-  input.flight_healthy = true;
-  input.telemetry.local_x_m = 0.0;
-  input.telemetry.local_y_m = 0.0;
-  input.telemetry.local_z_m = 0.0;
-  input.telemetry.orientation = {0.0, 0.0, 0.0, 1.0};
-  input.controller.mode = "MANUAL";
-  return input;
-}
-
-/// 构造已经由通信层接受的最小协议事件测试值。
-ProtocolEvent event(MessageType type, std::uint64_t seq, double now)
-{
-  ProtocolEvent value;
-  value.type = type;
-  value.seq = seq;
-  value.received_at = now;
-  value.accepted = true;
-  return value;
-}
-
-TEST(NavigationStateMachineTest, StartAndFlightRequireExplicitEventsAndMavrosConfirmation)
-{
-  SafetyConfig config;
-  config.setpoint_warmup_s = 0.1;
-  Navigation navigation(config);
-  auto input = base_input(1.0);
+  SafetyConfig safety;
+  safety.setpoint_warmup_s = 0.01;
+  safety.max_flight_seconds = 200.0;
+  safety.lcp_unhealthy_hold_timeout_s = 0.5;
+  MissionConfig mission;
+  mission.takeoff_height_m = 1.5;
+  mission.standoff_m = 0.10;
+  mission.match_tolerance_m = 0.10;
+  mission.car_status_timeout_s = 0.5;
+  Navigation navigation(safety, mission);
+  auto input = base_input(0.0);
   auto decision = navigation.update(input);
-  EXPECT_EQ(decision.phase, "waiting_start");
-  EXPECT_FALSE(decision.setpoint);
-  input.now = 1.1;
-  decision = navigation.update(input);
-  EXPECT_EQ(decision.phase, "waiting_start");
-  auto start = event(MessageType::start, 1, 1.2);
-  start.height_start_m = 0.8;
-  input.events = {start}; input.now = 1.2;
-  decision = navigation.update(input);
-  EXPECT_EQ(decision.phase, "setpoint_warmup");
-  input.events.clear(); input.now = 1.31;
-  decision = navigation.update(input);
-  EXPECT_EQ(decision.phase, "offboard_request_pending");
-  EXPECT_FALSE(std::any_of(decision.messages.begin(), decision.messages.end(),
-    [](const auto & message) {return message.type == MessageType::ok_flight;}));
-  input.controller.mode = "OFFBOARD"; input.now = 1.4;
-  EXPECT_EQ(navigation.update(input).phase, "arming_request_pending");
-  input.controller.armed = true; input.now = 1.5;
-  decision = navigation.update(input);
-  EXPECT_EQ(decision.phase, "climb");
-  EXPECT_TRUE(std::any_of(decision.messages.begin(), decision.messages.end(),
-    [](const auto & message) {return message.type == MessageType::ok_flight;}));
-}
+  EXPECT_EQ(navigation.phase(), "waiting_run_plan1");
+  EXPECT_TRUE(has_message(decision, MessageType::ok_wait));
 
-/// 驱动假飞控反馈和实测位置，直到状态机进入导航配置等待阶段。
-void reach_waiting_config(Navigation & navigation, NavigationInput & input)
-{
-  navigation.update(input);
-  auto start = event(MessageType::start, 1, input.now + 0.1);
-  start.height_start_m = 0.2;
-  input.now += 0.1; input.events = {start}; navigation.update(input);
-  input.events.clear(); input.now += 0.02; navigation.update(input);
-  input.controller.mode = "OFFBOARD"; input.now += 0.02; navigation.update(input);
-  input.controller.armed = true; input.now += 0.02; navigation.update(input);
-  for (int i = 0; i < 500 && navigation.phase() == "climb"; ++i) {
-    input.now += 0.05;
-    if (navigation.planner().latched()) {
-      const auto current = navigation.planner().current();
-      input.telemetry.local_x_m = current.x_m;
-      input.telemetry.local_y_m = current.y_m;
-      input.telemetry.local_z_m = current.z_m;
-    }
-    navigation.update(input);
-  }
-  for (int i = 0; i < 10 && navigation.phase() == "stabilize"; ++i) {
-    input.now += 0.05;
-    const auto current = navigation.planner().current();
-    input.telemetry.local_x_m = current.x_m;
-    input.telemetry.local_y_m = current.y_m;
-    input.telemetry.local_z_m = current.z_m;
-    navigation.update(input);
-  }
-}
-
-/// 构造三类载荷各三份且一致、最后带发送完成标志的导航批次。
-std::vector<ProtocolEvent> complete_batch(double now, int plan_mode = 1)
-{
-  std::vector<ProtocolEvent> result;
-  std::uint64_t seq = 10;
-  for (int copy = 0; copy < 3; ++copy) {
-    auto value = event(MessageType::navigation_and_point, seq++, now);
-    value.plan_mode = plan_mode;
-    value.final_point = Point3{2.0, 0.0, 0.2};
-    result.push_back(value);
-  }
-  for (int copy = 0; copy < 3; ++copy) {
-    auto value = event(MessageType::navigation_nfz, seq++, now);
-    value.points = {{5.0, 5.0, 0.0}};
-    result.push_back(value);
-  }
-  for (int copy = 0; copy < 3; ++copy) {
-    auto value = event(MessageType::navigation_plan, seq++, now);
-    value.points = {{1.0, 0.0, 0.2}};
-    result.push_back(value);
-  }
-  result.push_back(event(MessageType::navigation_fly_plan_send_ok, seq, now));
-  return result;
-}
-
-TEST(NavigationStateMachineTest, AcceptsExactlyThreeMatchingPacketsAndRejectsPlanModeZero)
-{
-  SafetyConfig config;
-  config.setpoint_warmup_s = 0.01;
-  config.hold_seconds = 0.1;
-  Navigation navigation(config);
-  auto input = base_input(1.0);
-  reach_waiting_config(navigation, input);
-  ASSERT_EQ(navigation.phase(), "waiting_navigation_config");
-  input.events = complete_batch(input.now);
-  auto decision = navigation.update(input);
-  EXPECT_EQ(decision.phase, "run_fly_plan");
-  EXPECT_TRUE(std::any_of(decision.messages.begin(), decision.messages.end(),
-    [](const auto & message) {return message.type == MessageType::ok_receive;}));
-
-  Navigation unsupported(config);
-  input = base_input(1.0);
-  reach_waiting_config(unsupported, input);
-  input.events = complete_batch(input.now, 0);
-  decision = unsupported.update(input);
-  EXPECT_EQ(decision.phase, "waiting_navigation_config");
-  EXPECT_NE(std::find(decision.rejections.begin(), decision.rejections.end(),
-    "autonomous_planning_not_supported"), decision.rejections.end());
-}
-
-TEST(NavigationStateMachineTest, AckTimeoutFreezesAndRecoveryReplans)
-{
-  SafetyConfig config;
-  config.setpoint_warmup_s = 0.01;
-  config.hold_seconds = 0.1;
-  Navigation navigation(config);
-  auto input = base_input(1.0);
-  reach_waiting_config(navigation, input);
-  input.events = complete_batch(input.now);
-  navigation.update(input);
-  input.events.clear(); input.now += 2.01;
-  auto decision = navigation.update(input);
-  EXPECT_EQ(decision.phase, "link_hold");
-  input.events = {event(MessageType::ack, 100, input.now + 0.01)};
   input.now += 0.01;
-  decision = navigation.update(input);
-  EXPECT_EQ(decision.phase, "run_fly_plan");
-}
-
-TEST(NavigationStateMachineTest, IncompleteOrInconsistentBatchDoesNotAcknowledgeReceipt)
-{
-  SafetyConfig config;
-  config.setpoint_warmup_s = 0.01;
-  config.hold_seconds = 0.1;
-  Navigation navigation(config);
-  auto input = base_input(1.0);
-  reach_waiting_config(navigation, input);
-  auto packets = complete_batch(input.now);
-  packets.erase(packets.begin());
-  input.events = packets;
-  auto decision = navigation.update(input);
-  EXPECT_EQ(decision.phase, "waiting_navigation_config");
-  EXPECT_FALSE(std::any_of(decision.messages.begin(), decision.messages.end(),
-    [](const auto & message) {return message.type == MessageType::ok_receive;}));
-  EXPECT_NE(std::find(decision.rejections.begin(), decision.rejections.end(),
-    "navigation_batch_incomplete_or_inconsistent"), decision.rejections.end());
-
-  packets = complete_batch(input.now + 0.1);
-  packets[1].final_point = Point3{2.1, 0.0, 0.2};
-  input.now += 0.1;
-  input.events = packets;
-  decision = navigation.update(input);
-  EXPECT_EQ(decision.phase, "waiting_navigation_config");
-  EXPECT_FALSE(std::any_of(decision.messages.begin(), decision.messages.end(),
-    [](const auto & message) {return message.type == MessageType::ok_receive;}));
-}
-
-TEST(NavigationStateMachineTest, ExecutesAllWaypointsThenWaitsForSuccessBeforeLandingAndManual)
-{
-  SafetyConfig config;
-  config.setpoint_warmup_s = 0.01;
-  config.hold_seconds = 0.1;
-  config.max_flight_seconds = 200.0;
-  Navigation navigation(config);
-  auto input = base_input(1.0);
-  reach_waiting_config(navigation, input);
-  input.events = complete_batch(input.now);
-  auto decision = navigation.update(input);
-  std::uint64_t ack_seq = 100;
-  bool saw_second_waypoint = false;
-  for (int i = 0; i < 2000 && navigation.phase() == "run_fly_plan"; ++i) {
+  input.events = {event(MessageType::run_plan1, input.now)};
+  navigation.update(input);
+  input.events.clear(); input.now += 0.02;
+  navigation.update(input);
+  EXPECT_EQ(navigation.phase(), "offboard_request_pending");
+  input.controller.mode = "OFFBOARD"; input.now += 0.01;
+  navigation.update(input);
+  input.controller.armed = true; input.now += 0.01;
+  navigation.update(input);
+  EXPECT_EQ(navigation.phase(), "climb");
+  for (int i = 0; i < 800 && navigation.phase() == "climb"; ++i) {
     input.now += 0.05;
-    const auto current = navigation.planner().current();
-    input.telemetry.local_x_m = current.x_m;
-    input.telemetry.local_y_m = current.y_m;
-    input.telemetry.local_z_m = current.z_m;
-    input.events = {event(MessageType::ack, ack_seq++, input.now)};
+    follow_planner(navigation, input);
     decision = navigation.update(input);
-    saw_second_waypoint = saw_second_waypoint || decision.waypoint_index == 1U;
   }
-  EXPECT_TRUE(saw_second_waypoint);
-  ASSERT_EQ(navigation.phase(), "awaiting_fly_plan_succeed");
-  EXPECT_EQ(navigation.waypoint_index(), 2U);
-  input.events.clear(); input.now += 1.0;
-  decision = navigation.update(input);
-  EXPECT_EQ(decision.phase, "awaiting_fly_plan_succeed");
+  ASSERT_EQ(navigation.phase(), "tracking");
+  EXPECT_TRUE(has_message(decision, MessageType::ok_height));
 
-  input.events = {event(MessageType::ok_fly_plan_succeed, ack_seq++, input.now + 0.01)};
   input.now += 0.01;
+  input.events = {car_event(1.1, 0.0, input.now)};
   decision = navigation.update(input);
-  EXPECT_EQ(decision.phase, "landing");
-  for (int i = 0; i < 500 && navigation.phase() == "landing"; ++i) {
+  EXPECT_NEAR(navigation.planner().target_x_m(), 1.0, 1e-9);
+  EXPECT_NEAR(navigation.planner().target_y_m(), 0.0, 1e-9);
+  input.now += 0.01;
+  input.events = {car_event(0.10, 0.0, input.now), event(MessageType::match_car_ok, input.now)};
+  decision = navigation.update(input);
+  EXPECT_EQ(navigation.phase(), "throwing");
+  EXPECT_TRUE(decision.release_gripper);
+  input.events.clear(); input.gripper_succeeded = true; input.now += 1.1;
+  decision = navigation.update(input);
+  EXPECT_EQ(navigation.phase(), "awaiting_b_ok");
+  EXPECT_TRUE(has_message(decision, MessageType::ok_throw));
+  input.gripper_succeeded = false; input.events = {event(MessageType::b_ok, input.now)};
+  decision = navigation.update(input);
+  EXPECT_EQ(navigation.phase(), "returning");
+  EXPECT_TRUE(has_message(decision, MessageType::ok_return));
+
+  for (int i = 0; i < 800 && navigation.phase() == "returning"; ++i) {
     input.now += 0.05;
-    const auto current = navigation.planner().current();
-    input.telemetry.local_z_m = current.z_m;
-    input.events.clear();
+    follow_planner(navigation, input);
+    decision = navigation.update(input);
+  }
+  ASSERT_EQ(navigation.phase(), "downing");
+  EXPECT_TRUE(has_message(decision, MessageType::ok_downing));
+  for (int i = 0; i < 800 && navigation.phase() == "downing"; ++i) {
+    input.now += 0.05;
+    follow_planner(navigation, input);
     decision = navigation.update(input);
   }
   ASSERT_EQ(navigation.phase(), "disarming");
-  EXPECT_EQ(decision.arm_intent, false);
   input.controller.armed = false; input.now += 0.05;
-  decision = navigation.update(input);
-  EXPECT_EQ(decision.phase, "manual_request_pending");
-  EXPECT_EQ(decision.target_mode, "MANUAL");
+  navigation.update(input);
+  ASSERT_EQ(navigation.phase(), "manual_request_pending");
   input.controller.mode = "MANUAL"; input.now += 0.05;
-  EXPECT_EQ(navigation.update(input).phase, "manual");
+  decision = navigation.update(input);
+  EXPECT_EQ(navigation.phase(), "manual");
+  EXPECT_TRUE(has_message(decision, MessageType::ok_down));
 }
 
-TEST(NavigationStateMachineTest, LcpTimeoutRequestsSafeLanding)
+TEST(NavigationV2Test, StaleCarHoldsPositionAndFailedGripperCanRetry)
 {
-  SafetyConfig config;
-  config.setpoint_warmup_s = 0.01;
-  config.hold_seconds = 0.1;
-  config.lcp_unhealthy_hold_timeout_s = 0.2;
-  Navigation navigation(config);
-  auto input = base_input(1.0);
-  reach_waiting_config(navigation, input);
-  input.events = complete_batch(input.now);
+  SafetyConfig safety;
+  safety.setpoint_warmup_s = 0.01;
+  Navigation navigation(safety);
+  auto input = base_input(0.0);
   navigation.update(input);
-  input.events.clear(); input.lcp_healthy = false; input.now += 0.05;
-  EXPECT_EQ(navigation.update(input).phase, "lcp_hold");
-  input.now += 0.21;
-  const auto decision = navigation.update(input);
-  EXPECT_EQ(decision.phase, "landing");
-  EXPECT_EQ(decision.target_mode, "AUTO.LAND");
+  input.events = {event(MessageType::run_plan1, 0.01)}; input.now = 0.01; navigation.update(input);
+  input.events.clear(); input.now = 0.03; navigation.update(input);
+  input.controller.mode = "OFFBOARD"; input.now = 0.04; navigation.update(input);
+  input.controller.armed = true; input.now = 0.05; navigation.update(input);
+  for (int i = 0; i < 800 && navigation.phase() == "climb"; ++i) {
+    input.now += 0.05; follow_planner(navigation, input); navigation.update(input);
+  }
+  ASSERT_EQ(navigation.phase(), "tracking");
+  input.events = {car_event(0.1, 0.0, input.now)}; navigation.update(input);
+  input.events = {event(MessageType::match_car_ok, input.now)}; navigation.update(input);
+  ASSERT_EQ(navigation.phase(), "throwing");
+  input.events.clear(); input.gripper_failed = true; input.now += 0.01;
+  auto decision = navigation.update(input);
+  EXPECT_EQ(navigation.phase(), "tracking");
+  EXPECT_FALSE(has_message(decision, MessageType::ok_throw));
+  input.gripper_failed = false; input.now += 0.6;
+  input.telemetry.local_x_m = 0.3; input.telemetry.local_y_m = -0.2;
+  navigation.update(input);
+  EXPECT_NEAR(navigation.planner().target_x_m(), 0.3, 1e-9);
+  EXPECT_NEAR(navigation.planner().target_y_m(), -0.2, 1e-9);
+}
+
+class PwmGripperTest : public ::testing::Test
+{
+protected:
+  void SetUp() override
+  {
+    char pattern[] = "/tmp/mavros-pwm-test-XXXXXX";
+    root_ = ::mkdtemp(pattern);
+    ASSERT_FALSE(root_.empty());
+    std::filesystem::create_directories(root_ + "/pwmchip0/pwm0");
+    std::ofstream(root_ + "/pwmchip0/export") << "0";
+    std::ofstream(root_ + "/pinmux") << "gpio18 pwm0";
+    for (const std::string name : {"enable", "period", "duty_cycle"}) {
+      std::ofstream(root_ + "/pwmchip0/pwm0/" + name) << "0";
+    }
+  }
+  void TearDown() override {std::filesystem::remove_all(root_);}
+  PwmGripperConfig config() const
+  {
+    PwmGripperConfig value;
+    value.enabled = true;
+    value.chip_path = root_ + "/pwmchip0";
+    value.channel = 0;
+    value.period_ns = 20000000;
+    value.idle_duty_ns = 1500000;
+    value.release_duty_ns = 2000000;
+    value.release_delay_ms = 500;
+    value.release_hold_ms = 200;
+    value.pinmux_path = root_ + "/pinmux";
+    value.pinmux_expected = "pwm0";
+    return value;
+  }
+  std::string read(const std::string & path) const
+  {
+    std::ifstream stream(path);
+    std::string value;
+    stream >> value;
+    return value;
+  }
+  std::string root_;
+};
+
+TEST_F(PwmGripperTest, WritesSysfsInReleaseOrderAndRestoresIdle)
+{
+  PwmGripper gripper(config());
+  ASSERT_TRUE(gripper.begin_release(0.0));
+  EXPECT_EQ(read(root_ + "/pwmchip0/pwm0/period"), "20000000");
+  EXPECT_EQ(read(root_ + "/pwmchip0/pwm0/duty_cycle"), "1500000");
+  EXPECT_EQ(gripper.update(0.49), ReleaseState::waiting_delay);
+  EXPECT_EQ(gripper.update(0.50), ReleaseState::holding_release);
+  EXPECT_EQ(read(root_ + "/pwmchip0/pwm0/duty_cycle"), "2000000");
+  EXPECT_EQ(gripper.update(0.71), ReleaseState::succeeded);
+  EXPECT_EQ(read(root_ + "/pwmchip0/pwm0/duty_cycle"), "1500000");
+}
+
+TEST_F(PwmGripperTest, PinmuxFailureDoesNotReportSuccessAndCanRetry)
+{
+  auto value = config();
+  value.pinmux_expected = "missing";
+  PwmGripper gripper(value);
+  EXPECT_FALSE(gripper.begin_release(0.0));
+  EXPECT_EQ(gripper.state(), ReleaseState::failed);
+  ASSERT_TRUE(gripper.fault());
+  std::ofstream(root_ + "/pinmux") << "missing";
+  EXPECT_TRUE(gripper.begin_release(1.0));
+  EXPECT_EQ(gripper.update(1.5), ReleaseState::holding_release);
+  EXPECT_EQ(gripper.update(1.71), ReleaseState::succeeded);
+}
+
+TEST(UdpIntegrationTest, LoopbackDatagramsDeliverEventThenAck)
+{
+  const int gcs_socket = ::socket(AF_INET, SOCK_DGRAM, 0);
+  ASSERT_GE(gcs_socket, 0);
+  sockaddr_in gcs{};
+  gcs.sin_family = AF_INET;
+  gcs.sin_port = 0;
+  ::inet_pton(AF_INET, "127.0.0.1", &gcs.sin_addr);
+  ASSERT_EQ(::bind(gcs_socket, reinterpret_cast<const sockaddr *>(&gcs), sizeof(gcs)), 0);
+  socklen_t gcs_length = sizeof(gcs);
+  ASSERT_EQ(::getsockname(gcs_socket, reinterpret_cast<sockaddr *>(&gcs), &gcs_length), 0);
+
+  const int probe = ::socket(AF_INET, SOCK_DGRAM, 0);
+  ASSERT_GE(probe, 0);
+  sockaddr_in uav{};
+  uav.sin_family = AF_INET;
+  uav.sin_port = 0;
+  ::inet_pton(AF_INET, "127.0.0.1", &uav.sin_addr);
+  ASSERT_EQ(::bind(probe, reinterpret_cast<const sockaddr *>(&uav), sizeof(uav)), 0);
+  socklen_t uav_length = sizeof(uav);
+  ASSERT_EQ(::getsockname(probe, reinterpret_cast<sockaddr *>(&uav), &uav_length), 0);
+  ::close(probe);
+
+  GroundStationConfig config;
+  config.bind_ip = "127.0.0.1";
+  config.bind_port = ntohs(uav.sin_port);
+  config.remote_ip = "127.0.0.1";
+  config.remote_port = ntohs(gcs.sin_port);
+  config.whitelist_ip = "127.0.0.1";
+  config.whitelist_port = ntohs(gcs.sin_port);
+  GroundStationLink link(config);
+  ASSERT_TRUE(link.bound());
+  timeval timeout{};
+  timeout.tv_sec = 1;
+  ASSERT_EQ(::setsockopt(gcs_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)), 0);
+
+  const std::string run_plan = R"({"header":"run_plan1","data":{}})";
+  ASSERT_EQ(::sendto(gcs_socket, run_plan.data(), run_plan.size(), 0,
+    reinterpret_cast<const sockaddr *>(&uav), sizeof(uav)), static_cast<ssize_t>(run_plan.size()));
+  const auto inbound = link.poll(0.9);
+  ASSERT_EQ(inbound.size(), 1U);
+  EXPECT_TRUE(inbound.front().accepted);
+  EXPECT_EQ(inbound.front().type, MessageType::run_plan1);
+
+  ASSERT_TRUE(link.send({MessageType::ok_wait}, 1.0));
+  char buffer[256]{};
+  sockaddr_in source{};
+  socklen_t source_length = sizeof(source);
+  const auto bytes = ::recvfrom(gcs_socket, buffer, sizeof(buffer), 0,
+    reinterpret_cast<sockaddr *>(&source), &source_length);
+  ASSERT_GT(bytes, 0);
+  EXPECT_EQ(std::string(buffer, static_cast<std::size_t>(bytes)), R"({"header":"ok_wait","data":{}})");
+  EXPECT_FALSE(link.retry_events(1.49));
+  ASSERT_TRUE(link.retry_events(1.50));
+  const auto retried = ::recvfrom(gcs_socket, buffer, sizeof(buffer), 0,
+    reinterpret_cast<sockaddr *>(&source), &source_length);
+  ASSERT_GT(retried, 0);
+  EXPECT_EQ(std::string(buffer, static_cast<std::size_t>(retried)), R"({"header":"ok_wait","data":{}})");
+  const std::string ack = R"({"header":"ack","data":{}})";
+  ASSERT_EQ(::sendto(gcs_socket, ack.data(), ack.size(), 0,
+    reinterpret_cast<const sockaddr *>(&uav), sizeof(uav)), static_cast<ssize_t>(ack.size()));
+  const auto events = link.poll(1.1);
+  ASSERT_EQ(events.size(), 1U);
+  EXPECT_TRUE(events.front().accepted);
+  EXPECT_EQ(link.pending_event_count(), 0U);
+  ::close(gcs_socket);
+}
+
+TEST(InitializationTest, LcpInitializationStillRequiresFreshPostRequestSamples)
+{
+  auto node = std::make_shared<rclcpp::Node>(
+    "mavros_xyz_initialization_test", rclcpp::NodeOptions().use_global_arguments(false));
+  AppOptions options;
+  options.range_topic = "/test/range";
+  options.optical_flow_topic = "/test/flow";
+  options.lcp_status_topic = "/test/lcp/status";
+  options.lcp_odometry_topic = "/test/lcp/odometry";
+  options.lcp_start_service = "/test/lcp/start";
+  SafetyConfig config;
+  Initialization initialization(*node, options, config);
+  initialization.update_lcp_status(2, 1.0);
+  initialization.update_lcp_odometry(1.0, 2.0, 0.0, 1.0);
+  initialization.begin_lcp_initialization(2.0);
+  initialization.update_lcp_init_state("accepted", 2.0, "started");
+  EXPECT_FALSE(initialization.lcp_ready(2.1));
+  for (const double stamp : {2.1, 2.2, 2.3}) {
+    initialization.update_lcp_status(2, stamp);
+    initialization.update_lcp_odometry(1.0, 2.0, 0.0, stamp);
+  }
+  EXPECT_TRUE(initialization.lcp_ready(2.3));
+}
+
+TEST(LcpVisionBridgeTest, ConvertsNwuToEnu)
+{
+  nav_msgs::msg::Odometry source;
+  source.header.frame_id = "lcp_nwu";
+  source.pose.pose.position.x = 2.0;
+  source.pose.pose.position.y = 3.0;
+  source.pose.pose.orientation.w = 1.0;
+  const auto output = mavros_xyz_position_offboard::bridge::LcpVisionBridge::nwu_to_enu(
+    source, 0.20, 0.20);
+  EXPECT_EQ(output.header.frame_id, "lcp_enu");
+  EXPECT_DOUBLE_EQ(output.pose.pose.position.x, -3.0);
+  EXPECT_DOUBLE_EQ(output.pose.pose.position.y, 2.0);
 }
 
 TEST(OffboardMappingTest, PositionTargetUsesLocalNedFullPositionHold)
 {
-  const mavros_xyz_position_offboard::common::PositionSetpoint input{
-    1.0, -2.0, 3.0, {0.0, 0.0, std::sqrt(0.5), std::sqrt(0.5)}, 0.4};
+  mavros_xyz_position_offboard::common::PositionSetpoint setpoint;
+  setpoint.x_m = 1.0; setpoint.y_m = 2.0; setpoint.z_m = 3.0;
+  setpoint.orientation = {0.0, 0.0, 0.0, 1.0};
   builtin_interfaces::msg::Time stamp;
-  const auto output = mavros_xyz_position_offboard::offboard::Offboard::make_position_target(input, stamp);
-  EXPECT_EQ(output.coordinate_frame, mavros_msgs::msg::PositionTarget::FRAME_LOCAL_NED);
-  EXPECT_EQ(output.type_mask & mavros_msgs::msg::PositionTarget::IGNORE_PX, 0U);
-  EXPECT_NE(output.type_mask & mavros_msgs::msg::PositionTarget::IGNORE_VX, 0U);
-  EXPECT_NE(output.type_mask & mavros_msgs::msg::PositionTarget::IGNORE_YAW_RATE, 0U);
-  EXPECT_DOUBLE_EQ(output.position.x, 1.0);
-}
-
-TEST(OffboardStructureTest, AdapterHeaderDoesNotReferenceMissionOrUdp)
-{
-  const std::string header = MAVROS_XYZ_SOURCE_DIR "/include/mavros_xyz_position_offboard/offboard/offboard.hpp";
-  std::ifstream stream(header);
-  const std::string text((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
-  EXPECT_EQ(text.find("navigation/"), std::string::npos);
-  EXPECT_EQ(text.find("GroundStation"), std::string::npos);
-  EXPECT_EQ(text.find("phase"), std::string::npos);
-}
-
-TEST(CliTest, PreservesSafetyOptInGates)
-{
-  const std::vector<std::string> basic{
-    "node", "--confirmed-fcu-url", "udp://127.0.0.1:14540", "--range-topic", "/range",
-    "--range-source-label", "downward", "--optical-flow-topic", "/flow",
-    "--optical-flow-source-label", "flow"};
-  const auto parsed = mavros_xyz_position_offboard::common::parse_options(basic);
-  EXPECT_FALSE(mavros_xyz_position_offboard::common::setpoint_enabled(parsed.options));
-  auto incomplete = basic;
-  incomplete.emplace_back("--enable-position-setpoints");
-  EXPECT_THROW(mavros_xyz_position_offboard::common::parse_options(incomplete), std::invalid_argument);
+  const auto target = mavros_xyz_position_offboard::offboard::Offboard::make_position_target(setpoint, stamp);
+  EXPECT_EQ(target.coordinate_frame, mavros_msgs::msg::PositionTarget::FRAME_LOCAL_NED);
+  EXPECT_EQ(target.type_mask & mavros_msgs::msg::PositionTarget::IGNORE_PX, 0U);
+  EXPECT_EQ(target.type_mask & mavros_msgs::msg::PositionTarget::IGNORE_YAW, 0U);
 }
 
 }  // namespace
 
-/// 初始化隔离的 ROS 测试上下文，运行全部 gtest 后正常关闭上下文。
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);

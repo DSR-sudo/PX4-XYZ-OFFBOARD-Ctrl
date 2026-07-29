@@ -3,62 +3,84 @@
 #include <cstdint>
 #include <optional>
 #include <string>
-#include <vector>
+
+#include "mavros_xyz_position_offboard/common/types.hpp"
 
 namespace mavros_xyz_position_offboard::communication
 {
 
-struct Point3
-{
-  double x_m{0.0};
-  double y_m{0.0};
-  double z_m{0.0};
-
-  /// 精确比较两个协议点的三个坐标，用于三份业务载荷一致性判断。
-  bool operator==(const Point3 & other) const;
-  /// 返回两个协议点是否存在任一坐标差异。
-  bool operator!=(const Point3 & other) const {return !(*this == other);}
-};
-
+/// Names registered by the V2 UAV--GCS JSON protocol.
 enum class MessageType
 {
-  start,
-  navigation_and_point,
-  navigation_nfz,
-  navigation_plan,
-  navigation_fly_plan_send_ok,
+  run_plan1,
+  car_status,
+  match_car_ok,
+  b_ok,
   ack,
-  ok_fly_plan_succeed,
-  ok_preflight,
-  ok_flight,
-  wait_plan,
-  ok_receive,
-  ok_fly_plan,
-  xyz_state,
-  battery_state,
+  ok_wait,
+  ok_height,
+  ok_throw,
+  ok_return,
+  ok_downing,
+  ok_down,
+  xyzstatus,
   invalid
 };
 
-/// 将内部消息枚举转换为 JSON V1 规定的 type 字符串。
+/// Converts a protocol enum to its exact wire-level header value.
 std::string to_string(MessageType type);
+/// True only for the ordered, ACK-required UAV event headers.
+bool is_discrete_event(MessageType type);
+
+struct CarStatus
+{
+  double distance_m{0.0};
+  double angle_deg{0.0};
+};
 
 struct ProtocolEvent
 {
   MessageType type{MessageType::invalid};
-  std::uint64_t seq{0};
   double received_at{0.0};
   bool accepted{false};
   std::string rejection_reason{};
-  std::optional<double> height_start_m{};
-  std::optional<int> plan_mode{};
-  std::optional<Point3> final_point{};
-  std::vector<Point3> points{};
+  std::optional<CarStatus> car_status{};
+};
+
+/// A ROS header represented without a ROS dependency in the protocol value layer.
+struct RosHeader
+{
+  std::int32_t stamp_sec{0};
+  std::uint32_t stamp_nanosec{0};
+  std::string frame_id{};
+};
+
+/// Full LCP debug sample with its task-relative altitude metadata.
+struct XyzStatus
+{
+  RosHeader header{};
+  std::uint8_t status{0};
+  bool map_locked{false};
+  bool pose_valid{false};
+  double position_x_m{0.0};
+  double position_y_m{0.0};
+  std::optional<double> position_z_m{};
+  std::string z_source{"none"};
+  std::optional<common::RosTimestamp> z_source_stamp{};
+  std::optional<double> z_quality{};
+  bool z_valid{false};
+  double yaw_rad{0.0};
+  double front_distance_m{0.0};
+  double rear_distance_m{0.0};
+  double left_distance_m{0.0};
+  double right_distance_m{0.0};
+  double map_size_x_m{0.0};
+  double map_size_y_m{0.0};
 };
 
 struct OutgoingMessage
 {
   MessageType type{MessageType::invalid};
-  std::string detail{};
 };
 
 }  // namespace mavros_xyz_position_offboard::communication

@@ -1,147 +1,148 @@
 # PX4 / MAVROS 飞行测试工具
 
-本仓库用于 PX4 飞控、MAVROS、雷达 LCP 建系、测距和光流融合的只读核验与受限
-XYZ 位置测试。核心 ROS 2 包是 `mavros_xyz_position_offboard`，另有 Python
-桥接脚本、参数读取工具、操作记录和测试产物。
+本工作区用于 PX4 飞控、MAVROS、LCP 建图定位、向下测距、光流和地面站 UDP 协同任务的
+受限测试。核心 ROS 2 C++17 包为 `mavros_xyz_position_offboard`；它实现 UAV 端任务状态机，
+不修改 PX4/MAVROS 参数，也不使用 force-arm 或 force-disarm。
 
-默认目标环境记录为 PX4 FMUv6C.x、PX4 1.17.0、Raspberry Pi 5、ROS 2 Jazzy、
-MAVROS 2.14.0 和 MTF02P 光流/测距。实际运行前必须重新确认当前硬件、话题来源、
-PX4 参数和坐标系；README 中的设备型号不构成自动识别结果。
+默认目标环境记录为 PX4 FMUv6C.x、PX4 1.17.0、Raspberry Pi 5、ROS 2 Jazzy、MAVROS
+2.14.0 和 MTF02P 光流/测距。实际运行前必须重新确认硬件、话题来源、PX4 参数和坐标系；
+本文档中的设备型号和命令不构成自动识别或飞行授权。
+
+完整的 GCS-UAV V0.7 协议位于工作区外层的
+`/home/pi/GCS_UAV_JSON通信协议.md`。该版本已移除 JSON V1 导航三包，不提供兼容回退。
 
 ## 核心能力
 
-`mavros_xyz_position_node` 是一个 C++17 ROS 2 节点，按显式授权逐级创建控制资源：
+`mavros_xyz_position_node` 按显式授权逐级创建控制资源：
 
-- 默认只订阅 MAVROS、传感器和 LCP 话题，执行预检并输出状态，不创建设定点发布器。
-- 满足完整确认组后，才创建 `/mavros/setpoint_raw/local` 发布器。
-- 再满足模式确认后，才创建 `/mavros/set_mode` 客户端。
-- 最后满足受限飞行确认后，才创建 `/mavros/cmd/arming` 客户端。
-- 不写入 PX4/MAVROS 参数，不使用 force-arm/force-disarm，不把服务响应当成飞控状态成功。
-- 所有模式和解锁结果必须等待后续 `/mavros/state` heartbeat 实际确认。
+- 默认只订阅 MAVROS、传感器和 LCP 话题，执行预检和状态输出，不创建设定点发布器。
+- 满足位置控制确认组后，才创建 `/mavros/setpoint_raw/local` 发布器。
+- 满足模式确认后，才创建 `/mavros/set_mode` 客户端；满足飞行确认后，才创建
+  `/mavros/cmd/arming` 客户端。
+- 所有模式和解锁结果都必须由后续 `/mavros/state` heartbeat 确认；服务响应本身不代表飞控
+  状态已经改变。
+- 通过固定远端、IP/端口白名单的 UDP 发送 V0.7 JSON，并拒绝错误方向、重复键、未知字段、
+  非 UTF-8 或无效数值的入站报文。
+- 按阶段执行“起飞、跟车、PWM 投放、返航、下降、普通解锁、`MANUAL`”任务流程。
 
 ## 内部架构
 
 ```text
-命令行参数与确认门禁
-          │
-          ▼
-MavrosNativeXYZNode（20 Hz 单线程定时器）
-   ┌──────┼──────────────┬──────────────┐
-   ▼      ▼              ▼              ▼
-Initialization  LcpVisionBridge  Navigation  ArtifactLogger
-   │              │              │
-   │ 订阅遥测     │ LCP NWU→ENU  │ 五次轨迹
-   │ 预检门禁     │ 外部视觉发布  │ 方形航点
-   │ RangeGuard   │              │ XYZ 设定点
-   └──────────────┴──────────────┴──────────────▶ OFFBOARD 状态机
-                                                        │
-                                                        ▼
-                                      PositionTarget / SetMode / CommandBool
+GCS UDP ──> GroundStationLink ──> Navigation ──> Offboard ──> MAVROS / PX4
+                  ▲                    │
+                  │                    └────────> PwmGripper
+                  │
+/lcp/debug ───────┼──> xyzstatus
+Initialization ────┴──> 健康状态与相对 Z
+LcpVisionBridge ─────────> LCP NWU 到 ENU 外部视觉位姿
 ```
 
-`Initialization` 只负责接收并缓存遥测、判断新鲜度和门禁；`Navigation` 是不依赖 ROS
-消息的轨迹规划器；`MavrosNativeXYZNode` 负责把两者串成预检、飞行和降落状态机。
-控制时间使用单调时钟，避免 ROS 时间跳变影响超时判断。
+`GroundStationLink` 负责 UDP、JSON 校验、离散事件 ACK 队列和 `xyzstatus` 编码；
+`Navigation` 是不依赖 ROS 的纯值类型任务状态机；`PwmGripper` 是非阻塞 PWM sysfs
+适配器；`ApplicationNode` 在 20 Hz 单线程定时器中连接遥测、飞控服务、导航和通信。
+控制超时使用单调时钟，不受 ROS 时间跳变影响。
 
-## 输入话题与输出接口
+## GCS-UAV V0.7 通信
 
-默认输入话题如下，均可通过命令行选项修改：
+每个 UDP 数据报恰好包含一个 UTF-8 JSON 对象：
 
-| 类别 | 默认话题 | 用途 |
+```json
+{"header":"<name>","data":{}}
+```
+
+UAV 读取 `udp.bind_*`、`udp.remote_*`、`udp.whitelist_*` 参数。入站数据报的源 IP **和**
+源端口必须同时匹配白名单；出站数据报只发送至固定远端。
+
+| 方向 | 消息 | 含义 |
 | --- | --- | --- |
-| 飞控 | `/mavros/state` | 连接、模式、解锁和 heartbeat |
-| 飞控 | `/mavros/sys_status` | 传感器 enabled/health 位掩码 |
-| 飞控 | `/mavros/battery` | 电池存在性、电压和电量 |
-| 飞控 | `/mavros/extended_state` | `ON_GROUND` 状态 |
-| 飞控 | `/mavros/local_position/pose` | 本地 XYZ 与姿态 |
-| 飞控 | `/mavros/local_position/velocity_local` | 本地 XYZ 速度 |
-| 飞控 | `/mavros/estimator_status` | 姿态、速度、位置和故障标志 |
-| 传感器 | 命令行指定 | `sensor_msgs/Range` 测距 |
-| 传感器 | 命令行指定 | `mavros_msgs/OpticalFlowRad` 光流 |
-| LCP | `/lcp/status` | LCP 状态，只有新鲜 `2` 才表示地图锁定 |
-| LCP | `/lcp/odometry` | LCP 平面位置和 yaw |
-| 输出 | `/mavros/vision_pose/pose_cov` | LCP 锁定后的外部视觉位姿 |
-| 输出 | `/mavros/setpoint_raw/local` | 启用控制后的 XYZ+yaw 位置设定点 |
+| GCS -> UAV | `run_plan1` | 在 `ok_wait` 后启动设定点预热、OFFBOARD、ARM 和 1.5 m 爬升。 |
+| GCS -> UAV | `car_status` | 提供 `distance`（m）和相对机体 `+X` 的 `angle`（度）。 |
+| GCS -> UAV | `match_car_ok` | 仅在新鲜且满足停靠距离的跟车状态下请求投放。 |
+| GCS -> UAV | `b_ok` | 在成功投放后启动返航。 |
+| GCS -> UAV | `ack` | 确认当前最早的未确认 `ok_*` 事件。 |
+| UAV -> GCS | `ok_wait`、`ok_height`、`ok_throw`、`ok_return`、`ok_downing`、`ok_down` | 有序、需要 ACK 的离散阶段事件。 |
+| UAV -> GCS | `xyzstatus` | 每个新 `/lcp/debug` 样本的 LCP 数据和相对 Z 元数据；不需要 ACK。 |
 
-LCP 初始化服务默认为 `/lcp/start_initialization`。节点会在 LCP 服务请求前锁存
-状态/里程计序列号基线，旧的 `STATUS=2` 消息不能为新的初始化请求“充数”。默认至少
-需要 3 个初始化基线之后的新鲜健康样本。
+离散 `ok_*` 事件按顺序入队，首个事件立即发送，并以
+`udp.event_retry_period_s`（默认 `0.5 s`）重发，直至收到 `{"header":"ack","data":{}}`。
+`xyzstatus` 不进入该队列，不能 ACK。
 
-## LCP 视觉桥接
+`car_status.angle` 以当前机体/航向 `+X` 为零度、逆时针为正，范围为 `[-180, 180]`。收到新鲜
+样本时，UAV 计算车辆方位并保持 `tracking.standoff_m`（默认 `0.10 m`）距离；超过
+`tracking.car_status_timeout_s`（默认 `0.5 s`）未收到有效样本时，UAV 固定在实测 XY，
+不会外推车辆运动。
 
-LCP 驱动在 `lcp_nwu` 中定义 `+X=北、+Y=西/左、+Z=上`，yaw=0 指向北。内置
-`LcpVisionBridge` 只接受新鲜 `STATUS=2` 且 frame 为 `lcp_nwu` 的里程计，然后整体
-转换为 ROS ENU：
+## 任务状态机
+
+启用完整控制并通过预检后，正常任务流程为：
 
 ```text
-lcp_nwu:  (x=north, y=west, yaw=0 north)
-       ↓  x_enu=-y_nwu, y_enu=x_nwu, yaw_enu=yaw_nwu+π/2
-lcp_enu:  (x=east, y=north)
-       ↓
-/mavros/vision_pose/pose_cov
+预检与 LCP 初始化
+  -> 锁存 Init XYZ、发送 ok_wait
+  -> 等待 run_plan1
+  -> 设定点预热 -> OFFBOARD -> 普通 ARM
+  -> 相对 Init 爬升 1.5 m、发送 ok_height
+  -> 根据 car_status 跟车
+  -> match_car_ok 通过停靠门限 -> PWM 投放 -> ok_throw
+  -> b_ok -> 返航 Init XY、世界偏航 0 -> ok_return
+  -> 开始下降 -> ok_downing
+  -> 着陆 -> 普通 Disarm -> MANUAL -> ok_down
 ```
 
-XY 和 yaw 使用可配置的标准差，Z、roll、pitch 使用大协方差，因为该桥接只为 XY/yaw
-外部视觉输入服务。它不会启用 PX4 EKF 融合，也不会修改任何 PX4 参数。需要隔离诊断
-时可使用 `--disable-lcp-vision-bridge`；通常应保持默认启用。
+`Navigation` 对 XY 和 Z 使用五次多项式轨迹，并通过延长轨迹时间限制速度和加速度。跟车目标始终
+限制在距 Init XY 的 `tracking.max_distance_m` 内。LCP 在爬升、跟车、投放或返航阶段失效时，
+任务会冻结可靠位置；超过 LCP 保持超时、飞控模式丢失、飞行健康失败或最大飞行时间后，进入安全
+降落路径。
 
-## 飞行状态机
+`ok_down` 的语义是已着陆、PX4 已普通解锁（Disarm）且已确认 `MANUAL`；不会关闭 Raspberry Pi
+或飞控电源。
 
-当只读监视模式运行时，节点停留在预检报告阶段。启用完整控制后，流程为：
+## LCP、外部视觉与 Z
+
+`LcpVisionBridge` 将 `lcp_nwu` 里程计转换为 ROS ENU 并发布到
+`/mavros/vision_pose/pose_cov`：
 
 ```text
-预检
-  → 请求 LCP 建系
-  → 等待新鲜 STATUS=2 和里程计样本
-  → 锁存当前 XYZ，固定北向 yaw
-  → 设定点预热（默认 2 s）
-  → 请求 OFFBOARD（若已授权）
-  → 请求普通 ARM（若已授权）
-  → 爬升到 origin_z + relative_z
-  → 定高悬停（默认 10 s）
-  → 前 / 左 / 后 / 右四段方形航点
-  → 回到初始 XY
-  → 下降
-  → 落地确认后普通解锁
-  → PASS 或 ABORTED_SAFE
+lcp_nwu:  x=北，y=西/左，yaw=0 指北
+       -> x_enu=-y_nwu，y_enu=x_nwu，yaw_enu=yaw_nwu+pi/2
+lcp_enu:  x=东，y=北
 ```
 
-`Navigation` 为 Z 和 XY 都使用五次多项式轨迹，并通过拉长轨迹时间限制速度和加速度。
-航点以 ARM 时的固定航向在 ROS ENU local XY 中生成，默认每边 0.5 m；不直接跳变位置
-设定点。
+应用还订阅 `/lcp/debug`（`lslidar_msgs/LcpDebug`），每个新样本均发送一条 `xyzstatus`。发送
+`ok_wait` 时锁存 MAVROS 本地 Z 为 Init，同时记录有效向下 Range 基准。默认采用新鲜本地位姿的
+`local_z - init_local_z`；仅当其与新鲜、有效 Range 的相对值差不超过
+`z.range_cross_check_max_delta_m`（默认 `0.30 m`）时，Z 才有效。设置
+`z.prefer_range:true` 可选择经校准的 Range 相对 Z。
 
-LCP 失效策略与阶段有关：爬升阶段不因 LCP `STATUS=3` 停止；定高悬停结束前必须等到
-新鲜 `STATUS=2` 才进入航点；航点期间 LCP 失效会冻结 XY/Z 进入 `lcp_hold`，恢复则
-继续，超过保持超时则进入安全降落。其他阻断条件（掉线、模式丢失、漂移、估计器故障、
-电池或传感器超时等）会固定水平位置并进入降落路径；必要时只请求正常 `AUTO.LAND`。
+无有效 Z 时，LCP 其余字段仍照常发送，且 Z 元数据固定为：
 
-## 预检门禁
+```json
+"position_z_m":null,"z_source":"none","z_source_stamp":null,"z_quality":null,"z_valid":false
+```
 
-预检会同时检查：
+## PWM 夹爪
 
-- MAVROS 已连接，heartbeat、SYS_STATUS 和落地状态新鲜；飞行器未解锁并处于地面状态。
-- PX4 enabled-but-unhealthy 传感器掩码没有不可接受故障。
-- 电池存在，电压默认不低于 14 V，地面预检电量默认不低于 30%。
-- local pose、local velocity、四元数有限且新鲜，地面速度不过限。
-- MAVROS 暴露的估计器姿态、速度、水平/垂直位置标志有效，GPS glitch 和 accel error 未置位。
-- 测距来源和光流来源通过命令行显式确认；消息新鲜，光流积分时间有效，质量默认至少 20。
-- local Z 与向下测距的差值不超过 0.30 m。
-- 测距值处于配置范围内，并对短时间大跳变进行故障锁存和连续稳定样本恢复。
+`PwmGripper` 使用 `/sys/class/pwm/pwmchip*`，以“延时 -> 保持释放占空比 -> 恢复空闲占空比”
+的非阻塞状态机完成一次投放。`gripper_pwm.enabled:false` 是默认值，适用于普通软件构建和
+SITL；此时适配器执行定时空操作，不访问硬件。
 
-RangeGuard 默认使用配置下限/上限 `0.02..12.0 m`，默认可忽略消息声明的最小距离，
-但仍检查声明的最大距离。使用 `--enforce-declared-min-range` 可强制同时遵守消息声明
-的最小距离；`--ack-range-below-declared-min` 只记录操作者对低于声明下限场景的审计确认，
-不会改变传感器物理有效范围。
+在完成无桨台架标定前，**不得**设置 `gripper_pwm.enabled:true`。启用硬件输出还要求：
 
-MAVROS 话题不能直接证明 PX4 内部所有 `vehicle_local_position`、`estimator_aid_src_*`
-或传感器融合字段。程序不会伪造这些字段；执行真实带桨飞行仍需要独立的 PX4 shell/ULog
-融合证据和物理安全措施。
+- 正确的 `chip_path`、`channel`、周期、空闲占空比和释放占空比；
+- `gripper_pwm.pinmux_path` 可读且包含 `gripper_pwm.pinmux_expected`；
+- PWM 通道可导出，且 `period`、`duty_cycle`、`enable` 均可写。
 
-## 三层显式确认
+任一准备或写入失败都不会发送 `ok_throw`，状态机会回到跟车阶段。之后一条满足门限的
+`match_car_ok` 可以重新尝试投放。自动测试仅使用 sysfs 仿真目录，不驱动真实 PWM 引脚。
 
-### 1. 创建位置设定点发布器
+## 预检与显式确认
 
-必须同时提供：
+预检会检查 MAVROS heartbeat、模式、解锁和落地状态的新鲜度；电池、local pose、local velocity、
+四元数、估计器状态、向下测距、光流和 LCP 健康状态。默认还要求 local Z 与向下测距差值不超过
+`0.30 m`。程序不会伪造 PX4 内部融合证据；实际带桨飞行仍需独立 PX4 shell/ULog 核验和物理安全
+措施。
+
+创建位置设定点发布器前，必须提供：
 
 ```text
 --enable-position-setpoints
@@ -152,25 +153,14 @@ MAVROS 话题不能直接证明 PX4 内部所有 `vehicle_local_position`、`est
 --confirm-optical-flow-source
 ```
 
-设定点使用 `mavros_msgs/PositionTarget` 的 `FRAME_LOCAL_NED`，保留 PX/PY/PZ/YAW，
-忽略速度、加速度和 yaw-rate。程序在内部维护 ROS ENU 值，并要求操作者确认 MAVROS
-的 `mav_frame=LOCAL_NED` 语义。
-
-### 2. 创建模式客户端
-
-在第一组确认之外，再提供：
+请求 OFFBOARD 前，还必须提供：
 
 ```text
 --request-offboard-mode
 --ack-disarmed-mode-switch
 ```
 
-程序才会创建 `/mavros/set_mode` 客户端并周期性请求 `OFFBOARD`；服务返回不等于模式已经
-切换，必须等 `/mavros/state` 回报 `OFFBOARD`。
-
-### 3. 创建解锁客户端和受限飞行
-
-在前两组确认之外，再提供：
+执行普通 ARM 和受限飞行前，还必须提供：
 
 ```text
 --execute-bounded-flight
@@ -183,79 +173,66 @@ MAVROS 话题不能直接证明 PX4 内部所有 `vehicle_local_position`、`est
 --px4-xy-fusion-evidence-label "可审计的证据标签"
 ```
 
-程序只发送普通 `CommandBool` ARM/解锁请求。若任一组确认不完整，参数解析阶段会报错，
-不会创建对应资源。
+若任一确认组不完整，参数解析会报错，相关控制资源不会被创建。通过单元测试不构成飞行授权。
 
 ## 构建与测试
+
+`lslidar_msgs` 是必需依赖。配置、构建和测试前先加载 ROS 及 LSLIDAR overlay：
 
 ```bash
 cd /home/pi/px4-test-tools
 source /opt/ros/jazzy/setup.bash
-colcon build --symlink-install --packages-select mavros_xyz_position_offboard
-colcon test --packages-select mavros_xyz_position_offboard
-colcon test-result --verbose
+source /home/pi/LSLIDARN10P/install/setup.bash
+colcon build --symlink-install --packages-select mavros_xyz_position_offboard --parallel-workers 1
 source install/setup.bash
-ros2 run mavros_xyz_position_offboard mavros_xyz_position_node --help
+colcon test --packages-select mavros_xyz_position_offboard --event-handlers console_direct+
+colcon test-result --all --verbose
 ```
 
-单元测试覆盖 LCP 新鲜样本基线、LCP→ENU 变换、五次轨迹速度/加速度约束、LOCAL_NED
-设定点映射和不完整确认拒绝。
+测试覆盖 V0.7 入站校验、白名单拒绝、ACK 重传队列、有效/无效 Z 的 `xyzstatus` 编码、完整任务
+顺序、PWM sysfs 仿真和 UDP 回环。真实 PWM 引脚和实际飞行不在自动测试范围内。
 
-## 运行示例
+## 配置与运行
 
-先启动 MAVROS，并把 `fcu_url`、测距和光流话题改成当前实机经过核验的值：
+使用 ROS 参数文件加载 UDP、跟车、Z 与 PWM 默认值：
 
-```bash
-source /opt/ros/jazzy/setup.bash
-ros2 launch mavros px4.launch \
-  fcu_url:=/dev/serial/by-id/你的飞控设备:2000000 \
-  gcs_url:=udp://127.0.0.1:14551@
+```text
+/home/pi/px4-test-tools/mavros_xyz_position_offboard/config/udp_ground_station.yaml
 ```
 
-只读核验/摘要模式：
+只读监视示例：
 
 ```bash
 ros2 run mavros_xyz_position_offboard mavros_xyz_position_node \
-  --confirmed-fcu-url /dev/serial/by-id/你的飞控设备:2000000 \
-  --range-topic /mavros/px4flow/ground_distance \
-  --range-source-label MTF02P-ground-distance \
-  --optical-flow-topic /mavros/px4flow/raw/optical_flow_rad \
-  --optical-flow-source-label MTF02P-optical-flow
+  --confirmed-fcu-url udp://127.0.0.1:14540 \
+  --range-topic /mavros/px4flow/ground_distance --range-source-label downward \
+  --optical-flow-topic /mavros/px4flow/raw/optical_flow_rad --optical-flow-source-label flow \
+  --ros-args --params-file \
+  /home/pi/px4-test-tools/install/mavros_xyz_position_offboard/share/mavros_xyz_position_offboard/config/udp_ground_station.yaml
 ```
 
-仓库中的 `command.txt` 保存了一条带完整确认项的有界测试命令。执行前必须重新检查
-飞控连接、传感器方向、螺旋桨/区域安全、PX4 XY 融合证据和独立急停，不应直接照抄设备路径。
+执行顺序应为：无桨台架与单独 PWM 标定、PX4 SITL、受控实机飞行。每一阶段都应记录 UDP 数据报及
+`/lcp/debug`、MAVROS 时间戳，并重新核验飞控连接、传感器方向、螺旋桨/区域安全、PX4 XY 融合证据
+和独立急停。
 
-## 日志与产物
+## 日志与目录
 
-节点默认在当前目录 `artifacts/` 创建 `mavros-xyz-flight-<UTC>-<pid>.log`，终端输出
-为人类可读摘要。指定 `--output jsonl` 后生成同名 `.jsonl` 文件，每行包含：
-
-- 当前阶段、结果、错误和安全中止原因；
-- 实测 XYZ、XYZ 速度、目标位置、目标高度和垂直速度；
-- 飞控模式/解锁、电池、测距、光流、估计器和 LCP 遥测；
-- LCP、SetMode、ARM 服务事件和所有审计配置。
-
-`--artifact-dir` 可以指定日志目录。`artifacts/`、`build/`、`install/` 和 `log/` 已在
-`.gitignore` 中排除，避免把运行产物提交进仓库。
-
-## 目录结构
+节点默认在 `artifacts/` 创建 `mavros-xyz-flight-<UTC>-<pid>.log`。指定 `--output jsonl`
+后生成同名 `.jsonl`，记录任务阶段、拒绝原因、飞控状态、遥测、LCP、服务请求和审计配置。
 
 ```text
 px4-test-tools/
-├── mavros_xyz_position_offboard/       ROS 2 C++17 节点、库、测试和包级 README
-│   ├── src/common/                     CLI、类型、日志
-│   ├── src/initialization/             遥测订阅、预检、RangeGuard、LCP 门禁
-│   ├── src/navigation/                五次 XYZ 轨迹和方形航点
-│   ├── src/bridge/                    LCP NWU→ENU 外部视觉桥
-│   ├── src/offboard/                  OFFBOARD/ARM/降落状态机
-│   └── test/                           C++ 单元测试
-├── lcp_yaw_vision_bridge.py            独立 Python LCP→MAVROS 外部视觉桥
+├── mavros_xyz_position_offboard/       ROS 2 C++17 UAV 节点、库、测试和包级 README
+│   ├── src/communication/              UDP V0.7 协议、ACK 队列与 xyzstatus 编码
+│   ├── src/navigation/                 五次轨迹和任务状态机
+│   ├── src/gripper/                    非阻塞 Linux PWM sysfs 夹爪适配器
+│   ├── src/initialization/             遥测订阅、预检、RangeGuard 与 LCP 门禁
+│   ├── src/bridge/                     LCP NWU 到 ENU 外部视觉桥
+│   └── test/                           C++ 单元与 UDP 回环测试
+├── lcp_yaw_vision_bridge.py            独立 Python LCP 到 MAVROS 外部视觉桥
 ├── read_px4_params.py                  PX4 参数读取辅助工具
-├── docs/                               操作记录、融合核验和迁移说明
 ├── command.txt                         经过审计的命令模板
-└── artifacts/                          本地运行时生成，已忽略
+└── artifacts/                          本地运行产物，已忽略
 ```
 
-独立 Python 桥接脚本与 C++ 节点的内置桥接不能同时运行，否则会向同一外部视觉话题
-重复发布。
+独立 Python 桥接脚本和 C++ 节点内置桥接不能同时运行，否则会向同一外部视觉话题重复发布。

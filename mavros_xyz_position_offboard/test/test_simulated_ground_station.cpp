@@ -183,8 +183,7 @@ TEST(SimulatedGroundStationTest, CompletesPayloadlessMissionOverLoopbackUdp)
 
   PwmGripperConfig gripper_config;
   gripper_config.enabled = false;
-  gripper_config.release_delay_ms = 10;
-  gripper_config.release_hold_ms = 10;
+  gripper_config.open_hold_ms = 10;
   PwmGripper gripper(gripper_config);
   EXPECT_FALSE(gripper.enabled());
 

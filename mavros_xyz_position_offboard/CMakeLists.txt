@@ -18,6 +18,8 @@ find_package(mavros_msgs REQUIRED)
 find_package(lslidar_msgs REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(JSONCPP REQUIRED IMPORTED_TARGET jsoncpp)
+find_path(LGPIO_INCLUDE_DIR NAMES lgpio.h REQUIRED)
+find_library(LGPIO_LIBRARY NAMES lgpio REQUIRED)
 
 add_library(${PROJECT_NAME}_core
   src/common/artifact_log.cpp
@@ -30,12 +32,15 @@ add_library(${PROJECT_NAME}_core
   src/initialization/initialization.cpp
   src/navigation/navigation.cpp
   src/offboard/offboard.cpp)
-target_include_directories(${PROJECT_NAME}_core PUBLIC
+target_include_directories(${PROJECT_NAME}_core
+  PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>)
+  $<INSTALL_INTERFACE:include>
+  PRIVATE
+  ${LGPIO_INCLUDE_DIR})
 ament_target_dependencies(${PROJECT_NAME}_core
   rclcpp geometry_msgs nav_msgs sensor_msgs std_msgs std_srvs mavros_msgs lslidar_msgs)
-target_link_libraries(${PROJECT_NAME}_core PkgConfig::JSONCPP)
+target_link_libraries(${PROJECT_NAME}_core PkgConfig::JSONCPP ${LGPIO_LIBRARY})
 target_compile_options(${PROJECT_NAME}_core PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(mavros_xyz_position_node src/main.cpp)
@@ -55,6 +60,7 @@ install(DIRECTORY launch DESTINATION share/${PROJECT_NAME}
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
   ament_add_gtest(test_lcp_navigation test/test_lcp_navigation.cpp SKIP_LINKING_MAIN_LIBRARIES)
   if(TARGET test_lcp_navigation)
     target_link_libraries(test_lcp_navigation ${PROJECT_NAME}_core)
@@ -68,6 +74,10 @@ if(BUILD_TESTING)
     target_link_libraries(test_simulated_ground_station ${PROJECT_NAME}_core)
     target_compile_options(test_simulated_ground_station PRIVATE -Wall -Wextra -Wpedantic)
   endif()
+
+  add_test(
+    NAME test_simulated_ground_station_udp_py
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_simulated_ground_station_udp.py)
 endif()
 
 ament_package()

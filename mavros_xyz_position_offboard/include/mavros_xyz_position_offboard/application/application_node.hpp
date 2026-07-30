@@ -52,7 +52,7 @@ private:
   navigation::MissionConfig load_mission_config();
   /// 读取 Z 源选择及 local/range 一致性校验参数。
   ZConfig load_z_config();
-  /// 读取树莓派 PWM sysfs 夹爪配置；默认禁用所有物理输出。
+  /// 读取树莓派 5 RP1/SG90 PWM 夹爪配置。
   gripper::PwmGripperConfig load_gripper_config();
   /// 将每个新鲜 LcpDebug 样本直接编码并上送为 xyzstatus。
   void lcp_debug_callback(const lslidar_msgs::msg::LcpDebug::SharedPtr message);

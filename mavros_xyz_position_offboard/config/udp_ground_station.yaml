@@ -69,9 +69,9 @@ mavros_native_xyz_position:
       min_optical_flow_quality: 20
 
       # 起飞前允许飞行所需的最低电池电压，单位：伏特。
-      min_battery_voltage_v: 14.8
+      min_battery_voltage_v: 14.0
       # 起飞前允许飞行所需的最低电池剩余电量比例，范围为 0 到 1。
-      min_battery_fraction: 0.15
+      min_battery_fraction: 0
 
       # 预检阶段允许的最大水平速度，单位：米/秒。
       max_preflight_horizontal_speed_m_s: 0.20
@@ -138,23 +138,15 @@ mavros_native_xyz_position:
       range_cross_check_max_delta_m: 0.30
 
     gripper_pwm:
-      # 是否启用物理 PWM 夹爪；false 用于 SITL 并禁止所有物理 GPIO 输出。
-      enabled: false
-      # Linux PWM 芯片 sysfs 路径。
-      chip_path: /sys/class/pwm/pwmchip0
-      # PWM 通道编号。
-      channel: 0
-      # PWM 周期，单位：纳秒。
-      period_ns: 20000000
-      # 夹爪空闲位置的 PWM 高电平宽度，单位：纳秒。
-      idle_duty_ns: 1500000
-      # 夹爪释放位置的 PWM 高电平宽度，单位：纳秒。
-      release_duty_ns: 2000000
-      # 收到释放命令后开始输出释放占空比前的延时，单位：毫秒。
-      release_delay_ms: 500
-      # 保持释放占空比的时长，单位：毫秒。
-      release_hold_ms: 500
-      # 启用物理 PWM 前必须填写且可读取的板级引脚复用状态文件路径。
-      pinmux_path: ""
-      # 启用物理 PWM 前 pinmux_path 文件中必须出现的预期文本。
-      pinmux_expected: ""
+      # 启用 Raspberry Pi 5 RP1 上的 SG90 物理夹爪；SITL 应覆盖为 false。
+      enabled: true
+      # SG90 信号线：BCM GPIO18，物理针脚 12。
+      bcm_gpio: 18
+      # SG90 PWM 频率，单位：Hz。
+      pwm_frequency_hz: 50.0
+      # 已验证的 SG90 关闭位置占空比，单位：百分比。
+      closed_duty_cycle: 4.0
+      # 已验证的 SG90 打开位置占空比，单位：百分比。
+      open_duty_cycle: 7.0
+      # 输出打开信号后的保持时长，单位：毫秒；之后恢复关闭信号。
+      open_hold_ms: 500

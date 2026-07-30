@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -931,72 +932,146 @@ TEST(NavigationV3Test, ControlJsonMatchesPublishedEnuPositionTarget)
   EXPECT_DOUBLE_EQ(root["commanded_setpoint"]["yaw_rad"].asDouble(), target.yaw);
 }
 
-class PwmGripperTest : public ::testing::Test
+struct PwmCommand
 {
-protected:
-  void SetUp() override
-  {
-    char pattern[] = "/tmp/mavros-pwm-test-XXXXXX";
-    root_ = ::mkdtemp(pattern);
-    ASSERT_FALSE(root_.empty());
-    std::filesystem::create_directories(root_ + "/pwmchip0/pwm0");
-    std::ofstream(root_ + "/pwmchip0/export") << "0";
-    std::ofstream(root_ + "/pinmux") << "gpio18 pwm0";
-    for (const std::string name : {"enable", "period", "duty_cycle"}) {
-      std::ofstream(root_ + "/pwmchip0/pwm0/" + name) << "0";
-    }
-  }
-  void TearDown() override {std::filesystem::remove_all(root_);}
-  PwmGripperConfig config() const
-  {
-    PwmGripperConfig value;
-    value.enabled = true;
-    value.chip_path = root_ + "/pwmchip0";
-    value.channel = 0;
-    value.period_ns = 20000000;
-    value.idle_duty_ns = 1500000;
-    value.release_duty_ns = 2000000;
-    value.release_delay_ms = 500;
-    value.release_hold_ms = 200;
-    value.pinmux_path = root_ + "/pinmux";
-    value.pinmux_expected = "pwm0";
-    return value;
-  }
-  std::string read(const std::string & path) const
-  {
-    std::ifstream stream(path);
-    std::string value;
-    stream >> value;
-    return value;
-  }
-  std::string root_;
+  int handle;
+  int bcm_gpio;
+  double frequency_hz;
+  double duty_cycle;
 };
 
-TEST_F(PwmGripperTest, WritesSysfsInReleaseOrderAndRestoresIdle)
+class FakePwmGpioBackend final : public mavros_xyz_position_offboard::gripper::PwmGpioBackend
 {
-  PwmGripper gripper(config());
-  ASSERT_TRUE(gripper.begin_release(0.0));
-  EXPECT_EQ(read(root_ + "/pwmchip0/pwm0/period"), "20000000");
-  EXPECT_EQ(read(root_ + "/pwmchip0/pwm0/duty_cycle"), "1500000");
-  EXPECT_EQ(gripper.update(0.49), ReleaseState::waiting_delay);
-  EXPECT_EQ(gripper.update(0.50), ReleaseState::holding_release);
-  EXPECT_EQ(read(root_ + "/pwmchip0/pwm0/duty_cycle"), "2000000");
-  EXPECT_EQ(gripper.update(0.71), ReleaseState::succeeded);
-  EXPECT_EQ(read(root_ + "/pwmchip0/pwm0/duty_cycle"), "1500000");
+public:
+  std::optional<int> discovered_gpiochip{4};
+  int opened_handle{42};
+  int claim_status{0};
+  std::vector<int> pwm_statuses{};
+  std::vector<int> opened_gpiochips{};
+  std::vector<PwmCommand> pwm_commands{};
+  int close_count{0};
+  int free_count{0};
+
+  std::optional<int> find_rp1_gpiochip() override {return discovered_gpiochip;}
+  int gpiochip_open(int gpiochip) override
+  {
+    opened_gpiochips.push_back(gpiochip);
+    return opened_handle;
+  }
+  int gpiochip_close(int) override {++close_count; return 0;}
+  int gpio_claim_output(int, int, int) override {return claim_status;}
+  int gpio_free(int, int) override {++free_count; return 0;}
+  int tx_pwm(int handle, int bcm_gpio, double frequency_hz, double duty_cycle) override
+  {
+    pwm_commands.push_back({handle, bcm_gpio, frequency_hz, duty_cycle});
+    if (pwm_statuses.empty()) {return 0;}
+    const int status = pwm_statuses.front();
+    pwm_statuses.erase(pwm_statuses.begin());
+    return status;
+  }
+  std::string error_text(int status) const override {return "fake error " + std::to_string(status);}
+};
+
+PwmGripperConfig sg90_config()
+{
+  PwmGripperConfig value;
+  value.enabled = true;
+  value.bcm_gpio = 18;
+  value.pwm_frequency_hz = 50.0;
+  value.closed_duty_cycle = 4.0;
+  value.open_duty_cycle = 7.0;
+  value.open_hold_ms = 500;
+  return value;
 }
 
-TEST_F(PwmGripperTest, PinmuxFailureDoesNotReportSuccessAndCanRetry)
+TEST(PwmGripperTest, InitializesClosedThenOpensForConfiguredHoldAndCloses)
 {
-  auto value = config();
-  value.pinmux_expected = "missing";
-  PwmGripper gripper(value);
+  const auto backend = std::make_shared<FakePwmGpioBackend>();
+  PwmGripper gripper(sg90_config(), backend);
+
+  ASSERT_TRUE(gripper.initialize());
+  ASSERT_EQ(backend->opened_gpiochips, std::vector<int>({4}));
+  ASSERT_EQ(backend->pwm_commands.size(), 1U);
+  EXPECT_EQ(backend->pwm_commands.front().handle, 42);
+  EXPECT_EQ(backend->pwm_commands.front().bcm_gpio, 18);
+  EXPECT_DOUBLE_EQ(backend->pwm_commands.front().frequency_hz, 50.0);
+  EXPECT_DOUBLE_EQ(backend->pwm_commands.front().duty_cycle, 4.0);
+
+  ASSERT_TRUE(gripper.begin_release(10.0));
+  ASSERT_EQ(backend->pwm_commands.size(), 2U);
+  EXPECT_DOUBLE_EQ(backend->pwm_commands.back().duty_cycle, 7.0);
+  EXPECT_EQ(gripper.update(10.49), ReleaseState::holding_release);
+  EXPECT_EQ(gripper.update(10.50), ReleaseState::succeeded);
+  ASSERT_EQ(backend->pwm_commands.size(), 3U);
+  EXPECT_DOUBLE_EQ(backend->pwm_commands.back().duty_cycle, 4.0);
+}
+
+TEST(PwmGripperTest, DisabledModeNeverTouchesGpio)
+{
+  auto config = sg90_config();
+  config.enabled = false;
+  const auto backend = std::make_shared<FakePwmGpioBackend>();
+  PwmGripper gripper(config, backend);
+
+  ASSERT_TRUE(gripper.initialize());
+  ASSERT_TRUE(gripper.begin_release(0.0));
+  EXPECT_EQ(gripper.update(0.49), ReleaseState::holding_release);
+  EXPECT_EQ(gripper.update(0.50), ReleaseState::succeeded);
+  EXPECT_TRUE(backend->opened_gpiochips.empty());
+  EXPECT_TRUE(backend->pwm_commands.empty());
+}
+
+TEST(PwmGripperTest, InvalidConfigAndDiscoveryFailureAreRejected)
+{
+  auto invalid = sg90_config();
+  invalid.open_duty_cycle = 100.0;
+  EXPECT_THROW(invalid.validate(), std::invalid_argument);
+
+  const auto backend = std::make_shared<FakePwmGpioBackend>();
+  backend->discovered_gpiochip.reset();
+  PwmGripper gripper(sg90_config(), backend);
+  EXPECT_FALSE(gripper.initialize());
+  EXPECT_EQ(gripper.state(), ReleaseState::failed);
+  ASSERT_TRUE(gripper.fault());
+  EXPECT_NE(gripper.fault()->find("RP1"), std::string::npos);
+
+  backend->discovered_gpiochip = 4;
+  EXPECT_TRUE(gripper.begin_release(1.0));
+  EXPECT_EQ(gripper.state(), ReleaseState::holding_release);
+}
+
+TEST(PwmGripperTest, GpioClaimFailureReleasesHandleAndCanRetry)
+{
+  const auto backend = std::make_shared<FakePwmGpioBackend>();
+  backend->claim_status = -6;
+  PwmGripper gripper(sg90_config(), backend);
+
+  EXPECT_FALSE(gripper.initialize());
+  EXPECT_EQ(gripper.state(), ReleaseState::failed);
+  EXPECT_TRUE(backend->pwm_commands.empty());
+  EXPECT_EQ(backend->free_count, 0);
+  EXPECT_EQ(backend->close_count, 1);
+
+  backend->claim_status = 0;
+  EXPECT_TRUE(gripper.begin_release(1.0));
+  EXPECT_EQ(gripper.state(), ReleaseState::holding_release);
+}
+
+TEST(PwmGripperTest, OpenPwmFailureReleasesHardwareAndCanRetry)
+{
+  const auto backend = std::make_shared<FakePwmGpioBackend>();
+  PwmGripper gripper(sg90_config(), backend);
+  ASSERT_TRUE(gripper.initialize());
+
+  backend->pwm_statuses = {-7};
   EXPECT_FALSE(gripper.begin_release(0.0));
   EXPECT_EQ(gripper.state(), ReleaseState::failed);
   ASSERT_TRUE(gripper.fault());
-  std::ofstream(root_ + "/pinmux") << "missing";
+  EXPECT_EQ(backend->free_count, 1);
+  EXPECT_EQ(backend->close_count, 1);
+
   EXPECT_TRUE(gripper.begin_release(1.0));
-  EXPECT_EQ(gripper.update(1.5), ReleaseState::holding_release);
-  EXPECT_EQ(gripper.update(1.71), ReleaseState::succeeded);
+  EXPECT_EQ(gripper.update(1.50), ReleaseState::succeeded);
 }
 
 TEST(UdpIntegrationTest, LoopbackDatagramsDeliverEventThenAck)
@@ -1195,10 +1270,16 @@ TEST(ApplicationNodeSafetyParameterTest, YamlParametersOverrideCliDefaultsAtStar
     "--ros-args", "--params-file",
     std::string(MAVROS_XYZ_SOURCE_DIR) + "/config/udp_ground_station.yaml"});
   options.append_parameter_override("udp.enabled", false);
+  options.append_parameter_override("gripper_pwm.enabled", false);
   const auto node = std::make_shared<ApplicationNode>(application_test_options(), cli_config, options);
 
-  EXPECT_DOUBLE_EQ(node->safety_config().max_flight_seconds, 60.0);
+  EXPECT_DOUBLE_EQ(node->safety_config().max_flight_seconds, 120.0);
   EXPECT_DOUBLE_EQ(node->safety_config().target_xy_max_speed_m_s, 0.25);
+  EXPECT_EQ(node->get_parameter("gripper_pwm.bcm_gpio").as_int(), 18);
+  EXPECT_DOUBLE_EQ(node->get_parameter("gripper_pwm.pwm_frequency_hz").as_double(), 50.0);
+  EXPECT_DOUBLE_EQ(node->get_parameter("gripper_pwm.closed_duty_cycle").as_double(), 4.0);
+  EXPECT_DOUBLE_EQ(node->get_parameter("gripper_pwm.open_duty_cycle").as_double(), 7.0);
+  EXPECT_EQ(node->get_parameter("gripper_pwm.open_hold_ms").as_int(), 500);
 }
 
 TEST(ApplicationNodeSafetyParameterTest, InvalidStartupOverrideIsRejected)

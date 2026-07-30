@@ -1,161 +1,192 @@
 #include "mavros_xyz_position_offboard/gripper/pwm_gripper.hpp"
 
+#include <lgpio.h>
+
 #include <cmath>
 #include <filesystem>
 #include <fstream>
-#include <sstream>
 #include <stdexcept>
 #include <system_error>
+#include <utility>
 
 namespace mavros_xyz_position_offboard::gripper
 {
 namespace
 {
-/// 将无符号整数转换为供 sysfs 写入的十进制文本。
-std::string as_text(std::uint64_t value) {return std::to_string(value);}
 
-/// 判断指定的可读文件是否包含预期文本。
-bool readable_contains(const std::string & path, const std::string & expected)
+class LgpioPwmBackend final : public PwmGpioBackend
 {
-  std::ifstream stream(path);
-  if (!stream) {return false;}
-  std::ostringstream contents;
-  contents << stream.rdbuf();
-  return contents.str().find(expected) != std::string::npos;
-}
-}  // 匿名命名空间
+public:
+  std::optional<int> find_rp1_gpiochip() override
+  {
+    namespace fs = std::filesystem;
+    std::error_code error;
+    const fs::path gpio_root{"/sys/class/gpio"};
+    for (fs::directory_iterator gpio_it(gpio_root, error), end; !error && gpio_it != end;
+      gpio_it.increment(error)) {
+      const fs::path gpio_path = gpio_it->path();
+      const std::string name = gpio_path.filename().string();
+      if (name.rfind("gpiochip", 0) != 0) {continue;}
 
-/// 校验 PWM 配置的路径、占空比关系、时序和引脚复用要求。
+      std::ifstream label(gpio_path / "label");
+      std::string label_value;
+      std::getline(label, label_value);
+      if (!label || label_value != "pinctrl-rp1") {continue;}
+
+      const fs::path controller = fs::canonical(gpio_path / "device", error);
+      if (error) {error.clear(); continue;}
+      const fs::path char_root{"/sys/dev/char"};
+      for (fs::directory_iterator char_it(char_root, error), char_end; !error && char_it != char_end;
+        char_it.increment(error)) {
+        const std::string device_name = char_it->path().filename().string();
+        const auto separator = device_name.find(':');
+        if (separator == std::string::npos || device_name.substr(0, separator) != "254") {continue;}
+        const fs::path character_device = fs::canonical(char_it->path(), error);
+        if (error) {error.clear(); continue;}
+        if (character_device.parent_path() != controller) {continue;}
+        try {
+          return std::stoi(device_name.substr(separator + 1));
+        } catch (const std::exception &) {
+          return std::nullopt;
+        }
+      }
+      if (error) {return std::nullopt;}
+    }
+    return std::nullopt;
+  }
+
+  int gpiochip_open(int gpiochip) override {return lgGpiochipOpen(gpiochip);}
+  int gpiochip_close(int handle) override {return lgGpiochipClose(handle);}
+  int gpio_claim_output(int handle, int bcm_gpio, int level) override
+  {
+    return lgGpioClaimOutput(handle, 0, bcm_gpio, level);
+  }
+  int gpio_free(int handle, int bcm_gpio) override {return lgGpioFree(handle, bcm_gpio);}
+  int tx_pwm(int handle, int bcm_gpio, double frequency_hz, double duty_cycle) override
+  {
+    return lgTxPwm(handle, bcm_gpio, static_cast<float>(frequency_hz), static_cast<float>(duty_cycle), 0, 0);
+  }
+  std::string error_text(int status) const override {return lguErrorText(status);}
+};
+
+std::string error_message(const PwmGpioBackend & backend, const char * action, int status)
+{
+  return std::string(action) + " failed: " + backend.error_text(status) + " (" + std::to_string(status) + ")";
+}
+
+}  // namespace
+
+std::shared_ptr<PwmGpioBackend> make_lgpio_pwm_backend()
+{
+  return std::make_shared<LgpioPwmBackend>();
+}
+
 void PwmGripperConfig::validate() const
 {
-  if (channel < 0 || chip_path.empty()) {throw std::invalid_argument("PWM chip path and non-negative channel are required");}
-  if (period_ns == 0 || idle_duty_ns == 0 || release_duty_ns == 0 || idle_duty_ns >= period_ns ||
-    release_duty_ns >= period_ns) {
-    throw std::invalid_argument("PWM period must exceed positive idle and release duties");
+  if (bcm_gpio < 0) {throw std::invalid_argument("BCM GPIO must be non-negative");}
+  if (!std::isfinite(pwm_frequency_hz) || pwm_frequency_hz < 0.1 || pwm_frequency_hz > 10000.0) {
+    throw std::invalid_argument("PWM frequency must be within 0.1..10000 Hz");
   }
-  if (release_delay_ms < 0 || release_hold_ms < 0) {
-    throw std::invalid_argument("PWM release delay and hold must be non-negative");
+  if (!std::isfinite(closed_duty_cycle) || !std::isfinite(open_duty_cycle) ||
+    closed_duty_cycle <= 0.0 || closed_duty_cycle >= 100.0 ||
+    open_duty_cycle <= 0.0 || open_duty_cycle >= 100.0) {
+    throw std::invalid_argument("PWM duty cycles must be within 0..100 percent");
   }
-  if (enabled && (pinmux_path.empty() || pinmux_expected.empty())) {
-    throw std::invalid_argument("enabled PWM requires pinmux_path and pinmux_expected validation");
-  }
+  if (open_hold_ms < 0) {throw std::invalid_argument("open PWM hold time must be non-negative");}
 }
 
-/// 保存经过校验的 PWM 配置，延迟到释放时才访问硬件。
-PwmGripper::PwmGripper(PwmGripperConfig config) : config_(std::move(config))
+PwmGripper::PwmGripper(PwmGripperConfig config, std::shared_ptr<PwmGpioBackend> backend)
+: config_(std::move(config)), backend_(std::move(backend))
 {
   config_.validate();
+  if (!backend_) {throw std::invalid_argument("PWM GPIO backend is required");}
 }
 
-/// 拼接 sysfs 中当前 PWM 通道的目录路径。
-std::string PwmGripper::channel_path() const
+PwmGripper::~PwmGripper() {cleanup();}
+
+void PwmGripper::cleanup() noexcept
 {
-  return config_.chip_path + "/pwm" + std::to_string(config_.channel);
+  if (config_.enabled && handle_ >= 0) {
+    if (gpio_claimed_) {
+      backend_->tx_pwm(handle_, config_.bcm_gpio, 0.0, 0.0);
+      backend_->gpio_free(handle_, config_.bcm_gpio);
+    }
+    backend_->gpiochip_close(handle_);
+  }
+  handle_ = -1;
+  gpio_claimed_ = false;
+  prepared_ = false;
 }
 
-/// 将属性值写入 sysfs 文件，并确认写入流未发生错误。
-bool PwmGripper::write_value(const std::string & path, const std::string & value) const
-{
-  std::ofstream stream(path);
-  if (!stream) {return false;}
-  stream << value;
-  stream.flush();
-  return static_cast<bool>(stream);
-}
-
-/// 验证配置的引脚复用状态是否满足 PWM 输出条件。
-bool PwmGripper::verify_pinmux() const
-{
-  return readable_contains(config_.pinmux_path, config_.pinmux_expected);
-}
-
-/// 在需要时导出 PWM 通道，并确认其目录已经出现。
-bool PwmGripper::ensure_channel()
-{
-  namespace fs = std::filesystem;
-  const auto pwm_path = channel_path();
-  std::error_code error;
-  if (fs::exists(pwm_path, error)) {return true;}
-  if (error) {return false;}
-  if (!write_value(config_.chip_path + "/export", std::to_string(config_.channel))) {return false;}
-  return fs::exists(pwm_path, error) && !error;
-}
-
-/// 将指定的纳秒占空比写入 PWM 通道。
-bool PwmGripper::set_duty(std::uint64_t duty_ns)
-{
-  return write_value(channel_path() + "/duty_cycle", as_text(duty_ns));
-}
-
-/// 锁存失败原因，清除阶段计时并结束当前释放操作。
 void PwmGripper::fail(const std::string & reason)
 {
+  cleanup();
   fault_ = reason;
   phase_started_at_.reset();
   state_ = ReleaseState::failed;
 }
 
-/// 初始化 PWM 硬件并设置空闲占空比；禁用时仅标记为已准备。
-bool PwmGripper::prepare()
+bool PwmGripper::set_duty(double duty_cycle)
 {
-  if (!config_.enabled) {prepared_ = true; return true;}
-  namespace fs = std::filesystem;
-  if (!verify_pinmux()) {fail("PWM pinmux validation failed"); return false;}
-  std::error_code error;
-  if (!fs::is_directory(config_.chip_path, error) || error) {
-    fail("PWM chip path is not a readable directory");
+  const int status = backend_->tx_pwm(handle_, config_.bcm_gpio, config_.pwm_frequency_hz, duty_cycle);
+  if (status < 0) {
+    fail(error_message(*backend_, "setting SG90 PWM", status));
     return false;
   }
-  if (!ensure_channel()) {fail("PWM channel export or access failed"); return false;}
-  const auto path = channel_path();
-  if (!write_value(path + "/enable", "0") || !write_value(path + "/period", as_text(config_.period_ns)) ||
-    !set_duty(config_.idle_duty_ns) || !write_value(path + "/enable", "1")) {
-    fail("PWM sysfs period, duty, enable, or permission check failed");
-    return false;
-  }
-  prepared_ = true;
   return true;
 }
 
-/// 启动释放状态机，并将重复成功调用视为幂等操作。
+bool PwmGripper::initialize()
+{
+  if (prepared_) {return true;}
+  fault_.reset();
+  if (!config_.enabled) {
+    prepared_ = true;
+    return true;
+  }
+
+  const auto gpiochip = backend_->find_rp1_gpiochip();
+  if (!gpiochip) {
+    fail("finding Raspberry Pi RP1 GPIO controller failed");
+    return false;
+  }
+  handle_ = backend_->gpiochip_open(*gpiochip);
+  if (handle_ < 0) {
+    fail(error_message(*backend_, "opening RP1 gpiochip", handle_));
+    return false;
+  }
+  const int claim_status = backend_->gpio_claim_output(handle_, config_.bcm_gpio, 0);
+  if (claim_status < 0) {
+    fail(error_message(*backend_, "claiming SG90 BCM GPIO", claim_status));
+    return false;
+  }
+  gpio_claimed_ = true;
+  if (!set_duty(config_.closed_duty_cycle)) {return false;}
+  prepared_ = true;
+  state_ = ReleaseState::idle;
+  return true;
+}
+
 bool PwmGripper::begin_release(double now)
 {
   if (!std::isfinite(now)) {throw std::invalid_argument("PWM action time must be finite");}
-  if (state_ == ReleaseState::waiting_delay || state_ == ReleaseState::holding_release) {return true;}
-  if (state_ == ReleaseState::succeeded) {return true;}
-  fault_.reset();
-  if (!prepared_ && !prepare()) {return false;}
+  if (state_ == ReleaseState::holding_release || state_ == ReleaseState::succeeded) {return true;}
+  if (!prepared_ && !initialize()) {return false;}
+  if (config_.enabled && !set_duty(config_.open_duty_cycle)) {return false;}
   phase_started_at_ = now;
-  state_ = ReleaseState::waiting_delay;
+  state_ = ReleaseState::holding_release;
   return true;
 }
 
-/// 按配置时序切换释放/空闲占空比并返回当前状态。
 ReleaseState PwmGripper::update(double now)
 {
   if (!std::isfinite(now)) {throw std::invalid_argument("PWM update time must be finite");}
-  if ((state_ != ReleaseState::waiting_delay && state_ != ReleaseState::holding_release) || !phase_started_at_) {
-    return state_;
-  }
-  if (state_ == ReleaseState::waiting_delay &&
-    now - *phase_started_at_ >= static_cast<double>(config_.release_delay_ms) / 1000.0) {
-    if (config_.enabled && !set_duty(config_.release_duty_ns)) {
-      fail("PWM release duty write failed");
-      return state_;
-    }
-    phase_started_at_ = now;
-    state_ = ReleaseState::holding_release;
-  }
-  if (state_ == ReleaseState::holding_release &&
-    now - *phase_started_at_ >= static_cast<double>(config_.release_hold_ms) / 1000.0) {
-    if (config_.enabled && !set_duty(config_.idle_duty_ns)) {
-      fail("PWM idle duty restore failed");
-      return state_;
-    }
-    phase_started_at_.reset();
-    state_ = ReleaseState::succeeded;
-  }
+  if (state_ != ReleaseState::holding_release || !phase_started_at_) {return state_;}
+  if (now - *phase_started_at_ < static_cast<double>(config_.open_hold_ms) / 1000.0) {return state_;}
+  if (config_.enabled && !set_duty(config_.closed_duty_cycle)) {return state_;}
+  phase_started_at_.reset();
+  state_ = ReleaseState::succeeded;
   return state_;
 }
 
-}  // mavros_xyz_position_offboard::gripper 命名空间
+}  // mavros_xyz_position_offboard::gripper namespace

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the bounded no-gripper UDP scenario against a live UAV application."""
+"""Run the bounded UDP scenario against a live UAV application."""
 
 import argparse
 import json
@@ -19,6 +19,8 @@ OK_HEADERS = {
 }
 
 GO_AHEAD_WAIT_S = 10.0
+GO_AHEAD_RETRY_S = 0.5
+PURSUIT_CONFIRM_DISTANCE_M = 0.10
 
 
 class Scenario:
@@ -38,6 +40,8 @@ class Scenario:
         self.car_forward_m = car_forward_m
         self.alignment_start = None
         self.car_position = None
+        self.go_ahead_reference = None
+        self.go_ahead_last_sent_at = None
 
     @staticmethod
     def payload(header, data=None):
@@ -133,6 +137,26 @@ class Scenario:
         car_x, car_y = self.car_position
         return math.hypot(current_x - car_x, current_y - car_y) < 0.10
 
+    def pursuit_started(self):
+        if not self.go_ahead_reference or not self.latest_xyzstatus:
+            return False
+        start_x, start_y, start_yaw = self.go_ahead_reference
+        current_x, current_y, _ = self.latest_xyzstatus
+        dx = current_x - start_x
+        dy = current_y - start_y
+        forward_m = dx * math.cos(start_yaw) + dy * math.sin(start_yaw)
+        return forward_m >= PURSUIT_CONFIRM_DISTANCE_M
+
+    def begin_go_ahead_handshake(self, now):
+        if not self.latest_xyzstatus:
+            return False
+        self.set_simulated_car_position()
+        self.go_ahead_reference = self.latest_xyzstatus
+        self.go_ahead_last_sent_at = now
+        self.send("go_ahead_ok")
+        self.begin_phase("waiting_pursuit_start")
+        return True
+
     def advance(self):
         now = time.monotonic()
         if now >= self.deadline:
@@ -145,14 +169,15 @@ class Scenario:
             self.alignment_start = self.latest_xyzstatus
             self.begin_phase("waiting_alignment_check")
         elif self.phase == "waiting_alignment_check" and self.alignment_verified():
-            self.set_simulated_car_position()
-            self.send("go_ahead_ok")
-            self.begin_phase("pursuing_car")
+            self.begin_go_ahead_handshake(now)
         elif self.phase == "waiting_go_ahead" and now >= self.command_due_at:
-            if self.latest_xyzstatus:
-                self.set_simulated_car_position()
-            self.send("go_ahead_ok")
-            self.begin_phase("pursuing_car")
+            self.begin_go_ahead_handshake(now)
+        elif self.phase == "waiting_pursuit_start":
+            if self.pursuit_started():
+                self.begin_phase("pursuing_car")
+            elif now - self.go_ahead_last_sent_at >= GO_AHEAD_RETRY_S:
+                self.send("go_ahead_ok")
+                self.go_ahead_last_sent_at = now
         elif self.phase == "pursuing_car" and self.car_distance_below_match_threshold():
             self.send("match_car_ok")
             self.begin_phase("waiting_ok_throw")
@@ -221,7 +246,7 @@ def main():
     if scenario.received_events != expected:
         print("FAIL unexpected event order: {}".format(scenario.received_events), file=sys.stderr, flush=True)
         return 1
-    print("PASS no-gripper UDP scenario completed", flush=True)
+    print("PASS UDP scenario completed", flush=True)
     return 0
 
 

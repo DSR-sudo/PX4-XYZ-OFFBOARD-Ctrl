@@ -44,6 +44,9 @@ ApplicationNode::ApplicationNode(
   lcp_vision_bridge_(*this, options_), z_config_(load_z_config()), gripper_(load_gripper_config()),
   artifact_log_(options_.artifact_dir, options_.output == "jsonl")
 {
+  if (!gripper_.initialize()) {
+    throw std::runtime_error("SG90 gripper initialization failed: " + gripper_.fault().value_or("unknown error"));
+  }
   const auto lcp_qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable().durability_volatile();
   lcp_debug_subscription_ = create_subscription<lslidar_msgs::msg::LcpDebug>(
     "/lcp/debug", lcp_qos, std::bind(&ApplicationNode::lcp_debug_callback, this, std::placeholders::_1));
@@ -197,18 +200,14 @@ gripper::PwmGripperConfig ApplicationNode::load_gripper_config()
 {
   gripper::PwmGripperConfig value;
   value.enabled = declare_parameter<bool>("gripper_pwm.enabled", value.enabled);
-  value.chip_path = declare_parameter<std::string>("gripper_pwm.chip_path", value.chip_path);
-  value.channel = declare_parameter<int>("gripper_pwm.channel", value.channel);
-  value.period_ns = static_cast<std::uint64_t>(declare_parameter<int64_t>(
-    "gripper_pwm.period_ns", static_cast<int64_t>(value.period_ns)));
-  value.idle_duty_ns = static_cast<std::uint64_t>(declare_parameter<int64_t>(
-    "gripper_pwm.idle_duty_ns", static_cast<int64_t>(value.idle_duty_ns)));
-  value.release_duty_ns = static_cast<std::uint64_t>(declare_parameter<int64_t>(
-    "gripper_pwm.release_duty_ns", static_cast<int64_t>(value.release_duty_ns)));
-  value.release_delay_ms = declare_parameter<int>("gripper_pwm.release_delay_ms", value.release_delay_ms);
-  value.release_hold_ms = declare_parameter<int>("gripper_pwm.release_hold_ms", value.release_hold_ms);
-  value.pinmux_path = declare_parameter<std::string>("gripper_pwm.pinmux_path", value.pinmux_path);
-  value.pinmux_expected = declare_parameter<std::string>("gripper_pwm.pinmux_expected", value.pinmux_expected);
+  value.bcm_gpio = declare_parameter<int>("gripper_pwm.bcm_gpio", value.bcm_gpio);
+  value.pwm_frequency_hz = declare_parameter<double>(
+    "gripper_pwm.pwm_frequency_hz", value.pwm_frequency_hz);
+  value.closed_duty_cycle = declare_parameter<double>(
+    "gripper_pwm.closed_duty_cycle", value.closed_duty_cycle);
+  value.open_duty_cycle = declare_parameter<double>(
+    "gripper_pwm.open_duty_cycle", value.open_duty_cycle);
+  value.open_hold_ms = declare_parameter<int>("gripper_pwm.open_hold_ms", value.open_hold_ms);
   value.validate();
   return value;
 }

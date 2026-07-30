@@ -17,6 +17,8 @@
   <depend>mavros_msgs</depend>
   <depend>lslidar_msgs</depend>
   <depend>jsoncpp</depend>
+  <build_depend>liblgpio-dev</build_depend>
+  <exec_depend>liblgpio1</exec_depend>
 
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>

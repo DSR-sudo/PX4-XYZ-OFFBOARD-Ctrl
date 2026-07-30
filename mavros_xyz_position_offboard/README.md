@@ -28,8 +28,9 @@ Initialization -- health/Z ----------+
   the application must not convert it a second time.
 - `LcpVisionBridge` still publishes converted LCP external-vision pose. The application also
   subscribes to `lslidar_msgs/LcpDebug` on `/lcp/debug` and sends one `xyzstatus` per sample.
-- `PwmGripper` is a non-blocking `/sys/class/pwm/pwmchip*` adapter. Its default disabled mode
-  is a timed no-op for SITL; it does not touch hardware.
+- `PwmGripper` is a non-blocking SG90 adapter built on `lgpio`. When enabled it dynamically finds
+  the Pi 5 RP1 controller, drives BCM GPIO18 at 50 Hz, and holds the verified 4% closed position;
+  disabled mode remains a timed no-op for SITL.
 
 Mission order:
 
@@ -72,9 +73,11 @@ initial-heading right side and waits. The GCS must compare the initial and trans
 coordinates and independently verify that the black line is centered in its video before sending
 `go_ahead_ok`. The UAV then flies its bounded `mission.forward_distance_m` path. The GCS owns car
 recognition and the `<0.1 m` distance decision; it sends `match_car_ok` only after that check.
-The UAV holds the confirmed position for `mission.match_hold_seconds` (default `0.5`) before the
-disabled-by-default gripper release path. Duplicate commands are phase-idempotent and cannot
-re-arm, release twice, or restart return.
+The UAV holds the confirmed position for `mission.match_hold_seconds` (default `0.5`) before it
+immediately drives the verified 7% open position. It holds that signal for
+`gripper_pwm.open_hold_ms` (default `500`) before restoring the 4% closed position and sending
+`ok_throw`. Duplicate commands are phase-idempotent and cannot re-arm, release twice, or restart
+return.
 
 ## LCP and Z
 
@@ -107,7 +110,7 @@ colcon test-result --all --verbose
 ```
 
 The tests cover V2 validation, non-whitelisted inputs, ordered ACK retry state, full LCP
-`xyzstatus` encoding including null Z, state-machine mission order, PWM sysfs fakes, and UDP
+`xyzstatus` encoding including null Z, state-machine mission order, mocked `lgpio` PWM calls, and UDP
 loopback. No automated test drives a real PWM pin.
 
 ## Configuration and PWM Calibration
@@ -155,11 +158,13 @@ confirmed, preflight is no longer used: loss of OFFBOARD or flight health keeps 
 and requests `AUTO.LAND`. Audit records include both `preflight_errors` and `flight_errors` for
 diagnosis.
 
-Do not set `gripper_pwm.enabled:true` until a bench calibration has recorded the correct
-`chip_path`, `channel`, period, idle duty, and release duty. Enabled mode also requires a readable
-`gripper_pwm.pinmux_path` containing `gripper_pwm.pinmux_expected`; failure to export the PWM,
-write period/duty/enable, check permissions, or verify pinmux resumes bounded pursuit and
-withholds `ok_throw`. A later `match_car_ok` retries the release.
+The deployed YAML enables the calibrated SG90 setup: BCM GPIO18 (physical pin 12), 50 Hz, 4%
+closed, 7% open, and a 500 ms open hold. Before flight, verify this on a no-prop bench with the
+signal wire connected to GPIO18 and ensure the launch user can access the RP1 gpiochip through the
+`dialout` group. If RP1 discovery, GPIO claim, or initial 4% PWM setup fails, node startup fails;
+if a later open/close PWM command fails, the release is withheld and a new `match_car_ok` may retry.
+
+Install the C++ GPIO dependency on deployment images with `sudo apt install liblgpio-dev`.
 
 Run in this order: no-prop bench and standalone PWM calibration, PX4 SITL, then controlled flight.
 Capture UDP datagrams and `/lcp/debug`/MAVROS timestamps during acceptance.

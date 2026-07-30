@@ -7,7 +7,7 @@
 | `application/` | Single `ApplicationNode`, fixed 20 Hz loop, LCP Debug subscription, Init-Z latching, component assembly. |
 | `communication/` | Strict V2 value types, non-blocking fixed-remote UDP, source allowlist, ordered event ACK queue, `xyzstatus` encoder. |
 | `navigation/` | ROS-free V2 mission state machine and bounded XY/Z quintic planner. |
-| `gripper/` | Non-blocking Pi Linux PWM sysfs adapter with testable chip-path root. |
+| `gripper/` | Non-blocking SG90 adapter using `lgpio` and dynamic Pi 5 RP1 gpiochip discovery. |
 | `initialization/` | Existing MAVROS telemetry, preflight/flight health, LCP start, RangeGuard, and ROS source timestamps. |
 | `bridge/` | Existing LCP NWU-to-ENU external-vision publisher. |
 | `config/udp_ground_station.yaml` | UDP, mission motion, Z source, and PWM parameters. |
@@ -41,28 +41,30 @@ is copied into one `xyzstatus` datagram immediately. It is independent of event 
 | `z.prefer_range` | `false` | Select Range-relative Z after field calibration. |
 | `z.source_timeout_s` | `0.5` | Freshness limit for pose/Range Z sources. |
 | `z.range_cross_check_max_delta_m` | `0.30` | Maximum local-vs-Range relative-Z disagreement. |
-| `gripper_pwm.enabled` | `false` | Enables physical sysfs output only after calibration. |
-| `gripper_pwm.release_delay_ms` | `500` | Delay before changing to release duty. |
+| `gripper_pwm.enabled` | `true` | Enables the calibrated physical SG90 output; override to `false` for SITL. |
+| `gripper_pwm.bcm_gpio` | `18` | SG90 signal GPIO (physical pin 12). |
+| `gripper_pwm.pwm_frequency_hz` | `50.0` | SG90 PWM frequency. |
+| `gripper_pwm.closed_duty_cycle` | `4.0` | Verified closed position duty cycle, percent. |
+| `gripper_pwm.open_duty_cycle` | `7.0` | Verified open position duty cycle, percent. |
+| `gripper_pwm.open_hold_ms` | `500` | Time to hold the open signal before restoring closed. |
 
-The existing `udp.bind_*`, `remote_*`, and `whitelist_*` parameters are unchanged. The YAML
-also defines PWM `chip_path`, `channel`, `period_ns`, idle/release duty, hold time, and pinmux
-check fields.
+The existing `udp.bind_*`, `remote_*`, and `whitelist_*` parameters are unchanged. The match hold
+is the only pre-open delay: after `mission.match_hold_seconds`, the gripper opens immediately and
+restores closed after `open_hold_ms`.
 
 ## PWM Procedure
 
-1. Keep `gripper_pwm.enabled:false` for all normal software builds and SITL.
-2. With propellers removed, identify the Linux PWM chip/channel and verify pinmux manually.
-3. Measure safe idle and release pulse widths for the actual gripper; set a period larger than
-   both duties.
-4. Set `pinmux_path` to the readable pinctrl inspection file and `pinmux_expected` to the exact
-   expected token. Set a non-production temporary chip root first when testing.
-5. Enable PWM and verify exported channel, `period`, `duty_cycle`, `enable`, release delay,
-   hold, and idle restoration before connecting a payload.
+1. Install `liblgpio-dev`; run SITL with `gripper_pwm.enabled:false`.
+2. With propellers removed, start the enabled node and verify that RP1 discovery claims BCM GPIO18
+   and immediately outputs 50 Hz / 4%.
+3. Confirm the SG90 opens at 7% and restores 4% after 500 ms. Keep the launch user in `dialout`
+   so it can access the RP1 gpiochip.
 
-When enabled, preparation performs pinmux text validation, chip/channel existence or export,
-sysfs permission/open checks, period write, idle duty write, and enable. Any failure reports
-`failed`, does not send `ok_throw`, and resumes bounded pursuit for a fresh
-`match_car_ok` retry. No automatic test uses `/sys/class/pwm`.
+When enabled, node startup finds the RP1 gpiochip from its sysfs label, opens it with `lgpio`,
+claims BCM GPIO18, and starts the 4% closed PWM. Startup failures stop the node before a mission
+can begin. A later PWM failure reports `failed`, does not send `ok_throw`, and resumes bounded
+pursuit for a fresh `match_car_ok` retry. Automated tests use an injected GPIO fake rather than a
+real GPIO line.
 
 ## Build and Acceptance
 

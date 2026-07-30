@@ -7,8 +7,25 @@
 #include <sstream>
 #include <stdexcept>
 
+#include <rcl_interfaces/msg/parameter_descriptor.hpp>
+
 namespace mavros_xyz_position_offboard::application
 {
+namespace
+{
+
+const rcl_interfaces::msg::ParameterDescriptor & safety_parameter_descriptor()
+{
+  static const rcl_interfaces::msg::ParameterDescriptor descriptor = [] {
+      rcl_interfaces::msg::ParameterDescriptor value;
+      value.read_only = true;
+      value.description = "Applied only during node creation; restart the node to change it.";
+      return value;
+    }();
+  return descriptor;
+}
+
+}  // namespace
 
 /// 读取不受 ROS 时间跳变影响的 steady_clock 秒数。
 double ApplicationNode::monotonic_now()
@@ -19,8 +36,9 @@ double ApplicationNode::monotonic_now()
 
 /// 创建唯一节点并按声明顺序组装全部运行期模块和 20 Hz wall timer。
 ApplicationNode::ApplicationNode(
-  const common::AppOptions & options, const common::SafetyConfig & config)
-: Node("mavros_native_xyz_position"), options_(options), config_(config),
+  const common::AppOptions & options, const common::SafetyConfig & config,
+  const rclcpp::NodeOptions & node_options)
+: Node("mavros_native_xyz_position", node_options), options_(options), config_(load_safety_config(config)),
   initialization_(*this, options_, config_), mission_config_(load_mission_config()),
   ground_station_(load_ground_station_config()), navigation_(config_, mission_config_), offboard_(*this, options_),
   lcp_vision_bridge_(*this, options_), z_config_(load_z_config()), gripper_(load_gripper_config()),
@@ -36,6 +54,93 @@ ApplicationNode::ApplicationNode(
 
 /// 在节点销毁时显式落盘并关闭 artifact 日志。
 ApplicationNode::~ApplicationNode() {artifact_log_.close();}
+
+common::SafetyConfig ApplicationNode::load_safety_config(const common::SafetyConfig & defaults)
+{
+  auto value = defaults;
+  const auto & descriptor = safety_parameter_descriptor();
+  value.state_timeout_s = declare_parameter<double>("safety.state_timeout_s", value.state_timeout_s, descriptor);
+  value.sys_status_timeout_s = declare_parameter<double>(
+    "safety.sys_status_timeout_s", value.sys_status_timeout_s, descriptor);
+  value.battery_timeout_s = declare_parameter<double>("safety.battery_timeout_s", value.battery_timeout_s, descriptor);
+  value.landed_timeout_s = declare_parameter<double>("safety.landed_timeout_s", value.landed_timeout_s, descriptor);
+  value.local_pose_timeout_s = declare_parameter<double>(
+    "safety.local_pose_timeout_s", value.local_pose_timeout_s, descriptor);
+  value.local_velocity_timeout_s = declare_parameter<double>(
+    "safety.local_velocity_timeout_s", value.local_velocity_timeout_s, descriptor);
+  value.estimator_timeout_s = declare_parameter<double>(
+    "safety.estimator_timeout_s", value.estimator_timeout_s, descriptor);
+  value.range_timeout_s = declare_parameter<double>("safety.range_timeout_s", value.range_timeout_s, descriptor);
+  value.optical_flow_timeout_s = declare_parameter<double>(
+    "safety.optical_flow_timeout_s", value.optical_flow_timeout_s, descriptor);
+  value.sensor_loss_grace_s = declare_parameter<double>(
+    "safety.sensor_loss_grace_s", value.sensor_loss_grace_s, descriptor);
+  value.lcp_status_timeout_s = declare_parameter<double>(
+    "safety.lcp_status_timeout_s", value.lcp_status_timeout_s, descriptor);
+  value.lcp_odometry_timeout_s = declare_parameter<double>(
+    "safety.lcp_odometry_timeout_s", value.lcp_odometry_timeout_s, descriptor);
+  value.lcp_ready_samples = declare_parameter<int>("safety.lcp_ready_samples", value.lcp_ready_samples, descriptor);
+  value.range_boundary_tolerance_m = declare_parameter<double>(
+    "safety.range_boundary_tolerance_m", value.range_boundary_tolerance_m, descriptor);
+  value.configured_min_range_m = declare_parameter<double>(
+    "safety.configured_min_range_m", value.configured_min_range_m, descriptor);
+  value.configured_max_range_m = declare_parameter<double>(
+    "safety.configured_max_range_m", value.configured_max_range_m, descriptor);
+  value.max_range_jump_m = declare_parameter<double>(
+    "safety.max_range_jump_m", value.max_range_jump_m, descriptor);
+  value.jump_window_s = declare_parameter<double>("safety.jump_window_s", value.jump_window_s, descriptor);
+  value.jump_recovery_samples = declare_parameter<int>(
+    "safety.jump_recovery_samples", value.jump_recovery_samples, descriptor);
+  value.jump_settle_tolerance_m = declare_parameter<double>(
+    "safety.jump_settle_tolerance_m", value.jump_settle_tolerance_m, descriptor);
+  value.min_optical_flow_quality = declare_parameter<int>(
+    "safety.min_optical_flow_quality", value.min_optical_flow_quality, descriptor);
+  value.min_battery_voltage_v = declare_parameter<double>(
+    "safety.min_battery_voltage_v", value.min_battery_voltage_v, descriptor);
+  value.min_battery_fraction = declare_parameter<double>(
+    "safety.min_battery_fraction", value.min_battery_fraction, descriptor);
+  value.max_preflight_horizontal_speed_m_s = declare_parameter<double>(
+    "safety.max_preflight_horizontal_speed_m_s", value.max_preflight_horizontal_speed_m_s, descriptor);
+  value.max_preflight_vertical_speed_m_s = declare_parameter<double>(
+    "safety.max_preflight_vertical_speed_m_s", value.max_preflight_vertical_speed_m_s, descriptor);
+  value.max_flight_horizontal_speed_m_s = declare_parameter<double>(
+    "safety.max_flight_horizontal_speed_m_s", value.max_flight_horizontal_speed_m_s, descriptor);
+  value.max_flight_vertical_speed_m_s = declare_parameter<double>(
+    "safety.max_flight_vertical_speed_m_s", value.max_flight_vertical_speed_m_s, descriptor);
+  value.max_flight_horizontal_drift_m = declare_parameter<double>(
+    "safety.max_flight_horizontal_drift_m", value.max_flight_horizontal_drift_m, descriptor);
+  value.climb_horizontal_speed_limit_m_s = declare_parameter<double>(
+    "safety.climb_horizontal_speed_limit_m_s", value.climb_horizontal_speed_limit_m_s, descriptor);
+  value.climb_horizontal_drift_limit_m = declare_parameter<double>(
+    "safety.climb_horizontal_drift_limit_m", value.climb_horizontal_drift_limit_m, descriptor);
+  value.hover_min_height_m = declare_parameter<double>(
+    "safety.hover_min_height_m", value.hover_min_height_m, descriptor);
+  value.publish_rate_hz = declare_parameter<double>("safety.publish_rate_hz", value.publish_rate_hz, descriptor);
+  value.setpoint_warmup_s = declare_parameter<double>(
+    "safety.setpoint_warmup_s", value.setpoint_warmup_s, descriptor);
+  value.max_z_setpoint_rate_m_s = declare_parameter<double>(
+    "safety.max_z_setpoint_rate_m_s", value.max_z_setpoint_rate_m_s, descriptor);
+  value.max_z_setpoint_accel_m_s2 = declare_parameter<double>(
+    "safety.max_z_setpoint_accel_m_s2", value.max_z_setpoint_accel_m_s2, descriptor);
+  value.target_xy_max_speed_m_s = declare_parameter<double>(
+    "safety.target_xy_max_speed_m_s", value.target_xy_max_speed_m_s, descriptor);
+  value.target_xy_max_accel_m_s2 = declare_parameter<double>(
+    "safety.target_xy_max_accel_m_s2", value.target_xy_max_accel_m_s2, descriptor);
+  value.target_tolerance_m = declare_parameter<double>(
+    "safety.target_tolerance_m", value.target_tolerance_m, descriptor);
+  value.touchdown_z_tolerance_m = declare_parameter<double>(
+    "safety.touchdown_z_tolerance_m", value.touchdown_z_tolerance_m, descriptor);
+  value.max_flight_seconds = declare_parameter<double>(
+    "safety.max_flight_seconds", value.max_flight_seconds, descriptor);
+  value.flow_effective_min_height_m = declare_parameter<double>(
+    "safety.flow_effective_min_height_m", value.flow_effective_min_height_m, descriptor);
+  value.flow_effective_min_quality = declare_parameter<int>(
+    "safety.flow_effective_min_quality", value.flow_effective_min_quality, descriptor);
+  value.ignore_declared_min_range = declare_parameter<bool>(
+    "safety.ignore_declared_min_range", value.ignore_declared_min_range, descriptor);
+  value.validate();
+  return value;
+}
 
 /// 从 ROS 参数构造并校验 GroundStationLink 的固定启动配置。
 communication::GroundStationConfig ApplicationNode::load_ground_station_config()

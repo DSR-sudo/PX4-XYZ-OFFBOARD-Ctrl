@@ -24,9 +24,13 @@ class ApplicationNode final : public rclcpp::Node
 {
 public:
   /// 创建唯一 ROS 2 节点，并按固定依赖顺序组装初始化、通信、导航和飞控执行模块。
-  ApplicationNode(const common::AppOptions & options, const common::SafetyConfig & config);
+  ApplicationNode(
+    const common::AppOptions & options, const common::SafetyConfig & config,
+    const rclcpp::NodeOptions & node_options = rclcpp::NodeOptions());
   /// 关闭应用持有的 artifact 日志并释放各模块资源。
   ~ApplicationNode() override;
+  /// 返回节点启动时锁定的有效安全配置，供状态检查和测试读取。
+  const common::SafetyConfig & safety_config() const {return config_;}
 
 private:
   struct ZConfig
@@ -40,6 +44,8 @@ private:
 
   /// 返回供控制周期、超时和日志使用的单调时钟秒数。
   static double monotonic_now();
+  /// 以 CLI 解析值为默认值声明、读取并锁定全部活动 safety.* 参数。
+  common::SafetyConfig load_safety_config(const common::SafetyConfig & defaults);
   /// 声明并读取启动时生效的 UDP 端点、白名单和事件重传参数。
   communication::GroundStationConfig load_ground_station_config();
   /// 读取极坐标跟踪、任务高度和安全半径参数。

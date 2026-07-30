@@ -3,6 +3,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -11,11 +12,14 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <gtest/gtest.h>
 #include <json/json.h>
 #include <rclcpp/rclcpp.hpp>
 
+#include "mavros_xyz_position_offboard/application/application_node.hpp"
 #include "mavros_xyz_position_offboard/bridge/lcp_vision_bridge.hpp"
 #include "mavros_xyz_position_offboard/common/cli.hpp"
 #include "mavros_xyz_position_offboard/communication/ground_station_link.hpp"
@@ -26,6 +30,7 @@
 
 namespace
 {
+using mavros_xyz_position_offboard::application::ApplicationNode;
 using mavros_xyz_position_offboard::common::AppOptions;
 using mavros_xyz_position_offboard::common::SafetyConfig;
 using mavros_xyz_position_offboard::communication::GroundStationConfig;
@@ -44,6 +49,97 @@ using mavros_xyz_position_offboard::navigation::Navigation;
 using mavros_xyz_position_offboard::navigation::NavigationInput;
 using mavros_xyz_position_offboard::navigation::TrajectoryPlanner;
 using mavros_xyz_position_offboard::navigation::control_json;
+
+struct DoubleSafetyOverride
+{
+  const char * name;
+  double SafetyConfig::* field;
+  double value;
+};
+
+struct IntSafetyOverride
+{
+  const char * name;
+  int SafetyConfig::* field;
+  int value;
+};
+
+struct BoolSafetyOverride
+{
+  const char * name;
+  bool SafetyConfig::* field;
+  bool value;
+};
+
+const std::array<DoubleSafetyOverride, 38> kDoubleSafetyOverrides{{
+  {"state_timeout_s", &SafetyConfig::state_timeout_s, 1.1},
+  {"sys_status_timeout_s", &SafetyConfig::sys_status_timeout_s, 1.2},
+  {"battery_timeout_s", &SafetyConfig::battery_timeout_s, 5.1},
+  {"landed_timeout_s", &SafetyConfig::landed_timeout_s, 1.3},
+  {"local_pose_timeout_s", &SafetyConfig::local_pose_timeout_s, 0.4},
+  {"local_velocity_timeout_s", &SafetyConfig::local_velocity_timeout_s, 0.45},
+  {"estimator_timeout_s", &SafetyConfig::estimator_timeout_s, 1.4},
+  {"range_timeout_s", &SafetyConfig::range_timeout_s, 0.31},
+  {"optical_flow_timeout_s", &SafetyConfig::optical_flow_timeout_s, 0.32},
+  {"sensor_loss_grace_s", &SafetyConfig::sensor_loss_grace_s, 1.6},
+  {"lcp_status_timeout_s", &SafetyConfig::lcp_status_timeout_s, 0.7},
+  {"lcp_odometry_timeout_s", &SafetyConfig::lcp_odometry_timeout_s, 0.8},
+  {"range_boundary_tolerance_m", &SafetyConfig::range_boundary_tolerance_m, 0.002},
+  {"configured_min_range_m", &SafetyConfig::configured_min_range_m, 0.03},
+  {"configured_max_range_m", &SafetyConfig::configured_max_range_m, 11.0},
+  {"max_range_jump_m", &SafetyConfig::max_range_jump_m, 0.4},
+  {"jump_window_s", &SafetyConfig::jump_window_s, 0.4},
+  {"jump_settle_tolerance_m", &SafetyConfig::jump_settle_tolerance_m, 0.07},
+  {"min_battery_voltage_v", &SafetyConfig::min_battery_voltage_v, 15.0},
+  {"min_battery_fraction", &SafetyConfig::min_battery_fraction, 0.4},
+  {"max_preflight_horizontal_speed_m_s", &SafetyConfig::max_preflight_horizontal_speed_m_s, 0.3},
+  {"max_preflight_vertical_speed_m_s", &SafetyConfig::max_preflight_vertical_speed_m_s, 0.31},
+  {"max_flight_horizontal_speed_m_s", &SafetyConfig::max_flight_horizontal_speed_m_s, 0.6},
+  {"max_flight_vertical_speed_m_s", &SafetyConfig::max_flight_vertical_speed_m_s, 0.9},
+  {"max_flight_horizontal_drift_m", &SafetyConfig::max_flight_horizontal_drift_m, 1.1},
+  {"climb_horizontal_speed_limit_m_s", &SafetyConfig::climb_horizontal_speed_limit_m_s, 3.1},
+  {"climb_horizontal_drift_limit_m", &SafetyConfig::climb_horizontal_drift_limit_m, 3.2},
+  {"hover_min_height_m", &SafetyConfig::hover_min_height_m, 0.25},
+  {"publish_rate_hz", &SafetyConfig::publish_rate_hz, 25.0},
+  {"setpoint_warmup_s", &SafetyConfig::setpoint_warmup_s, 2.5},
+  {"max_z_setpoint_rate_m_s", &SafetyConfig::max_z_setpoint_rate_m_s, 0.3},
+  {"max_z_setpoint_accel_m_s2", &SafetyConfig::max_z_setpoint_accel_m_s2, 0.5},
+  {"target_xy_max_speed_m_s", &SafetyConfig::target_xy_max_speed_m_s, 0.3},
+  {"target_xy_max_accel_m_s2", &SafetyConfig::target_xy_max_accel_m_s2, 0.6},
+  {"target_tolerance_m", &SafetyConfig::target_tolerance_m, 0.05},
+  {"touchdown_z_tolerance_m", &SafetyConfig::touchdown_z_tolerance_m, 0.09},
+  {"max_flight_seconds", &SafetyConfig::max_flight_seconds, 61.0},
+  {"flow_effective_min_height_m", &SafetyConfig::flow_effective_min_height_m, 0.4},
+}};
+
+const std::array<IntSafetyOverride, 4> kIntSafetyOverrides{{
+  {"lcp_ready_samples", &SafetyConfig::lcp_ready_samples, 5},
+  {"jump_recovery_samples", &SafetyConfig::jump_recovery_samples, 4},
+  {"min_optical_flow_quality", &SafetyConfig::min_optical_flow_quality, 42},
+  {"flow_effective_min_quality", &SafetyConfig::flow_effective_min_quality, 44},
+}};
+
+const std::array<BoolSafetyOverride, 1> kBoolSafetyOverrides{{
+  {"ignore_declared_min_range", &SafetyConfig::ignore_declared_min_range, false},
+}};
+
+AppOptions application_test_options()
+{
+  AppOptions options;
+  options.range_topic = "/test/range";
+  options.optical_flow_topic = "/test/flow";
+  options.lcp_vision_bridge_enabled = false;
+  return options;
+}
+
+rclcpp::NodeOptions application_test_node_options(std::vector<rclcpp::Parameter> overrides = {})
+{
+  overrides.emplace_back("udp.enabled", false);
+  rclcpp::NodeOptions options;
+  options.use_global_arguments(false);
+  options.parameter_overrides(overrides);
+  return options;
+}
 
 GroundStationLink disabled_link()
 {
@@ -524,6 +620,41 @@ TEST(NavigationV2Test, OffboardLossAfterArmRequestsAutoLand)
   ASSERT_TRUE(decision.arm_intent);
   EXPECT_TRUE(*decision.arm_intent);
   EXPECT_FALSE(decision.control.origin);
+}
+
+TEST(NavigationV2Test, FlightTimeoutUsesConfiguredThresholdAndExistingAutoLandPath)
+{
+  for (const double max_flight_seconds : {0.10, 0.20}) {
+    SafetyConfig safety;
+    safety.setpoint_warmup_s = 0.01;
+    safety.max_flight_seconds = max_flight_seconds;
+    Navigation navigation(safety);
+    auto input = base_input(0.0);
+    navigation.update(input);
+    input.now = 0.01;
+    navigation.update(input);
+    input.now = 0.02;
+    input.events = {event(MessageType::run_plan1, input.now)};
+    navigation.update(input);
+    input.events.clear();
+    input.controller.mode = "OFFBOARD";
+    input.now = 0.03;
+    navigation.update(input);
+    ASSERT_EQ(navigation.phase(), "arming_request_pending");
+
+    input.controller.armed = true;
+    input.now = 0.04;
+    navigation.update(input);
+    ASSERT_EQ(navigation.phase(), "climb");
+    input.now += max_flight_seconds - 0.01;
+    navigation.update(input);
+    EXPECT_EQ(navigation.phase(), "climb");
+    input.now += 0.02;
+    const auto decision = navigation.update(input);
+    EXPECT_EQ(navigation.phase(), "landing");
+    ASSERT_TRUE(decision.target_mode);
+    EXPECT_EQ(*decision.target_mode, "AUTO.LAND");
+  }
 }
 
 TEST(NavigationV2Test, LcpLossDuringClimbDoesNotInterruptClimb)
@@ -1008,6 +1139,107 @@ TEST(SafetyConfigTest, DefaultBatteryTelemetryTimeoutIsFiveSeconds)
   EXPECT_DOUBLE_EQ(config.battery_timeout_s, 5.0);
   EXPECT_FALSE(mavros_xyz_position_offboard::common::stale(10.0, 14.99, config.battery_timeout_s));
   EXPECT_TRUE(mavros_xyz_position_offboard::common::stale(10.0, 15.01, config.battery_timeout_s));
+}
+
+TEST(ApplicationNodeSafetyParameterTest, StartupOverridesEveryActiveSafetyField)
+{
+  std::vector<rclcpp::Parameter> overrides;
+  for (const auto & definition : kDoubleSafetyOverrides) {
+    overrides.emplace_back(std::string("safety.") + definition.name, definition.value);
+  }
+  for (const auto & definition : kIntSafetyOverrides) {
+    overrides.emplace_back(std::string("safety.") + definition.name, definition.value);
+  }
+  for (const auto & definition : kBoolSafetyOverrides) {
+    overrides.emplace_back(std::string("safety.") + definition.name, definition.value);
+  }
+
+  const auto node = std::make_shared<ApplicationNode>(
+    application_test_options(), SafetyConfig{}, application_test_node_options(std::move(overrides)));
+  const auto & config = node->safety_config();
+  for (const auto & definition : kDoubleSafetyOverrides) {
+    EXPECT_DOUBLE_EQ(config.*(definition.field), definition.value) << definition.name;
+  }
+  for (const auto & definition : kIntSafetyOverrides) {
+    EXPECT_EQ(config.*(definition.field), definition.value) << definition.name;
+  }
+  for (const auto & definition : kBoolSafetyOverrides) {
+    EXPECT_EQ(config.*(definition.field), definition.value) << definition.name;
+  }
+}
+
+TEST(ApplicationNodeSafetyParameterTest, CliDefaultsRemainWhenNoSafetyOverrideIsProvided)
+{
+  SafetyConfig cli_config;
+  cli_config.max_flight_seconds = 72.0;
+  cli_config.relative_z_m = 1.23;
+  cli_config.hold_seconds = 9.87;
+  const auto node = std::make_shared<ApplicationNode>(
+    application_test_options(), cli_config, application_test_node_options());
+
+  EXPECT_DOUBLE_EQ(node->safety_config().max_flight_seconds, cli_config.max_flight_seconds);
+  EXPECT_DOUBLE_EQ(node->safety_config().relative_z_m, cli_config.relative_z_m);
+  EXPECT_DOUBLE_EQ(node->safety_config().hold_seconds, cli_config.hold_seconds);
+  EXPECT_FALSE(node->has_parameter("safety.relative_z_m"));
+  EXPECT_FALSE(node->has_parameter("safety.hold_seconds"));
+}
+
+TEST(ApplicationNodeSafetyParameterTest, YamlParametersOverrideCliDefaultsAtStartup)
+{
+  SafetyConfig cli_config;
+  cli_config.max_flight_seconds = 72.0;
+  cli_config.target_xy_max_speed_m_s = 0.70;
+  rclcpp::NodeOptions options;
+  options.use_global_arguments(false);
+  options.arguments({
+    "--ros-args", "--params-file",
+    std::string(MAVROS_XYZ_SOURCE_DIR) + "/config/udp_ground_station.yaml"});
+  options.append_parameter_override("udp.enabled", false);
+  const auto node = std::make_shared<ApplicationNode>(application_test_options(), cli_config, options);
+
+  EXPECT_DOUBLE_EQ(node->safety_config().max_flight_seconds, 60.0);
+  EXPECT_DOUBLE_EQ(node->safety_config().target_xy_max_speed_m_s, 0.25);
+}
+
+TEST(ApplicationNodeSafetyParameterTest, InvalidStartupOverrideIsRejected)
+{
+  const std::vector<rclcpp::Parameter> overrides{
+    rclcpp::Parameter("safety.max_flight_seconds", 0.0)};
+  EXPECT_THROW(
+    std::make_shared<ApplicationNode>(
+      application_test_options(), SafetyConfig{}, application_test_node_options(overrides)),
+    std::invalid_argument);
+}
+
+TEST(ApplicationNodeSafetyParameterTest, RuntimeChangesAreRejectedAndEffectiveConfigStaysFixed)
+{
+  SafetyConfig cli_config;
+  cli_config.max_flight_seconds = 72.0;
+  const auto node = std::make_shared<ApplicationNode>(
+    application_test_options(), cli_config, application_test_node_options());
+
+  const auto results = node->set_parameters({rclcpp::Parameter("safety.max_flight_seconds", 30.0)});
+  ASSERT_EQ(results.size(), 1U);
+  EXPECT_FALSE(results.front().successful);
+  EXPECT_DOUBLE_EQ(node->get_parameter("safety.max_flight_seconds").as_double(), 72.0);
+  EXPECT_DOUBLE_EQ(node->safety_config().max_flight_seconds, 72.0);
+}
+
+TEST(ApplicationNodeSafetyParameterTest, SensorSourceConfirmationRemainsCliOnly)
+{
+  SafetyConfig cli_config;
+  cli_config.range_source_confirmed = true;
+  cli_config.optical_flow_source_confirmed = true;
+  const std::vector<rclcpp::Parameter> overrides{
+    rclcpp::Parameter("safety.range_source_confirmed", false),
+    rclcpp::Parameter("safety.optical_flow_source_confirmed", false)};
+  const auto node = std::make_shared<ApplicationNode>(
+    application_test_options(), cli_config, application_test_node_options(overrides));
+
+  EXPECT_TRUE(node->safety_config().range_source_confirmed);
+  EXPECT_TRUE(node->safety_config().optical_flow_source_confirmed);
+  EXPECT_FALSE(node->has_parameter("safety.range_source_confirmed"));
+  EXPECT_FALSE(node->has_parameter("safety.optical_flow_source_confirmed"));
 }
 
 TEST(LcpVisionBridgeTest, ConvertsNwuToEnu)

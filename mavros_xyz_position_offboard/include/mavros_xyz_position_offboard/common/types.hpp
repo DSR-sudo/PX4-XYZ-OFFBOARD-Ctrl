@@ -96,6 +96,7 @@ struct SafetyConfig
   double hover_min_height_m{0.20};
   double publish_rate_hz{20.0};
   double setpoint_warmup_s{2.0};
+  // Legacy CLI compatibility value. No control path consumes it; remove after callers migrate.
   double relative_z_m{0.80};
   double max_z_setpoint_rate_m_s{1.0};
   double max_z_setpoint_accel_m_s2{1.50};
@@ -103,6 +104,7 @@ struct SafetyConfig
   double target_xy_max_accel_m_s2{0.50};
   double target_tolerance_m{0.04};
   double touchdown_z_tolerance_m{0.08};
+  // Legacy CLI compatibility value. No control path consumes it; remove after callers migrate.
   double hold_seconds{10.0};
   double max_flight_seconds{60.0};
   double flow_effective_min_height_m{0.35};

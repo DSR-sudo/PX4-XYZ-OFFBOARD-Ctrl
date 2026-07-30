@@ -1,40 +1,160 @@
 mavros_native_xyz_position:
   ros__parameters:
     udp:
+      # 是否启用与地面站的 UDP 通信。
       enabled: true
+      # 本机 UDP 监听地址。
       bind_ip: 0.0.0.0
+      # 本机 UDP 监听端口。
       bind_port: 5005
+      # 地面站 UDP 目标地址。
       remote_ip: 192.168.10.59
+      # 地面站 UDP 目标端口。
       remote_port: 5005
+      # 仅接受此 IP 地址发来的 UDP 数据报。
       whitelist_ip: 192.168.10.59
+      # 仅接受此端口发来的 UDP 数据报。
       whitelist_port: 5005
+      # 需要确认的业务事件重发周期，单位：秒。
       event_retry_period_s: 0.5
 
+    safety:
+      # 静态部署参数：YAML/launch 值覆盖应用 CLI 默认值，修改后必须重启节点。
+      # 传感器来源确认只能使用 CLI 的 --confirm-range-source 和
+      # --confirm-optical-flow-source，不能由此 YAML 绕过。
+      # 仅为兼容旧 CLI 保留的 relative_z_m 与 hold_seconds 未在此处参数化。
+
+      # MAVROS 状态/心跳消息的最大新鲜时间，单位：秒。
+      state_timeout_s: 1.5
+      # MAVROS SYS_STATUS 消息的最大新鲜时间，单位：秒。
+      sys_status_timeout_s: 2.0
+      # 电池遥测消息的最大新鲜时间，单位：秒。
+      battery_timeout_s: 5.0
+      # MAVROS 落地状态消息的最大新鲜时间，单位：秒。
+      landed_timeout_s: 2.0
+      # 本地位姿消息的最大新鲜时间，单位：秒。
+      local_pose_timeout_s: 0.5
+      # 本地速度消息的最大新鲜时间，单位：秒。
+      local_velocity_timeout_s: 0.5
+      # 飞控估计器状态消息的最大新鲜时间，单位：秒。
+      estimator_timeout_s: 1.5
+      # 向下测距消息的最大新鲜时间，单位：秒。
+      range_timeout_s: 0.35
+      # 光流消息的最大新鲜时间，单位：秒。
+      optical_flow_timeout_s: 0.35
+      # 飞行中传感器健康异常允许持续的宽限时间，单位：秒。
+      sensor_loss_grace_s: 2.0
+      # LCP 状态消息的最大新鲜时间，单位：秒。
+      lcp_status_timeout_s: 0.75
+      # LCP 里程计消息的最大新鲜时间，单位：秒。
+      lcp_odometry_timeout_s: 0.75
+      # LCP 初始化就绪所需的连续健康样本数。
+      lcp_ready_samples: 3
+
+      # 测距值接近边界时允许的额外误差，单位：米。
+      range_boundary_tolerance_m: 0.001
+      # 无视传感器声明下限时仍采用的最小可接受测距值，单位：米。
+      configured_min_range_m: 0.02
+      # 可接受的最大测距值，单位：米。
+      configured_max_range_m: 12.0
+      # 在跳变时间窗内允许的最大测距变化，单位：米。
+      max_range_jump_m: 0.30
+      # 判定测距跳变使用的时间窗，单位：秒。
+      jump_window_s: 0.30
+      # 跳变后恢复测距有效性所需的一致样本数。
+      jump_recovery_samples: 3
+      # 跳变恢复样本与候选值之间允许的偏差，单位：米。
+      jump_settle_tolerance_m: 0.06
+      # 预检接受光流数据所需的最小质量值。
+      min_optical_flow_quality: 20
+
+      # 起飞前允许飞行所需的最低电池电压，单位：伏特。
+      min_battery_voltage_v: 14.8
+      # 起飞前允许飞行所需的最低电池剩余电量比例，范围为 0 到 1。
+      min_battery_fraction: 0.15
+
+      # 预检阶段允许的最大水平速度，单位：米/秒。
+      max_preflight_horizontal_speed_m_s: 0.20
+      # 预检阶段允许的最大垂直速度，单位：米/秒。
+      max_preflight_vertical_speed_m_s: 0.20
+      # 正常飞行阶段允许的最大水平速度，单位：米/秒。
+      max_flight_horizontal_speed_m_s: 0.50
+      # 正常飞行阶段允许的最大垂直速度，单位：米/秒。
+      max_flight_vertical_speed_m_s: 0.80
+      # 悬停阶段允许相对指令点的最大水平漂移，单位：米。
+      max_flight_horizontal_drift_m: 1.0
+      # 爬升阶段允许的最大水平速度，单位：米/秒。
+      climb_horizontal_speed_limit_m_s: 3.0
+      # 爬升阶段允许相对指令点的最大水平漂移，单位：米。
+      climb_horizontal_drift_limit_m: 3.0
+      # 判定悬停相关状态所需的最小离地高度，单位：米。
+      hover_min_height_m: 0.20
+
+      # 位置设定点发布频率，单位：赫兹。
+      publish_rate_hz: 20.0
+      # 进入任务前持续发送设定点的预热时间，单位：秒。
+      setpoint_warmup_s: 2.0
+      # Z 轴设定点轨迹允许的最大速度，单位：米/秒。
+      max_z_setpoint_rate_m_s: 0.20
+      # Z 轴设定点轨迹允许的最大加速度，单位：米/秒²。
+      max_z_setpoint_accel_m_s2: 0.40
+      # XY 目标轨迹允许的最大速度，单位：米/秒。
+      target_xy_max_speed_m_s: 0.25
+      # XY 目标轨迹允许的最大加速度，单位：米/秒²。
+      target_xy_max_accel_m_s2: 0.50
+      # 目标点到达判定使用的位置容差，单位：米。
+      target_tolerance_m: 0.04
+      # 触地/下降完成判定使用的 Z 轴容差，单位：米。
+      touchdown_z_tolerance_m: 0.08
+
+      # 最大允许飞行时长，单位：秒；超时后的 AUTO.LAND 动作固定在导航逻辑中。
+      max_flight_seconds: 120.0
+
+      # 认为光流对水平定位有效所需的最小测距高度，单位：米。
+      flow_effective_min_height_m: 0.35
+      # 认为光流对水平定位有效所需的最小质量值。
+      flow_effective_min_quality: 20
+      # true 表示忽略传感器声明的最小量程，仅使用 configured_min_range_m。
+      ignore_declared_min_range: true
+
     mission:
+      # 任务起飞相对高度，单位：米。
       takeoff_height_m: 1.5
+      # 到达任务高度后必须持续稳定的时间，单位：秒。
       height_stable_seconds: 3.0
-      # Initial-heading body-right translation used for black-line alignment.
+      # 按初始航向向机体右侧平移的距离，用于黑线对齐，单位：米。
       right_shift_m: 0.375
-      # Bounded straight-line pursuit after the GCS sends go_ahead_ok.
+      # 收到地面站 go_ahead_ok 后沿航向直线追踪的最大距离，单位：米。
       forward_distance_m: 5.0
-      # Hold at the GCS-confirmed vehicle match point before release.
+      # 在地面站确认的车辆匹配点保持后再释放的时长，单位：秒。
       match_hold_seconds: 0.5
 
     z:
+      # true 时优先使用测距高度，false 时优先使用本地位姿高度。
       prefer_range: false
+      # 高度来源数据的最大新鲜时间，单位：秒。
       source_timeout_s: 0.5
+      # 本地位姿高度与测距高度的最大允许差值，单位：米。
       range_cross_check_max_delta_m: 0.30
 
     gripper_pwm:
-      # Disabled is a timed no-op for SITL and prevents all physical GPIO output.
+      # 是否启用物理 PWM 夹爪；false 用于 SITL 并禁止所有物理 GPIO 输出。
       enabled: false
+      # Linux PWM 芯片 sysfs 路径。
       chip_path: /sys/class/pwm/pwmchip0
+      # PWM 通道编号。
       channel: 0
+      # PWM 周期，单位：纳秒。
       period_ns: 20000000
+      # 夹爪空闲位置的 PWM 高电平宽度，单位：纳秒。
       idle_duty_ns: 1500000
+      # 夹爪释放位置的 PWM 高电平宽度，单位：纳秒。
       release_duty_ns: 2000000
+      # 收到释放命令后开始输出释放占空比前的延时，单位：毫秒。
       release_delay_ms: 500
+      # 保持释放占空比的时长，单位：毫秒。
       release_hold_ms: 500
-      # These must be site-specific and non-empty before enabled:true is accepted.
+      # 启用物理 PWM 前必须填写且可读取的板级引脚复用状态文件路径。
       pinmux_path: ""
+      # 启用物理 PWM 前 pinmux_path 文件中必须出现的预期文本。
       pinmux_expected: ""

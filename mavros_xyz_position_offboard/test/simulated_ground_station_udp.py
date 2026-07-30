@@ -175,7 +175,7 @@ def parse_args():
         "--line-centered", action="store_true",
         help="Use the original simulated visual-alignment gate instead of the 10 s go-ahead delay.")
     parser.add_argument(
-        "--simulated-car-forward-m", type=float, default=1.30,
+        "--simulated-car-forward-m", type=float, default=2.3,
         help="Place the simulated vision-detected car this far ahead after line alignment.")
     args = parser.parse_args()
     if not 4.0 <= args.command_wait_s <= 9.0:

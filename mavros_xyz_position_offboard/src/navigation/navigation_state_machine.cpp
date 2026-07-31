@@ -26,13 +26,11 @@ void Navigation::process_events(const NavigationInput & input)
     if (event.type == communication::MessageType::car_status) {
       if (!event.car_status) {
         reject("car_status_missing_measurement");
-      } else if (phase_ == "waiting_target" || phase_ == "cardinal_alignment" ||
-        phase_ == "final_intercept") {
+      } else if (phase_ == "waiting_target") {
         apply_car_status(input, *event.car_status);
       } else if (phase_ == "lcp_hold" && control_.hold_reason != "lcp_unhealthy") {
-        const auto resume = control_.hold_resume_phase;
         clear_hold();
-        transition(resume.empty() ? "waiting_target" : resume, input.now);
+        transition("waiting_target", input.now);
         apply_car_status(input, *event.car_status);
       } else {
         reject("car_status_not_allowed_in_phase");
@@ -51,7 +49,6 @@ NavigationDecision Navigation::update(const NavigationInput & input)
   pending_messages_.clear();
   pending_rejections_.clear();
   pending_release_gripper_ = false;
-  update_own_velocity(input);
   process_events(input);
 
   if (phase_ == "waiting_preflight") {
@@ -103,28 +100,16 @@ NavigationDecision Navigation::update(const NavigationInput & input)
       transition("transit_to_b", input.now);
     }
   } else if (phase_ == "transit_to_b") {
-    if (planner_.target_reached() && stable_at(input.telemetry, planner_.current())) {
+    if (planner_.target_reached() && b_arrival_stable(input.telemetry, planner_.current())) {
       emit(communication::MessageType::ok_b);
       transition("waiting_target", input.now);
     }
-  } else if (phase_ == "waiting_target" || phase_ == "cardinal_alignment" ||
-    phase_ == "final_intercept") {
+  } else if (phase_ == "waiting_target") {
     if (last_car_status_at_ && !car_status_fresh(input.now)) {
-      target_tracker_.reset();
       control_.target_samples = 0;
-      intercept_due_at_.reset();
       control_.predicted_intercept_seconds.reset();
+      last_car_status_at_.reset();
       enter_hold(input, "lcp_hold", "car_status_timeout", "waiting_target");
-    } else if (phase_ == "final_intercept" && intercept_due_at_ && input.now >= *intercept_due_at_) {
-      const auto estimate = target_tracker_.estimate(input.now);
-      if (std::hypot(estimate.x_m - input.telemetry.local_x_m,
-          estimate.y_m - input.telemetry.local_y_m) <= mission_.throw_distance_m) {
-        pending_release_gripper_ = true;
-        transition("throwing", input.now);
-      } else {
-        intercept_due_at_.reset();
-        plan_intercept(input, 0.0);
-      }
     }
   } else if (phase_ == "throwing") {
     if (input.gripper_failed) {
@@ -210,16 +195,14 @@ NavigationDecision Navigation::update(const NavigationInput & input)
   }
   if (phase_ == "offboard_request_pending" || phase_ == "arming_request_pending" ||
     phase_ == "climb" || phase_ == "height_stabilizing" || phase_ == "transit_to_b" ||
-    phase_ == "waiting_target" || phase_ == "cardinal_alignment" ||
-    phase_ == "final_intercept" || phase_ == "throwing" || phase_ == "returning" ||
+    phase_ == "waiting_target" || phase_ == "throwing" || phase_ == "returning" ||
     phase_ == "lcp_hold" || phase_ == "downing") {
     decision.target_mode = "OFFBOARD";
   }
   if (phase_ == "landing" && !landing_reason_.empty()) {decision.target_mode = "AUTO.LAND";}
   if (phase_ == "arming_request_pending" || phase_ == "climb" ||
     phase_ == "height_stabilizing" || phase_ == "transit_to_b" ||
-    phase_ == "waiting_target" || phase_ == "cardinal_alignment" ||
-    phase_ == "final_intercept" || phase_ == "throwing" || phase_ == "returning" ||
+    phase_ == "waiting_target" || phase_ == "throwing" || phase_ == "returning" ||
     phase_ == "lcp_hold" || phase_ == "downing" || phase_ == "landing") {
     decision.arm_intent = true;
   }

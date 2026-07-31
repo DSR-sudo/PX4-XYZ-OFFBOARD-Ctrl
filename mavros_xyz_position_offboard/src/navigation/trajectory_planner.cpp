@@ -95,6 +95,18 @@ void TrajectoryPlanner::set_xy_target_with_max_speed(double x_m, double y_m, dou
     x_m, y_m, std::nullopt, max_speed_m_s, config_.target_xy_max_accel_m_s2);
 }
 
+/// 使用调用方提供的二维合速度和合加速度约束规划 XY 轨迹。
+void TrajectoryPlanner::set_xy_target_with_limits(
+  double x_m, double y_m, double max_speed_m_s, double max_accel_m_s2)
+{
+  require_latched("setting an XY target with custom limits");
+  if (!common::finite(x_m) || !common::finite(y_m) || !common::finite(max_speed_m_s) ||
+    !common::finite(max_accel_m_s2) || max_speed_m_s <= 0.0 || max_accel_m_s2 <= 0.0) {
+    throw std::invalid_argument("XY target and limits must be finite and positive");
+  }
+  begin_xy_trajectory(x_m, y_m, std::nullopt, max_speed_m_s, max_accel_m_s2);
+}
+
 /// 在不突破既有速度和加速度约束的前提下尝试按指定时长到达 XY 目标。
 bool TrajectoryPlanner::set_xy_target_with_arrival_time(
   double x_m, double y_m, double arrival_seconds)

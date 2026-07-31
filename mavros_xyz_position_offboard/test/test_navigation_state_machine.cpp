@@ -19,6 +19,7 @@ using mavros_xyz_position_offboard::navigation::MissionConfig;
 using mavros_xyz_position_offboard::navigation::Navigation;
 using mavros_xyz_position_offboard::navigation::NavigationInput;
 using mavros_xyz_position_offboard::navigation::NavigationDecision;
+using mavros_xyz_position_offboard::navigation::TrajectoryPlanner;
 using mavros_xyz_position_offboard::navigation::control_json;
 
 SafetyConfig intercept_safety()
@@ -70,6 +71,9 @@ NavigationInput base_input(double now)
   input.telemetry.local_y_m = 0.0;
   input.telemetry.local_z_m = 0.0;
   input.telemetry.orientation = {0.0, 0.0, 0.0, 1.0};
+  input.telemetry.velocity_x_m_s = 0.0;
+  input.telemetry.velocity_y_m_s = 0.0;
+  input.telemetry.velocity_z_m_s = 0.0;
   input.controller.mode = "MANUAL";
   return input;
 }
@@ -84,7 +88,7 @@ void follow_planner(Navigation & navigation, NavigationInput & input)
   input.telemetry.orientation = setpoint.orientation;
 }
 
-void advance_to_b(Navigation & navigation, NavigationInput & input, double & now)
+void advance_to_transit_to_b(Navigation & navigation, NavigationInput & input, double & now)
 {
   const auto tick = [&]() {
       follow_planner(navigation, input);
@@ -106,7 +110,29 @@ void advance_to_b(Navigation & navigation, NavigationInput & input, double & now
   ASSERT_EQ(navigation.phase(), "height_stabilizing");
   for (int count = 0; count < 100 && navigation.phase() != "transit_to_b"; ++count) {tick();}
   ASSERT_EQ(navigation.phase(), "transit_to_b");
-  for (int count = 0; count < 400 && navigation.phase() != "waiting_target"; ++count) {tick();}
+}
+
+void finish_b_trajectory(Navigation & navigation, NavigationInput & input, double & now)
+{
+  for (int count = 0; count < 400 && !navigation.planner().target_reached(); ++count) {
+    follow_planner(navigation, input);
+    input.now = now;
+    input.events.clear();
+    navigation.update(input);
+    now += input.dt;
+  }
+  ASSERT_TRUE(navigation.planner().target_reached());
+}
+
+void advance_to_b(Navigation & navigation, NavigationInput & input, double & now)
+{
+  advance_to_transit_to_b(navigation, input, now);
+  finish_b_trajectory(navigation, input, now);
+  follow_planner(navigation, input);
+  input.now = now;
+  input.events.clear();
+  navigation.update(input);
+  now += input.dt;
   ASSERT_EQ(navigation.phase(), "waiting_target");
 }
 
@@ -122,7 +148,7 @@ TEST(NavigationTypesTest, EncodesControlJsonWithoutStateMachineDependency)
   EXPECT_NE(encoded.find("\"target_samples\":3"), std::string::npos);
 }
 
-TEST(NavigationV3Test, StabilizesThreeSecondsThenUsesTheDiagonalBPointAndEmitsOkBOnce)
+TEST(NavigationV3Test, StabilizesThreeSecondsThenUsesFixedBPointAndEmitsOkBOnce)
 {
   auto safety = intercept_safety();
   MissionConfig mission;
@@ -175,7 +201,29 @@ TEST(NavigationV3Test, StabilizesThreeSecondsThenUsesTheDiagonalBPointAndEmitsOk
   EXPECT_EQ(ok_b_count, 1);
 }
 
-TEST(NavigationV3Test, ShapesCardinalTranslationThenUnlocksForFinalInterceptAndRejectsBadObservations)
+TEST(NavigationV3Test, UsesFixedLocalEnuBPointForDifferentInitialYaws)
+{
+  const double pi = std::acos(-1.0);
+  for (const double yaw : {0.0, 0.7, pi / 2.0, pi, -1.1}) {
+    auto safety = intercept_safety();
+    MissionConfig mission;
+    mission.height_stable_seconds = 0.05;
+    Navigation navigation(safety, mission);
+    auto input = base_input(0.0);
+    input.telemetry.local_x_m = 1.20;
+    input.telemetry.local_y_m = -0.80;
+    input.telemetry.orientation = {
+      0.0, 0.0, std::sin(yaw / 2.0), std::cos(yaw / 2.0)};
+    double now = 0.0;
+
+    advance_to_transit_to_b(navigation, input, now);
+
+    EXPECT_NEAR(navigation.planner().target_x_m(), mission.b_right_m, 1e-9);
+    EXPECT_NEAR(navigation.planner().target_y_m(), mission.b_forward_m, 1e-9);
+  }
+}
+
+TEST(NavigationV3Test, RequiresMeasuredBPointVelocityBeforeSendingOkB)
 {
   auto safety = intercept_safety();
   MissionConfig mission;
@@ -184,40 +232,128 @@ TEST(NavigationV3Test, ShapesCardinalTranslationThenUnlocksForFinalInterceptAndR
   auto input = base_input(0.0);
   input.dt = 0.05;
   double now = 0.0;
+  advance_to_transit_to_b(navigation, input, now);
+  finish_b_trajectory(navigation, input, now);
+
+  follow_planner(navigation, input);
+  input.telemetry.velocity_x_m_s = 0.118;
+  input.telemetry.velocity_y_m_s = 0.0;
+  input.telemetry.velocity_z_m_s = 0.0;
+  input.now = now;
+  input.events.clear();
+  const auto moving_horizontally = navigation.update(input);
+  now += input.dt;
+  EXPECT_EQ(moving_horizontally.phase, "transit_to_b");
+  EXPECT_FALSE(has_message(moving_horizontally, MessageType::ok_b));
+
+  input.telemetry.velocity_x_m_s = 0.0;
+  input.telemetry.velocity_z_m_s = 0.118;
+  input.now = now;
+  const auto moving_vertically = navigation.update(input);
+  now += input.dt;
+  EXPECT_EQ(moving_vertically.phase, "transit_to_b");
+  EXPECT_FALSE(has_message(moving_vertically, MessageType::ok_b));
+
+  input.telemetry.velocity_z_m_s = 0.0;
+  input.now = now;
+  const auto stable = navigation.update(input);
+  now += input.dt;
+  EXPECT_EQ(stable.phase, "waiting_target");
+  EXPECT_TRUE(has_message(stable, MessageType::ok_b));
+
+  input.now = now;
+  const auto after_ack = navigation.update(input);
+  EXPECT_EQ(after_ack.phase, "waiting_target");
+  EXPECT_FALSE(has_message(after_ack, MessageType::ok_b));
+}
+
+TEST(NavigationV3Test, SingleCarStatusDirectlyTargetsVehicleCenterWithYawConversion)
+{
+  auto safety = intercept_safety();
+  MissionConfig mission;
+  mission.height_stable_seconds = 0.05;
+  Navigation navigation(safety, mission);
+  auto input = base_input(0.0);
+  input.dt = 0.05;
+  double now = 0.0;
+  const double yaw = 0.70;
+  const double distance = 1.00;
+  const double bearing = -0.25;
+  input.telemetry.orientation = {0.0, 0.0, std::sin(yaw / 2.0), std::cos(yaw / 2.0)};
   advance_to_b(navigation, input, now);
 
-  for (int sample = 0; sample < 3; ++sample) {
-    input.now = now;
-    input.events = {car_status_event(1.414 - 0.071 * sample, std::acos(-1.0) / 4.0, now)};
-    const auto decision = navigation.update(input);
-    follow_planner(navigation, input);
-    now += input.dt;
-    if (sample == 2) {
-      EXPECT_EQ(decision.phase, "cardinal_alignment");
-      EXPECT_NEAR(mavros_xyz_position_offboard::common::yaw_from_quaternion(
-          navigation.commanded_setpoint()->orientation), 0.0, 1e-9);
-    }
-  }
-  EXPECT_NEAR(navigation.planner().target_x_m(), input.telemetry.local_x_m, 0.15);
-  EXPECT_GT(navigation.planner().target_y_m(), input.telemetry.local_y_m);
-
-  const double b_x = mission.b_forward_m;
-  const double b_y = -mission.b_right_m;
-  input.telemetry.local_x_m = b_x + 0.85 - 0.45 * std::cos(0.35);
-  input.telemetry.local_y_m = b_y + 0.85 - 0.45 * std::sin(0.35);
-  input.telemetry.velocity_x_m_s = 0.0;
-  input.telemetry.velocity_y_m_s = 0.0;
   input.now = now;
-  input.events = {car_status_event(0.45, 0.35, now)};
-  const auto final = navigation.update(input);
-  EXPECT_EQ(final.phase, "final_intercept");
-  EXPECT_NEAR(mavros_xyz_position_offboard::common::yaw_from_quaternion(final.setpoint->orientation), 0.0, 1e-9);
+  input.events = {car_status_event(distance, bearing, now)};
+  const auto decision = navigation.update(input);
 
-  input.now += mission.car_status_timeout_s + input.dt;
+  const double expected_x = input.telemetry.local_x_m + distance * std::cos(yaw + bearing);
+  const double expected_y = input.telemetry.local_y_m + distance * std::sin(yaw + bearing);
+  EXPECT_EQ(decision.phase, "waiting_target");
+  EXPECT_FALSE(decision.release_gripper);
+  EXPECT_NEAR(navigation.planner().target_x_m(), expected_x, 1e-9);
+  EXPECT_NEAR(navigation.planner().target_y_m(), expected_y, 1e-9);
+  ASSERT_TRUE(decision.control.mission_goal);
+  EXPECT_NEAR(decision.control.mission_goal->x_m, expected_x, 1e-9);
+  EXPECT_NEAR(decision.control.mission_goal->y_m, expected_y, 1e-9);
+  EXPECT_NEAR(decision.control.mission_goal->z_m, 1.5, 1e-9);
+  EXPECT_NEAR(mavros_xyz_position_offboard::common::yaw_from_quaternion(
+      decision.control.mission_goal->orientation), yaw, 1e-9);
+  EXPECT_EQ(decision.control.target_samples, 0);
+  EXPECT_FALSE(decision.control.predicted_intercept_seconds);
+}
+
+TEST(NavigationV3Test, CarStatusUsesMissionLimitsWhileBUsesGlobalXyLimits)
+{
+  auto safety = intercept_safety();
+  MissionConfig mission;
+  mission.height_stable_seconds = 0.05;
+  mission.car_tracking_max_speed_m_s = 0.35;
+  mission.car_tracking_max_accel_m_s2 = 0.65;
+  Navigation navigation(safety, mission);
+  auto input = base_input(0.0);
+  input.dt = 0.05;
+  double now = 0.0;
+  advance_to_transit_to_b(navigation, input, now);
+
+  const double b_duration = navigation.planner().xy_trajectory_duration_s();
+  TrajectoryPlanner expected_b(safety);
+  expected_b.latch(0.0, 0.0, mission.takeoff_height_m, {0.0, 0.0, 0.0, 1.0});
+  expected_b.set_xy_target(mission.b_right_m, mission.b_forward_m);
+  EXPECT_NEAR(b_duration, expected_b.xy_trajectory_duration_s(), 1e-12);
+
+  finish_b_trajectory(navigation, input, now);
+  follow_planner(navigation, input);
+  input.now = now;
   input.events.clear();
-  const auto timed_out = navigation.update(input);
-  EXPECT_EQ(timed_out.phase, "lcp_hold");
-  EXPECT_TRUE(timed_out.control.mission_paused);
+  ASSERT_EQ(navigation.update(input).phase, "waiting_target");
+  now += input.dt;
+
+  const double distance = 1.0;
+  const double bearing = 0.0;
+  const double target_x = input.telemetry.local_x_m + distance;
+  const double target_y = input.telemetry.local_y_m;
+  TrajectoryPlanner expected_global(safety);
+  expected_global.latch(
+    input.telemetry.local_x_m, input.telemetry.local_y_m, input.telemetry.local_z_m,
+    input.telemetry.orientation);
+  expected_global.set_xy_target(target_x, target_y);
+  TrajectoryPlanner expected_tracking(safety);
+  expected_tracking.latch(
+    input.telemetry.local_x_m, input.telemetry.local_y_m, input.telemetry.local_z_m,
+    input.telemetry.orientation);
+  expected_tracking.set_xy_target_with_limits(
+    target_x, target_y, mission.car_tracking_max_speed_m_s,
+    mission.car_tracking_max_accel_m_s2);
+
+  input.now = now;
+  input.events = {car_status_event(distance, bearing, now)};
+  const auto decision = navigation.update(input);
+  EXPECT_EQ(decision.phase, "waiting_target");
+  EXPECT_NEAR(
+    navigation.planner().xy_trajectory_duration_s(), expected_tracking.xy_trajectory_duration_s(),
+    1e-12);
+  EXPECT_GT(
+    navigation.planner().xy_trajectory_duration_s(), expected_global.xy_trajectory_duration_s());
 }
 
 TEST(NavigationV3Test, SuccessfulThrowReturnsAndCompletesLandingWithoutAGcsReturnCommand)
@@ -231,17 +367,14 @@ TEST(NavigationV3Test, SuccessfulThrowReturnsAndCompletesLandingWithoutAGcsRetur
   double now = 0.0;
   advance_to_b(navigation, input, now);
 
-  for (int sample = 0; sample < 3; ++sample) {
-    input.now = now;
-    input.events = {car_status_event(0.15, 0.0, now)};
-    const auto decision = navigation.update(input);
-    follow_planner(navigation, input);
-    now += input.dt;
-    if (sample == 2) {
-      EXPECT_EQ(decision.phase, "throwing");
-      EXPECT_TRUE(decision.release_gripper);
-    }
-  }
+  input.now = now;
+  input.events = {car_status_event(0.15, 0.0, now)};
+  const auto throw_decision = navigation.update(input);
+  EXPECT_EQ(throw_decision.phase, "throwing");
+  EXPECT_TRUE(throw_decision.release_gripper);
+  EXPECT_EQ(throw_decision.control.target_samples, 0);
+  EXPECT_FALSE(throw_decision.control.predicted_intercept_seconds);
+  now += input.dt;
 
   input.now = now;
   input.events.clear();
@@ -286,6 +419,152 @@ TEST(NavigationV3Test, SuccessfulThrowReturnsAndCompletesLandingWithoutAGcsRetur
   const auto completed = navigation.update(input);
   EXPECT_EQ(completed.phase, "manual");
   EXPECT_TRUE(has_message(completed, MessageType::ok_down));
+}
+
+TEST(NavigationV3Test, NewCarStatusImmediatelyUpdatesRawVehicleCenterTarget)
+{
+  auto safety = intercept_safety();
+  MissionConfig mission;
+  mission.height_stable_seconds = 0.05;
+  Navigation navigation(safety, mission);
+  auto input = base_input(0.0);
+  input.dt = 0.05;
+  double now = 0.0;
+  advance_to_b(navigation, input, now);
+
+  const double uav_x = input.telemetry.local_x_m;
+  const double uav_y = input.telemetry.local_y_m;
+  const double yaw = 0.4;
+  input.telemetry.orientation = {0.0, 0.0, std::sin(yaw / 2.0), std::cos(yaw / 2.0)};
+  const double first_distance = 1.0;
+  const double first_bearing = 0.2;
+  input.now = now;
+  input.events = {car_status_event(first_distance, first_bearing, now)};
+  const auto first = navigation.update(input);
+  const double first_x = uav_x + first_distance * std::cos(yaw + first_bearing);
+  const double first_y = uav_y + first_distance * std::sin(yaw + first_bearing);
+  EXPECT_EQ(first.phase, "waiting_target");
+  EXPECT_NEAR(navigation.planner().target_x_m(), first_x, 1e-9);
+  EXPECT_NEAR(navigation.planner().target_y_m(), first_y, 1e-9);
+
+  const double second_distance = 2.0;
+  const double second_bearing = 2.4;
+  now += input.dt;
+  input.now = now;
+  input.events = {car_status_event(second_distance, second_bearing, now)};
+  const auto second = navigation.update(input);
+  const double second_x = uav_x + second_distance * std::cos(yaw + second_bearing);
+  const double second_y = uav_y + second_distance * std::sin(yaw + second_bearing);
+  EXPECT_EQ(second.phase, "waiting_target");
+  EXPECT_TRUE(second.rejections.empty());
+  EXPECT_NEAR(navigation.planner().target_x_m(), second_x, 1e-9);
+  EXPECT_NEAR(navigation.planner().target_y_m(), second_y, 1e-9);
+  EXPECT_EQ(second.control.target_samples, 0);
+  EXPECT_FALSE(second.control.predicted_intercept_seconds);
+}
+
+TEST(NavigationV3Test, RawDistanceBelowThrowThresholdImmediatelyReleases)
+{
+  auto safety = intercept_safety();
+  MissionConfig mission;
+  mission.height_stable_seconds = 0.05;
+  Navigation navigation(safety, mission);
+  auto input = base_input(0.0);
+  input.dt = 0.05;
+  double now = 0.0;
+  advance_to_b(navigation, input, now);
+
+  input.now = now;
+  input.events = {car_status_event(mission.throw_distance_m - 0.01, 0.0, now)};
+  const auto decision = navigation.update(input);
+  EXPECT_EQ(decision.phase, "throwing");
+  EXPECT_TRUE(decision.release_gripper);
+}
+
+TEST(NavigationV3Test, LcpFailureCancelsSameCycleRawReleaseAndEntersHold)
+{
+  auto safety = intercept_safety();
+  MissionConfig mission;
+  mission.height_stable_seconds = 0.05;
+  Navigation navigation(safety, mission);
+  auto input = base_input(0.0);
+  input.dt = 0.05;
+  double now = 0.0;
+  advance_to_b(navigation, input, now);
+
+  input.now = now;
+  input.lcp_healthy = false;
+  input.events = {car_status_event(0.15, 0.0, now)};
+  const auto decision = navigation.update(input);
+  EXPECT_EQ(decision.phase, "lcp_hold");
+  EXPECT_FALSE(decision.release_gripper);
+  EXPECT_TRUE(decision.control.mission_paused);
+  EXPECT_EQ(decision.control.hold_reason, "lcp_unhealthy");
+}
+
+TEST(NavigationV3Test, ThrowDistanceBoundaryDoesNotRelease)
+{
+  auto safety = intercept_safety();
+  MissionConfig mission;
+  mission.height_stable_seconds = 0.05;
+  Navigation navigation(safety, mission);
+  auto input = base_input(0.0);
+  input.dt = 0.05;
+  double now = 0.0;
+  advance_to_b(navigation, input, now);
+
+  input.now = now;
+  input.events = {car_status_event(mission.throw_distance_m, 1.2, now)};
+  const auto decision = navigation.update(input);
+  EXPECT_EQ(decision.phase, "waiting_target");
+  EXPECT_FALSE(decision.release_gripper);
+  EXPECT_EQ(decision.control.target_samples, 0);
+  EXPECT_FALSE(decision.control.predicted_intercept_seconds);
+}
+
+TEST(NavigationV3Test, TrackingRadiusViolationStillEntersLcpHold)
+{
+  auto safety = intercept_safety();
+  MissionConfig mission;
+  mission.height_stable_seconds = 0.05;
+  Navigation navigation(safety, mission);
+  auto input = base_input(0.0);
+  input.dt = 0.05;
+  double now = 0.0;
+  advance_to_b(navigation, input, now);
+
+  input.now = now;
+  input.events = {car_status_event(5.0, std::acos(-1.0) / 2.0, now)};
+  const auto decision = navigation.update(input);
+  EXPECT_EQ(decision.phase, "lcp_hold");
+  EXPECT_FALSE(decision.release_gripper);
+  EXPECT_TRUE(decision.control.mission_paused);
+  ASSERT_FALSE(decision.rejections.empty());
+  EXPECT_EQ(decision.rejections.back(), "car_status_target_outside_tracking_radius");
+}
+
+TEST(NavigationV3Test, CarStatusTimeoutStillEntersLcpHold)
+{
+  auto safety = intercept_safety();
+  MissionConfig mission;
+  mission.height_stable_seconds = 0.05;
+  Navigation navigation(safety, mission);
+  auto input = base_input(0.0);
+  input.dt = 0.10;
+  double now = 0.0;
+  advance_to_b(navigation, input, now);
+
+  input.now = now;
+  input.events = {car_status_event(1.0, 0.0, now)};
+  const auto observed = navigation.update(input);
+  EXPECT_EQ(observed.phase, "waiting_target");
+  now += mission.car_status_timeout_s + input.dt;
+  input.now = now;
+  input.events.clear();
+  const auto timed_out = navigation.update(input);
+  EXPECT_EQ(timed_out.phase, "lcp_hold");
+  EXPECT_TRUE(timed_out.control.mission_paused);
+  EXPECT_EQ(timed_out.control.hold_reason, "car_status_timeout");
 }
 
 }  // namespace

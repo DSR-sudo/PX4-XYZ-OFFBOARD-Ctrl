@@ -604,11 +604,16 @@ TEST(ApplicationNodeSafetyParameterTest, YamlParametersOverrideCliDefaultsAtStar
   const auto node = std::make_shared<ApplicationNode>(application_test_options(), cli_config, options);
 
   EXPECT_DOUBLE_EQ(node->safety_config().max_flight_seconds, 120.0);
-  EXPECT_DOUBLE_EQ(node->safety_config().target_xy_max_speed_m_s, 0.25);
+  EXPECT_DOUBLE_EQ(node->safety_config().target_xy_max_speed_m_s, 10.0);
   EXPECT_DOUBLE_EQ(node->get_parameter("udp.max_tracking_distance_m").as_double(), 5.0);
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.b_right_m").as_double(), 0.375);
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.b_forward_m").as_double(), 2.375);
+  EXPECT_DOUBLE_EQ(node->get_parameter("mission.b_arrival_speed_m_s").as_double(), 0.05);
+  EXPECT_DOUBLE_EQ(node->get_parameter("mission.car_tracking_max_speed_m_s").as_double(), 10.0);
+  EXPECT_DOUBLE_EQ(node->get_parameter("mission.car_tracking_max_accel_m_s2").as_double(), 5.0);
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.throw_distance_m").as_double(), 0.2);
+  EXPECT_DOUBLE_EQ(node->get_parameter("mission.throw_bearing_rad").as_double(), 1.57079632679);
+  EXPECT_DOUBLE_EQ(node->get_parameter("mission.throw_bearing_tolerance_rad").as_double(), 0.08);
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.filter_measurement_noise_m").as_double(), 0.05);
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.filter_acceleration_noise_m_s2").as_double(), 0.50);
   EXPECT_EQ(node->get_parameter("mission.filter_min_samples").as_int(), 3);
@@ -622,6 +627,18 @@ TEST(ApplicationNodeSafetyParameterTest, YamlParametersOverrideCliDefaultsAtStar
   EXPECT_DOUBLE_EQ(node->get_parameter("gripper_pwm.closed_duty_cycle").as_double(), 4.0);
   EXPECT_DOUBLE_EQ(node->get_parameter("gripper_pwm.open_duty_cycle").as_double(), 7.0);
   EXPECT_EQ(node->get_parameter("gripper_pwm.open_hold_ms").as_int(), 500);
+}
+
+TEST(ApplicationNodeMissionParameterTest, CarTrackingLimitsInheritEffectiveSafetyDefaults)
+{
+  SafetyConfig cli_config;
+  cli_config.target_xy_max_speed_m_s = 0.70;
+  cli_config.target_xy_max_accel_m_s2 = 1.30;
+  const auto node = std::make_shared<ApplicationNode>(
+    application_test_options(), cli_config, application_test_node_options());
+
+  EXPECT_DOUBLE_EQ(node->get_parameter("mission.car_tracking_max_speed_m_s").as_double(), 0.70);
+  EXPECT_DOUBLE_EQ(node->get_parameter("mission.car_tracking_max_accel_m_s2").as_double(), 1.30);
 }
 
 TEST(ApplicationNodeSafetyParameterTest, InvalidStartupOverrideIsRejected)

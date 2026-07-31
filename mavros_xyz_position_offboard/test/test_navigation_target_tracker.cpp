@@ -1,4 +1,6 @@
 #include <cmath>
+#include <limits>
+#include <stdexcept>
 
 #include <gtest/gtest.h>
 
@@ -9,6 +11,21 @@ namespace
 {
 using mavros_xyz_position_offboard::navigation::MissionConfig;
 using mavros_xyz_position_offboard::navigation::TargetTracker;
+
+TEST(MissionConfigTest, RejectsInvalidCarTrackingLimits)
+{
+  for (const double value : {
+      0.0, -1.0, std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()}) {
+    MissionConfig invalid_speed;
+    invalid_speed.car_tracking_max_speed_m_s = value;
+    EXPECT_THROW(invalid_speed.validate(), std::invalid_argument);
+
+    MissionConfig invalid_accel;
+    invalid_accel.car_tracking_max_accel_m_s2 = value;
+    EXPECT_THROW(invalid_accel.validate(), std::invalid_argument);
+  }
+}
 
 TEST(TargetTrackerTest, FiltersNoisyConstantVelocityAndFindsFirstIntercept)
 {

@@ -172,8 +172,18 @@ navigation::MissionConfig ApplicationNode::load_mission_config()
     "mission.height_stable_seconds", value.height_stable_seconds);
   value.b_right_m = declare_parameter<double>("mission.b_right_m", value.b_right_m);
   value.b_forward_m = declare_parameter<double>("mission.b_forward_m", value.b_forward_m);
+  value.b_arrival_speed_m_s = declare_parameter<double>(
+    "mission.b_arrival_speed_m_s", value.b_arrival_speed_m_s);
+  value.car_tracking_max_speed_m_s = declare_parameter<double>(
+    "mission.car_tracking_max_speed_m_s", config_.target_xy_max_speed_m_s);
+  value.car_tracking_max_accel_m_s2 = declare_parameter<double>(
+    "mission.car_tracking_max_accel_m_s2", config_.target_xy_max_accel_m_s2);
   value.throw_distance_m = declare_parameter<double>(
     "mission.throw_distance_m", value.throw_distance_m);
+  value.throw_bearing_rad = declare_parameter<double>(
+    "mission.throw_bearing_rad", value.throw_bearing_rad);
+  value.throw_bearing_tolerance_rad = declare_parameter<double>(
+    "mission.throw_bearing_tolerance_rad", value.throw_bearing_tolerance_rad);
   value.filter_measurement_noise_m = declare_parameter<double>(
     "mission.filter_measurement_noise_m", value.filter_measurement_noise_m);
   value.filter_acceleration_noise_m_s2 = declare_parameter<double>(

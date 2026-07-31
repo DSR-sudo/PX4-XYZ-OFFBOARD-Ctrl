@@ -7,7 +7,7 @@ namespace mavros_xyz_position_offboard::navigation
 {
 
 Navigation::Navigation(const common::SafetyConfig & config, MissionConfig mission)
-: config_(config), mission_(std::move(mission)), planner_(config), target_tracker_(mission_)
+: config_(config), mission_(std::move(mission)), planner_(config)
 {
   mission_.validate();
 }
@@ -15,7 +15,6 @@ Navigation::Navigation(const common::SafetyConfig & config, MissionConfig missio
 void Navigation::reset()
 {
   planner_.reset();
-  target_tracker_.reset();
   phase_ = "waiting_preflight";
   phase_started_at_ = 0.0;
   flight_started_at_.reset();
@@ -26,13 +25,6 @@ void Navigation::reset()
   landing_reason_.clear();
   pending_release_gripper_ = false;
   last_car_status_at_.reset();
-  intercept_due_at_.reset();
-  cardinal_alignment_achieved_ = false;
-  last_own_pose_at_.reset();
-  last_own_x_m_.reset();
-  last_own_y_m_.reset();
-  own_vx_m_s_ = 0.0;
-  own_vy_m_s_ = 0.0;
 }
 
 void Navigation::transition(const std::string & phase, double now)

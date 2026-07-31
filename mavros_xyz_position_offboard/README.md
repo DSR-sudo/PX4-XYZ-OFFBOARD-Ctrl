@@ -21,8 +21,8 @@ Initialization -- health/Z ----------+
   IP/port allowlist and the complete Plan1 object shape, and sends only to the fixed remote.
 - `Navigation` is a pure C++ state machine. It keeps an immutable ARM-time `origin`, a task
   `mission_goal`, the published `commanded_setpoint`, and a separate temporary `hold_setpoint`.
-  It plans the bounded right shift and straight search from the ARM-time heading, then converts
-  each GCS visual relative measurement into an ENU target without turning toward the vehicle.
+  It flies to the fixed local ENU B point, then converts each GCS visual relative measurement into
+  a vehicle-center ENU target without turning toward the vehicle.
 - `Offboard` sends internal ENU position/yaw setpoints unchanged to MAVROS `PositionTarget`.
   MAVROS 2.14 `SetpointRawPlugin::local_cb()` converts the ROS ENU input to PX4 `LOCAL_NED`;
   the application must not convert it a second time.
@@ -37,7 +37,7 @@ Mission order:
 ```text
 waiting_preflight -> ground-hold warmup -> ok_wait -> waiting_run_plan1
 -> run_plan1 -> OFFBOARD/ARM -> latch origin and climb 1.5 m -> height_stabilizing (3 s)
--> transit_to_b -> ok_b -> waiting_target -> cardinal_alignment -> final_intercept
+-> transit_to_b -> ok_b -> waiting_target (vehicle-center tracking) -> throwing
 -> PWM release -> ok_throw -> returning -> Init XY + yaw 0 -> ok_return
 -> downing -> ok_downing -> descend Init Z -> Disarm -> MANUAL -> ok_down
 ```
@@ -63,7 +63,18 @@ measurements after acknowledging `ok_b`:
 ```
 
 `distance_m` is in `[0, udp.max_tracking_distance_m]` (default `5.0`) and `bearing_rad` is in
-`[-pi, pi]`; zero means straight ahead and positive angles are counterclockwise in the body frame.
+`[-pi, pi]`; it is the target line-of-sight angle relative to the UAV body: zero means straight
+ahead, `+pi/2` is the UAV's left, and `+/-pi` is directly behind.
+Every accepted `car_status` is converted with the current measured yaw and immediately becomes the
+vehicle-center XY target. The mission altitude and ARM-time yaw are preserved, and each new
+observation replans the XY target in place with the two-dimensional resultant limits
+`mission.car_tracking_max_speed_m_s` (default `10.0 m/s`) and
+`mission.car_tracking_max_accel_m_s2` (default `5.0 m/s2`). If either parameter is omitted, its
+effective `safety.target_xy_*` value is inherited. B-point, return, and landing trajectories keep
+using the global `safety.target_xy_*` limits. When the latest fresh raw `distance_m <
+mission.throw_distance_m` (default `0.20 m`), the UAV immediately enters `throwing`; equality does
+not release. `throw_bearing_rad` and `throw_bearing_tolerance_rad` remain accepted compatibility
+parameters but do not participate in target planning or release.
 
 UAV discrete events are `ok_wait`, `ok_b`, `ok_throw`, `ok_return`, `ok_downing`, and `ok_down`.
 They are ordered in an ACK queue. The UAV sends and retransmits only the earliest unsatisfied event
@@ -71,22 +82,21 @@ every `udp.event_retry_period_s` (default `0.5`); `{"header":"ack","data":{}}` r
 head. `xyzstatus` is continuous and is neither queued nor acknowledged. Legacy `ok_height`,
 `go_ahead_ok`, `match_car_ok`, and `b_ok` are rejected as `legacy_header_rejected`.
 
-At ARM, the UAV latches Init and initial yaw `psi0`. After the 3-second stability gate it holds
-the climb altitude and flies directly to B:
+At ARM, the UAV latches Init and initial yaw for height/orientation control. After the 3-second
+stability gate it holds the climb altitude and flies directly to the fixed local ENU B point:
 
 ```text
-xB = x0 + 2.375*cos(psi0) + 0.375*sin(psi0)
-yB = y0 + 2.375*sin(psi0) - 0.375*cos(psi0)
+xB = mission.b_right_m   # default 0.375 m; historical parameter name, ENU X
+yB = mission.b_forward_m # default 2.375 m; historical parameter name, ENU Y
 ```
 
-After the actual B position is within tolerance, `ok_b` is emitted once. Every `car_status` uses
-the UAV receipt time and measured yaw to form an ENU target observation. A 2D constant-velocity
-Kalman tracker uses 0.05 m measurement noise, 0.50 m/s2 process acceleration noise, at least
-three observations, and a 2-second prediction window. Before the final 0.5 seconds, the command
-is shaped through the closest 0/90/180/270 degree relative direction without rotating the yaw. In
-the final window it directly targets the prediction. Releasing requires predicted separation at
-or below 0.20 m. A stale, outlier, or out-of-radius observation cancels release timing and enters
-the existing safe hold.
+The XY move is one two-dimensional trajectory. `ok_b` is emitted once only after that trajectory
+is complete, measured XYZ is within `mission.target_tolerance_m`, and measured horizontal and
+vertical speeds are both no greater than `mission.b_arrival_speed_m_s` (default `0.05 m/s`). Every
+accepted `car_status` uses the UAV receipt time and measured yaw to form the raw ENU vehicle-center
+target. A large in-radius jump is accepted and replans immediately; the active Navigation path does
+not use Kalman samples, innovation rejection, cardinal shaping, or predicted intercept timing.
+Stale or out-of-radius observations still enter the existing safe LCP hold.
 
 On a successful gripper cycle, `ok_throw` is queued and the UAV immediately returns without a GCS
 command. It emits `ok_return` only after Init XY and yaw zero are measured, then queues
@@ -132,7 +142,10 @@ loopback. No automated test drives a real PWM pin.
 
 Load [config/udp_ground_station.yaml](config/udp_ground_station.yaml) with ROS parameters. It
 contains the UDP allowlist/fixed remote, the `mission.takeoff_height_m: 1.5` and
-`mission.height_stable_seconds: 3.0` gate, B-point, Kalman, intercept, Z, and PWM defaults. The
+`mission.height_stable_seconds: 3.0` gate, B-point, vehicle-center tracking, retained Kalman,
+Z, and PWM defaults. The vehicle-center speed and acceleration limits are explicitly set to
+`10.0 m/s` and `5.0 m/s2`; without those mission entries, the node inherits the effective safety
+XY limits. The
 3-second timer accumulates only while measured XYZ remains within `--target-tolerance`; leaving
 the tolerance restarts the timer.
 
@@ -176,7 +189,7 @@ The deployed YAML enables the calibrated SG90 setup: BCM GPIO18 (physical pin 12
 closed, 7% open, and a 500 ms open hold. Before flight, verify this on a no-prop bench with the
 signal wire connected to GPIO18 and ensure the launch user can access the RP1 gpiochip through the
 `dialout` group. If RP1 discovery, GPIO claim, or initial 4% PWM setup fails, node startup fails.
-At the predicted 0.20 m intercept gate, this mission opens the gripper. Successful completion of
+At the raw 0.20 m vehicle-center gate, this mission opens the gripper. Successful completion of
 its configured open/close cycle emits `ok_throw` and immediately begins autonomous return.
 
 Install the C++ GPIO dependency on deployment images with `sudo apt install liblgpio-dev`.

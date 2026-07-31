@@ -8,7 +8,7 @@
 2.14.0 和 MTF02P 光流/测距。实际运行前必须重新确认硬件、话题来源、PX4 参数和坐标系；
 本文档中的设备型号和命令不构成自动识别或飞行授权。
 
-Plan1 B 点拦截协议位于
+Plan1 B 点车辆中心实时追踪协议位于
 [`docs/plan1_intercept_udp_protocol.md`](docs/plan1_intercept_udp_protocol.md)。该版本不提供旧的
 右移、GCS 前飞放行、匹配确认或返航命令兼容回退。
 
@@ -24,7 +24,7 @@ Plan1 B 点拦截协议位于
   状态已经改变。
 - 通过固定远端、IP/端口白名单的 UDP 发送 Plan1 JSON，并拒绝错误方向、重复键、未知字段、
   非 UTF-8 或无效数值的入站报文。
-- 按阶段执行“B 点直达、视觉卡尔曼预测投放、自主返航、下降、普通解锁、`MANUAL`”任务流程。
+- 按阶段执行“B 点直达、车辆中心实时闭环追踪投放、自主返航、下降、普通解锁、`MANUAL`”任务流程。
 
 ## 内部架构
 
@@ -66,12 +66,20 @@ UAV 读取 `udp.bind_*`、`udp.remote_*`、`udp.whitelist_*` 参数。入站数�
 `udp.event_retry_period_s`（默认 `0.5 s`）重发，直至收到 `{"header":"ack","data":{}}`。
 `xyzstatus` 不进入该队列，不能 ACK。
 
-到达高度并连续稳定 3 s 后，UAV 从 ARM 锁存的 Init 与初始偏航直达 B 点，保持高度和初始偏航。
-到 B 点并实测落入容差后仅发送一次 `ok_b`。GCS ACK 后开始特定图形识别，并持续发送
-`car_status`。UAV 用收包时间和实测 yaw 进行 ENU 转换，以二维匀速卡尔曼滤波预测首次进入
-0.20 m 投放距离的时刻。预测窗口大于 0.5 s 时只整形平移到最近直角相对方位，不转动机头；最后
-0.5 s 直接拦截预测目标。旧 `ok_height`、`go_ahead_ok`、`match_car_ok` 和 `b_ok` 一律拒绝并
-记录 `legacy_header_rejected`。
+到达高度并连续稳定 3 s 后，UAV 保持高度和初始偏航，通过一条二维轨迹直达固定本地 ENU
+B 点 `(b_right_m, b_forward_m)`，与 ARM 原点和初始 yaw 无关。只有轨迹规划完成、实测 XYZ
+落入容差且实测水平合速度和垂直速度都不超过 `mission.b_arrival_speed_m_s`（默认 `0.05 m/s`）
+时才发送一次 `ok_b`。GCS ACK 后开始特定图形识别，并持续发送
+`car_status`。UAV 用收包时间和实测 yaw 进行 ENU 转换，每个通过协议、姿态和 Init 半径
+检查的观测都会立即把转换后的 `car_x/car_y` 写入 `mission_goal` 并刷新 XY 目标。
+车辆中心轨迹使用 `mission.car_tracking_max_speed_m_s`（默认 `10.0 m/s`）和
+`mission.car_tracking_max_accel_m_s2`（默认 `5.0 m/s²`）限制整个二维向量的合速度与合加速度；
+未显式配置时，这两个参数继承当前有效的 `safety.target_xy_max_speed_m_s` 和
+`safety.target_xy_max_accel_m_s2`。B 点、返航和降落继续使用全局 `safety.target_xy_*` 限制。
+`bearing_rad` 只用于坐标转换，不参与侧向对齐或释放判断；最新有效 raw `distance_m < 0.20 m`
+时立即投放，`distance_m == 0.20 m` 不触发投放。Kalman 参数和实现仍保留用于独立测试与审计兼容，
+但实时任务路径不调用它。
+旧 `ok_height`、`go_ahead_ok`、`match_car_ok` 和 `b_ok` 一律拒绝并记录 `legacy_header_rejected`。
 
 ## 任务状态机
 
@@ -83,15 +91,14 @@ UAV 读取 `udp.bind_*`、`udp.remote_*`、`udp.whitelist_*` 参数。入站数�
   -> 等待 run_plan1
   -> 设定点预热 -> OFFBOARD -> 普通 ARM
   -> 相对 Init 爬升 1.5 m、连续稳定 3 s
-  -> B 点直达 -> ok_b -> 等待连续 car_status
-  -> 直角方位整形 -> 最终预测拦截 -> PWM 投放 -> ok_throw
+  -> B 点直达 -> ok_b -> 车辆中心实时闭环追踪 -> raw distance < 0.20 m -> PWM 投放 -> ok_throw
   -> 自主返航 Init XY、世界偏航 0 -> ok_return
   -> 开始下降 -> ok_downing
   -> 着陆 -> 普通 Disarm -> MANUAL -> ok_down
 ```
 
 `Navigation` 对 XY 和 Z 使用五次多项式轨迹，并通过延长轨迹时间限制速度和加速度。LCP 在
-高度稳定、B 点、拦截、投放或返航阶段失效时，任务会冻结可靠位置；超过保持超时、飞控模式丢失、
+高度稳定、B 点、车辆追踪、投放或返航阶段失效时，任务会冻结可靠位置；超过保持超时、飞控模式丢失、
 飞行健康失败或最大飞行时间后，进入安全降落路径。
 
 `ok_down` 的语义是已着陆、PX4 已普通解锁（Disarm）且已确认 `MANUAL`；不会关闭 Raspberry Pi

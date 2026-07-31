@@ -5,7 +5,6 @@
 
 #include "mavros_xyz_position_offboard/navigation/mission_config.hpp"
 #include "mavros_xyz_position_offboard/navigation/navigation_types.hpp"
-#include "mavros_xyz_position_offboard/navigation/target_tracker.hpp"
 #include "mavros_xyz_position_offboard/navigation/trajectory_planner.hpp"
 
 namespace mavros_xyz_position_offboard::navigation
@@ -65,19 +64,18 @@ private:
   /// 判断实测 XYZ 是否位于稳定阶段要求的位置容差内。
   bool stable_at(
     const common::Telemetry & telemetry, const common::PositionSetpoint & target) const;
+  /// 判断 B 点实测 XYZ 位置和水平/垂直速度是否都满足到达门限。
+  bool b_arrival_stable(
+    const common::Telemetry & telemetry, const common::PositionSetpoint & target) const;
   /// 判断实测偏航角是否已接近目标世界航向。
   bool actual_yaw_within(
     const common::Telemetry & telemetry, double yaw_rad, double tolerance_rad) const;
-  /// 从锁存原点和初始航向规划到 B 点的一次性斜向轨迹。
+  /// 从当前爬升目标规划到固定本地 ENU B 点的一次性二维轨迹。
   void begin_transit_to_b();
-  /// 将车体相对视觉测量转换为 ENU，更新滤波器并重规划拦截轨迹。
+  /// 将车体相对视觉测量转换为 ENU，并把车辆中心作为当前 XY 目标。
   bool apply_car_status(const NavigationInput & input, const communication::CarStatus & status);
   /// 判断最近一次有效视觉测量在当前控制周期仍然新鲜。
   bool car_status_fresh(double now) const;
-  /// 使用最新本地位姿更新 UAV 水平速度估计。
-  void update_own_velocity(const NavigationInput & input);
-  /// 使用卡尔曼预测重规划最近 90 度方位或最终直接拦截目标。
-  void plan_intercept(const NavigationInput & input, double bearing_rad);
   /// 取消投掷计时并开始从当前高度返回锁存原点。
   void begin_return(double now);
   /// 判断阶段是否必须因 LCP 不健康冻结位置。
@@ -86,7 +84,6 @@ private:
   const common::SafetyConfig & config_;
   const MissionConfig mission_;
   TrajectoryPlanner planner_;
-  TargetTracker target_tracker_;
   std::string phase_{"waiting_preflight"};
   double phase_started_at_{0.0};
   std::optional<double> flight_started_at_{};
@@ -97,13 +94,6 @@ private:
   std::string landing_reason_{};
   bool pending_release_gripper_{false};
   std::optional<double> last_car_status_at_{};
-  std::optional<double> intercept_due_at_{};
-  bool cardinal_alignment_achieved_{false};
-  std::optional<double> last_own_pose_at_{};
-  std::optional<double> last_own_x_m_{};
-  std::optional<double> last_own_y_m_{};
-  double own_vx_m_s_{0.0};
-  double own_vy_m_s_{0.0};
 };
 
 }  // namespace mavros_xyz_position_offboard::navigation

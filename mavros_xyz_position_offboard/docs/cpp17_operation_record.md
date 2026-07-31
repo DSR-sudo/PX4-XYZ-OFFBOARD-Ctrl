@@ -1,4 +1,4 @@
-# C++17 Operation Record: Plan1 Intercept
+# C++17 Operation Record: Plan1 Vehicle-Center Tracking
 
 ## Components
 
@@ -9,11 +9,11 @@
 | `navigation/navigation.hpp` | Compatibility aggregate header and ROS-free mission state-machine coordinator. |
 | `navigation/navigation.cpp` | Navigation object lifecycle, mission-goal normalization, and planner orchestration. |
 | `navigation/navigation_state_machine.cpp` | Phase transitions, protocol event dispatch, health gates, and cycle decisions. |
-| `navigation/navigation_mission.cpp` | B-point planning, own-velocity estimation, visual target conversion, and intercept/return planning. |
+| `navigation/navigation_mission.cpp` | B-point planning, raw visual target conversion, and return planning. |
 | `navigation/navigation_safety.cpp` | Position/yaw stability checks, LCP hold/resume, and landing safety decisions. |
 | `navigation/mission_config.*` | Mission defaults and configuration validation. |
 | `navigation/trajectory_planner.*` | Bounded quintic XYZ+yaw trajectories and continuous replanning. |
-| `navigation/target_tracker.*` | 2D constant-velocity Kalman filtering and intercept-time calculation. |
+| `navigation/target_tracker.*` | Retained standalone 2D constant-velocity Kalman filtering and intercept-time tests; not used by active Navigation tracking. |
 | `navigation/navigation_types.*` | Controller inputs, auditable control state/decisions, and `control_json`. |
 | `gripper/` | Non-blocking SG90 adapter using `lgpio` and dynamic Pi 5 RP1 gpiochip discovery. |
 | `initialization/` | MAVROS telemetry, preflight/flight health, LCP start, RangeGuard, and ROS source timestamps. |
@@ -35,40 +35,55 @@ writes audit status. Every `/lcp/debug` sample is separately sent as one unqueue
 | `udp.max_tracking_distance_m` | `5.0` | Maximum accepted `car_status.distance_m`. |
 | `mission.takeoff_height_m` | `1.5` | Relative MAVROS local-Z climb from Init. |
 | `mission.height_stable_seconds` | `3.0` | Required continuous XYZ stability before B-point transit. |
-| `mission.b_right_m` | `0.375` | B-point right component in the initial body frame. |
-| `mission.b_forward_m` | `2.375` | B-point forward component in the initial body frame. |
-| `mission.throw_distance_m` | `0.20` | Predicted separation that permits release. |
-| `mission.filter_measurement_noise_m` | `0.05` | Target position measurement standard deviation. |
-| `mission.filter_acceleration_noise_m_s2` | `0.50` | Constant-velocity filter acceleration process-noise standard deviation. |
-| `mission.filter_min_samples` | `3` | Valid observations required before prediction. |
-| `mission.prediction_horizon_s` | `2.0` | Maximum look-ahead for predicted intercept. |
-| `mission.cardinal_tolerance_deg` | `5.0` | Tolerance around nearest relative 0/90/180/270 degree direction. |
-| `mission.final_intercept_seconds` | `0.5` | Window where cardinal translation shaping is removed. |
+| `mission.b_right_m` | `0.375` | Fixed local ENU X coordinate of B; historical parameter name retained for compatibility. |
+| `mission.b_forward_m` | `2.375` | Fixed local ENU Y coordinate of B; historical parameter name retained for compatibility. |
+| `mission.b_arrival_speed_m_s` | `0.05` | Maximum measured horizontal resultant speed and vertical speed for B arrival. |
+| `mission.car_tracking_max_speed_m_s` | `10.0` | Maximum resultant XY speed for `car_status` vehicle-center tracking; inherits `safety.target_xy_max_speed_m_s` when omitted. |
+| `mission.car_tracking_max_accel_m_s2` | `5.0` | Maximum resultant XY acceleration for `car_status` vehicle-center tracking; inherits `safety.target_xy_max_accel_m_s2` when omitted. |
+| `mission.throw_distance_m` | `0.20` | Strict raw distance threshold for immediate release. |
+| `mission.throw_bearing_rad` | `1.57079632679` | Retained compatibility parameter; unused by vehicle-center tracking. |
+| `mission.throw_bearing_tolerance_rad` | `0.08` | Retained compatibility parameter; unused by vehicle-center tracking. |
+| `mission.filter_measurement_noise_m` | `0.05` | Retained standalone Kalman measurement-noise parameter. |
+| `mission.filter_acceleration_noise_m_s2` | `0.50` | Retained standalone Kalman acceleration-noise parameter. |
+| `mission.filter_min_samples` | `3` | Retained standalone Kalman sample-count parameter. |
+| `mission.prediction_horizon_s` | `2.0` | Retained standalone Kalman query horizon. |
+| `mission.cardinal_tolerance_deg` | `5.0` | Retained historical parameter; unused by active tracking. |
+| `mission.final_intercept_seconds` | `0.5` | Retained historical parameter; unused by active tracking. |
 | `mission.car_status_timeout_s` | `2.0` | Freshness bound before safe visual hold. |
 | `mission.max_tracking_radius_m` | `5.0` | Maximum target radius from Init XY. |
 
-`car_status` is the only nonempty inbound message. Its `bearing_rad` is relative to measured UAV
-yaw, zero is forward, and positive is counter-clockwise. `Navigation` converts it at receipt to
-ENU, filters `[target_x, target_y, target_vx, target_vy]`, and computes the first predicted time
-within `throw_distance_m` using measured UAV horizontal velocity.
+`car_status` is the only nonempty inbound message. Its `bearing_rad` is the target line-of-sight
+angle relative to measured UAV yaw: zero is forward, `+pi/2` is left, and `+/-pi` is rear.
+`Navigation` converts it at receipt to ENU using `uav_yaw + bearing_rad`. Every valid observation
+sets the raw `car_x/car_y` as both `mission_goal` XY and the planner XY target while preserving the
+current task altitude and ARM-time yaw. The vehicle-center planner applies the independent
+`mission.car_tracking_max_speed_m_s` and `mission.car_tracking_max_accel_m_s2` limits to the
+two-dimensional resultant vector. B-point, return, and landing planning continue to use the global
+`safety.target_xy_*` limits. The active path does not filter, reject innovations, shape cardinal
+motion, or calculate predicted intercept time. `target_samples` remains `0` and
+`predicted_intercept_seconds` remains `null` in audit JSON. Strict raw `distance_m < 0.20 m` enters
+`throwing` immediately; equality does not.
 
 ## Safety And Completion
 
-The normal flight phases are `height_stabilizing`, `transit_to_b`, `waiting_target`,
-`cardinal_alignment`, `final_intercept`, `throwing`, `returning`, `downing`, and `manual`.
+The normal flight phases are `height_stabilizing`, `transit_to_b`, `waiting_target`, `throwing`,
+`returning`, `downing`, and `manual`.
 Additional preflight, OFFBOARD/ARM, LCP-hold, landing, Disarm, and MANUAL-request phases retain
 the established safety boundaries.
 
-At ARM, Init and `psi0` are latched. B is planned once at the climb altitude and initial yaw:
+At ARM, Init and `psi0` are latched. B is planned once at the climb altitude and initial yaw,
+but its XY coordinates are fixed local ENU values:
 
 ```text
-xB = x0 + 2.375*cos(psi0) + 0.375*sin(psi0)
-yB = y0 + 2.375*sin(psi0) - 0.375*cos(psi0)
+xB = mission.b_right_m
+yB = mission.b_forward_m
 ```
 
-Only trajectory completion plus measured B tolerance emits `ok_b`. A stale visual sample, target
-outside the Init-radius bound, innovation outlier, or unavailable intercept clears release timing
-and freezes the safe hold point. Successful PWM release queues `ok_throw` and begins return
+The single `set_target()` call plans the two-dimensional XY move and Z move together; the move is
+not split into forward and right legs. Only trajectory completion, measured B XYZ tolerance, and
+horizontal/vertical measured speeds no greater than `mission.b_arrival_speed_m_s` emit `ok_b`. A stale visual sample or target
+outside the Init-radius bound clears the active target and freezes the safe hold point; in-radius
+target jumps are accepted directly. Successful PWM release queues `ok_throw` and begins return
 without a GCS command. `ok_return` is emitted only at Init XY and yaw zero; `ok_downing` starts
 descent; `ok_down` requires touchdown, confirmed ordinary Disarm, and confirmed `MANUAL`.
 

@@ -19,7 +19,7 @@ struct TargetEstimate
   double vy_m_s{0.0};
 };
 
-/// 不依赖 ROS 的二维常速度目标滤波器，测量与状态均在 ENU 世界系。
+/// 不依赖 ROS 的二维常速度目标滤波器，保留为独立模块和单元测试，测量与状态均在 ENU 世界系。
 class TargetTracker
 {
 public:

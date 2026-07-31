@@ -26,6 +26,9 @@ public:
   void set_xy_target(double x_m, double y_m);
   /// 在调用方给定的水平速度上限内开始 XY 轨迹，仍使用统一加速度约束。
   void set_xy_target_with_max_speed(double x_m, double y_m, double max_speed_m_s);
+  /// 使用调用方给定的二维合速度和合加速度上限开始 XY 轨迹。
+  void set_xy_target_with_limits(
+    double x_m, double y_m, double max_speed_m_s, double max_accel_m_s2);
   /// 以期望到达时间重规划 XY；返回 false 表示安全约束要求更长时间。
   bool set_xy_target_with_arrival_time(double x_m, double y_m, double arrival_seconds);
   /// 将水平设定点立即冻结在指定实测位置。

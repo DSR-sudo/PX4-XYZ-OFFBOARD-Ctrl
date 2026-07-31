@@ -80,7 +80,7 @@ mavros_native_xyz_position:
       # 预检阶段允许的最大垂直速度，单位：米/秒。
       max_preflight_vertical_speed_m_s: 0.20
       # 正常飞行阶段允许的最大水平速度，单位：米/秒。
-      max_flight_horizontal_speed_m_s: 0.50
+      max_flight_horizontal_speed_m_s: 1.0
       # 正常飞行阶段允许的最大垂直速度，单位：米/秒。
       max_flight_vertical_speed_m_s: 0.80
       # 悬停阶段允许相对指令点的最大水平漂移，单位：米。
@@ -113,7 +113,7 @@ mavros_native_xyz_position:
       max_flight_seconds: 120.0
 
       # 认为光流对水平定位有效所需的最小测距高度，单位：米。
-      flow_effective_min_height_m: 0.35
+      flow_effective_min_height_m: 0.15
       # 认为光流对水平定位有效所需的最小质量值。
       flow_effective_min_quality: 20
       # true 表示忽略传感器声明的最小量程，仅使用 configured_min_range_m。
@@ -128,6 +128,8 @@ mavros_native_xyz_position:
       right_shift_m: 0.375
       # 收到地面站 go_ahead_ok 后沿航向直线追踪的最大距离，单位：米。
       forward_distance_m: 5.0
+      # go_ahead_ok 前向搜索的最大水平速度，不能超过 safety.max_flight_horizontal_speed_m_s，单位：米/秒。
+      forward_max_speed_m_s: 0.9
       # 视觉相对目标的期望 XY 到达时间，单位：秒。
       tracking_arrival_seconds: 1.0
       # 允许 match_car_ok 确认投放的最新视觉距离阈值，单位：米。

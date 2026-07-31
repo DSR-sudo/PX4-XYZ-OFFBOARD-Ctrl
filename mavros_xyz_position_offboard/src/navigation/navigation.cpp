@@ -100,7 +100,20 @@ void TrajectoryPlanner::set_xy_target(double x_m, double y_m)
 {
   require_latched("setting an XY target");
   if (!common::finite(x_m) || !common::finite(y_m)) {throw std::invalid_argument("XY target must be finite");}
-  begin_xy_trajectory(x_m, y_m);
+  begin_xy_trajectory(
+    x_m, y_m, std::nullopt, config_.target_xy_max_speed_m_s, config_.target_xy_max_accel_m_s2);
+}
+
+/// 使用调用方提供的速度上限和默认安全加速度约束规划 XY 轨迹。
+void TrajectoryPlanner::set_xy_target_with_max_speed(double x_m, double y_m, double max_speed_m_s)
+{
+  require_latched("setting an XY target with a speed limit");
+  if (!common::finite(x_m) || !common::finite(y_m) || !common::finite(max_speed_m_s) ||
+    max_speed_m_s <= 0.0) {
+    throw std::invalid_argument("XY target and speed limit must be finite and positive");
+  }
+  begin_xy_trajectory(
+    x_m, y_m, std::nullopt, max_speed_m_s, config_.target_xy_max_accel_m_s2);
 }
 
 /// 在不突破既有速度和加速度约束的前提下尝试按指定时长到达 XY 目标。
@@ -112,7 +125,8 @@ bool TrajectoryPlanner::set_xy_target_with_arrival_time(
     arrival_seconds <= 0.0) {
     throw std::invalid_argument("timed XY target and arrival time must be finite and positive");
   }
-  return begin_xy_trajectory(x_m, y_m, arrival_seconds);
+  return begin_xy_trajectory(
+    x_m, y_m, arrival_seconds, config_.target_xy_max_speed_m_s, config_.target_xy_max_accel_m_s2);
 }
 
 /// 立即把水平控制冻结在最新可靠的实测位置。
@@ -191,7 +205,8 @@ void TrajectoryPlanner::begin_z_trajectory(double target)
 
 /// 迭代拉长二维五次轨迹，直到合成速度与加速度满足配置。
 bool TrajectoryPlanner::begin_xy_trajectory(
-  double target_x, double target_y, const std::optional<double> & arrival_seconds)
+  double target_x, double target_y, const std::optional<double> & arrival_seconds,
+  double max_speed_m_s, double max_accel_m_s2)
 {
   const double distance = std::hypot(target_x - x_m_, target_y - y_m_);
   const double speed = std::hypot(xy_velocity_x_m_s_, xy_velocity_y_m_s_);
@@ -203,9 +218,9 @@ bool TrajectoryPlanner::begin_xy_trajectory(
     return true;
   }
   double duration = arrival_seconds.value_or(std::max({0.5,
-    2.0 * distance / config_.target_xy_max_speed_m_s,
-    std::sqrt(6.0 * distance / config_.target_xy_max_accel_m_s2),
-    2.0 * speed / config_.target_xy_max_accel_m_s2}));
+    2.0 * distance / max_speed_m_s,
+    std::sqrt(6.0 * distance / max_accel_m_s2),
+    2.0 * speed / max_accel_m_s2}));
   auto candidate = std::array<Coefficients, 2>{quintic_coefficients(x_m_, xy_velocity_x_m_s_, target_x, duration), quintic_coefficients(y_m_, xy_velocity_y_m_s_, target_y, duration)};
   for (int iteration = 0; iteration < 12; ++iteration) {
     double peak_rate = 0.0; double peak_acceleration = 0.0;
@@ -214,7 +229,8 @@ bool TrajectoryPlanner::begin_xy_trajectory(
       const auto y = evaluate(candidate[1], duration * static_cast<double>(index) / 200.0);
       peak_rate = std::max(peak_rate, std::hypot(x[1], y[1])); peak_acceleration = std::max(peak_acceleration, std::hypot(x[2], y[2]));
     }
-    const double scale = std::max({1.0, peak_rate / config_.target_xy_max_speed_m_s, std::sqrt(peak_acceleration / config_.target_xy_max_accel_m_s2)});
+    const double scale = std::max({
+      1.0, peak_rate / max_speed_m_s, std::sqrt(peak_acceleration / max_accel_m_s2)});
     if (scale <= 1.000001) {break;}
     duration *= scale * 1.01;
     candidate = {quintic_coefficients(x_m_, xy_velocity_x_m_s_, target_x, duration), quintic_coefficients(y_m_, xy_velocity_y_m_s_, target_y, duration)};
@@ -258,7 +274,8 @@ void MissionConfig::validate() const
 {
   const double values[] = {
     takeoff_height_m, height_stable_seconds, right_shift_m, forward_distance_m,
-    tracking_arrival_seconds, tracking_tolerance_m, match_hold_seconds, car_status_timeout_s,
+    forward_max_speed_m_s, tracking_arrival_seconds, tracking_tolerance_m, match_hold_seconds,
+    car_status_timeout_s,
     max_tracking_radius_m, accompanying_z_jump_threshold_m, accompanying_z_step_m,
     accompanying_z_jump_window_s};
   for (const double value : values) {
@@ -276,6 +293,10 @@ Navigation::Navigation(const common::SafetyConfig & config, MissionConfig missio
 : config_(config), mission_(std::move(mission)), planner_(config)
 {
   mission_.validate();
+  if (mission_.forward_max_speed_m_s > config_.max_flight_horizontal_speed_m_s) {
+    throw std::invalid_argument(
+            "forward pursuit speed must not exceed max flight horizontal speed");
+  }
 }
 
 /// 清除任务执行上下文并恢复到等待预检阶段。
@@ -375,6 +396,16 @@ void Navigation::plan_to_mission_goal()
   planner_.set_yaw_rad(common::yaw_from_quaternion(goal.orientation));
 }
 
+/// 为前向搜索使用任务专属速度上限，其他任务段保持全局 XY 限制。
+void Navigation::plan_to_forward_pursuit_goal()
+{
+  if (!planner_.latched() || !control_.mission_goal) {return;}
+  const auto & goal = *control_.mission_goal;
+  planner_.set_xy_target_with_max_speed(goal.x_m, goal.y_m, mission_.forward_max_speed_m_s);
+  planner_.set_z_target(goal.z_m);
+  planner_.set_yaw_rad(common::yaw_from_quaternion(goal.orientation));
+}
+
 /// 保持使用实测 XYZ，偏航始终沿用最近实际发布的命令。
 common::PositionSetpoint Navigation::measured_hold_setpoint(const NavigationInput & input) const
 {
@@ -417,7 +448,11 @@ void Navigation::clear_hold()
 void Navigation::resume_hold(double now)
 {
   const std::string resume = control_.hold_resume_phase.empty() ? "pursuing_car" : control_.hold_resume_phase;
-  plan_to_mission_goal();
+  if (resume == "pursuing_car") {
+    plan_to_forward_pursuit_goal();
+  } else {
+    plan_to_mission_goal();
+  }
   if (resume == "accompanying_car" && control_.mission_goal) {
     planner_.set_z_target(control_.mission_goal->z_m + control_.accompanying_z_offset_m);
   }
@@ -452,7 +487,7 @@ void Navigation::begin_forward_pursuit()
   goal.y_m += mission_.forward_distance_m * std::sin(yaw);
   goal.orientation = control_.origin->orientation;
   set_mission_goal(goal);
-  plan_to_mission_goal();
+  plan_to_forward_pursuit_goal();
 }
 
 /// 把相对机体的距离和方位角换算成 ENU 目标，不改变机头指向或任务高度。
@@ -714,7 +749,7 @@ NavigationDecision Navigation::update(const NavigationInput & input)
   } else if (phase_ == "throwing") {
     if (input.gripper_failed) {
       reject("gripper_release_failed");
-      plan_to_mission_goal();
+      plan_to_forward_pursuit_goal();
       clear_hold();
       reset_accompanying_z_compensation();
       last_car_status_at_.reset();

@@ -27,6 +27,8 @@ public:
   void latch(double x_m, double y_m, double z_m, const common::Quaternion & orientation);
   /// 开始到世界坐标 XY 目标的有界五次轨迹。
   void set_xy_target(double x_m, double y_m);
+  /// 在调用方给定的水平速度上限内开始 XY 轨迹，仍使用统一加速度约束。
+  void set_xy_target_with_max_speed(double x_m, double y_m, double max_speed_m_s);
   /// 以期望到达时间重规划 XY；返回 false 表示安全约束要求更长时间。
   bool set_xy_target_with_arrival_time(double x_m, double y_m, double arrival_seconds);
   /// 将水平设定点立即冻结在指定实测位置。
@@ -93,7 +95,8 @@ private:
   /// 根据平面速度/加速度约束初始化 XY 轨迹。
   bool begin_xy_trajectory(
     double target_x_m, double target_y_m,
-    const std::optional<double> & arrival_seconds = std::nullopt);
+    const std::optional<double> & arrival_seconds, double max_speed_m_s,
+    double max_accel_m_s2);
   /// 确保调用者先锁存位姿，否则报告逻辑错误。
   void require_latched(const char * action) const;
 
@@ -135,6 +138,7 @@ struct MissionConfig
   double height_stable_seconds{3.0};
   double right_shift_m{0.375};
   double forward_distance_m{5.0};
+  double forward_max_speed_m_s{0.50};
   double tracking_arrival_seconds{1.0};
   double tracking_tolerance_m{0.2};
   double match_hold_seconds{0.5};
@@ -234,6 +238,8 @@ private:
   void set_mission_goal(const common::PositionSetpoint & goal);
   /// 从当前命令点重新规划到任务最终目标。
   void plan_to_mission_goal();
+  /// 以 go_ahead_ok 前向搜索的独立速度上限重新规划当前任务目标。
+  void plan_to_forward_pursuit_goal();
   /// 使用新鲜实测 XYZ 和最近命令偏航构建临时保持点。
   common::PositionSetpoint measured_hold_setpoint(const NavigationInput & input) const;
   /// 在指定保持阶段冻结可靠实测位置，且绝不改写任务最终目标。

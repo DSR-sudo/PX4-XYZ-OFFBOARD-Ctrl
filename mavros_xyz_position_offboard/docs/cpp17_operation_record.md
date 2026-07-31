@@ -38,6 +38,7 @@ is copied into one `xyzstatus` datagram immediately. It is independent of event 
 | `mission.takeoff_height_m` | `1.5` | Relative MAVROS local-Z climb from Init. |
 | `mission.right_shift_m` | `0.375` | Initial-heading right shift; startup validation restricts it to 0.35--0.40 m. |
 | `mission.forward_distance_m` | `5.0` | Bounded straight-line distance after GCS `go_ahead_ok`. |
+| `mission.forward_max_speed_m_s` | `0.50` | XY speed limit for the `go_ahead_ok` forward search; startup validation rejects values above `safety.max_flight_horizontal_speed_m_s`. |
 | `mission.tracking_arrival_seconds` | `1.0` | Requested arrival time for each continuously replanned visual XY target. |
 | `mission.tracking_tolerance_m` | `0.2` | Fresh visual distance required before `match_car_ok` confirms release. |
 | `mission.match_hold_seconds` | `0.5` | Measured-position hold between a confirmed match and gripper release. |

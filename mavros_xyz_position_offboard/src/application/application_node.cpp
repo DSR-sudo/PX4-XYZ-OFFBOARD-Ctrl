@@ -173,6 +173,8 @@ navigation::MissionConfig ApplicationNode::load_mission_config()
   value.right_shift_m = declare_parameter<double>("mission.right_shift_m", value.right_shift_m);
   value.forward_distance_m = declare_parameter<double>(
     "mission.forward_distance_m", value.forward_distance_m);
+  value.forward_max_speed_m_s = declare_parameter<double>(
+    "mission.forward_max_speed_m_s", value.forward_max_speed_m_s);
   value.tracking_arrival_seconds = declare_parameter<double>(
     "mission.tracking_arrival_seconds", value.tracking_arrival_seconds);
   value.tracking_tolerance_m = declare_parameter<double>(

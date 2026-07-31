@@ -81,8 +81,10 @@ Z source are unrelated to `b_ok`.
 After `ok_height`, the UAV translates `mission.right_shift_m` (validated to 0.35--0.40 m) to its
 initial-heading right side and waits. The GCS must compare the initial and translated `xyzstatus`
 coordinates and independently verify that the black line is centered in its video before sending
-`go_ahead_ok`. The UAV then flies its bounded `mission.forward_distance_m` search path until the
-first `car_status`. For every valid measurement, it uses the actual local XY and current yaw to
+`go_ahead_ok`. The UAV then flies its bounded `mission.forward_distance_m` search path at
+`mission.forward_max_speed_m_s` (default `0.50 m/s`) until the first `car_status`; this value
+may not exceed `safety.max_flight_horizontal_speed_m_s`. For every valid measurement, it uses the
+actual local XY and current yaw to
 form an ENU XY target, preserves that yaw and task height, and tries to arrive in
 `mission.tracking_arrival_seconds` (default `1.0`). Existing speed/acceleration limits always
 win if that time is infeasible. Targets outside `mission.max_tracking_radius_m` (default `5.0`)

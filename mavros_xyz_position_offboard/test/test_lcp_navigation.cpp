@@ -366,6 +366,40 @@ TEST(TrajectoryPlannerTest, TimedXyTargetMeetsFeasibleDeadlineAndExtendsUnsafeDe
   }
 }
 
+TEST(TrajectoryPlannerTest, ForwardPursuitCanUseASpecificSpeedLimit)
+{
+  SafetyConfig config;
+  config.target_xy_max_speed_m_s = 0.25;
+  config.target_xy_max_accel_m_s2 = 0.50;
+
+  TrajectoryPlanner default_limited(config);
+  default_limited.latch(0.0, 0.0, 1.5, {0.0, 0.0, 0.0, 1.0});
+  default_limited.set_xy_target(5.0, 0.0);
+
+  TrajectoryPlanner forward_limited(config);
+  forward_limited.latch(0.0, 0.0, 1.5, {0.0, 0.0, 0.0, 1.0});
+  forward_limited.set_xy_target_with_max_speed(5.0, 0.0, 0.50);
+
+  EXPECT_NEAR(default_limited.xy_trajectory_duration_s(), 40.0, 1e-9);
+  EXPECT_NEAR(forward_limited.xy_trajectory_duration_s(), 20.0, 1e-9);
+  auto previous = forward_limited.current();
+  for (int i = 0; i < 2500 && !forward_limited.xy_target_reached(); ++i) {
+    const auto current = forward_limited.update(0.01);
+    EXPECT_LE(std::hypot(current.x_m - previous.x_m, current.y_m - previous.y_m) / 0.01,
+      0.50 * 1.002);
+    previous = current;
+  }
+}
+
+TEST(NavigationV2Test, ForwardPursuitSpeedCannotExceedFlightHealthLimit)
+{
+  SafetyConfig safety;
+  safety.max_flight_horizontal_speed_m_s = 0.50;
+  MissionConfig mission;
+  mission.forward_max_speed_m_s = 0.51;
+  EXPECT_THROW(Navigation(safety, mission), std::invalid_argument);
+}
+
 TEST(NavigationV2Test, CompleteMissionAlignsRightThenPursuesAfterGcsApproval)
 {
   SafetyConfig safety;
@@ -462,6 +496,8 @@ TEST(NavigationV2Test, CompleteMissionAlignsRightThenPursuesAfterGcsApproval)
   ASSERT_EQ(navigation.phase(), "pursuing_car");
   EXPECT_NEAR(navigation.planner().target_x_m(), 1.05, 1e-9);
   EXPECT_NEAR(navigation.planner().target_y_m(), -0.475, 1e-9);
+  EXPECT_NEAR(navigation.planner().xy_trajectory_duration_s(),
+    2.0 * mission.forward_distance_m / mission.forward_max_speed_m_s, 1e-9);
 
   // The first visual update takes over the bounded search using actual ENU position and yaw.
   input.now += 0.05;
@@ -1456,6 +1492,7 @@ TEST(ApplicationNodeSafetyParameterTest, YamlParametersOverrideCliDefaultsAtStar
   EXPECT_DOUBLE_EQ(node->safety_config().max_flight_seconds, 120.0);
   EXPECT_DOUBLE_EQ(node->safety_config().target_xy_max_speed_m_s, 0.25);
   EXPECT_DOUBLE_EQ(node->get_parameter("udp.max_tracking_distance_m").as_double(), 5.0);
+  EXPECT_DOUBLE_EQ(node->get_parameter("mission.forward_max_speed_m_s").as_double(), 0.50);
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.tracking_arrival_seconds").as_double(), 1.0);
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.tracking_tolerance_m").as_double(), 0.2);
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.match_hold_seconds").as_double(), 0.5);

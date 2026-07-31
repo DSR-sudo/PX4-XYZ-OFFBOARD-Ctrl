@@ -138,6 +138,23 @@ std::string empty_command_json(const std::string & header)
   return "{\"header\":\"" + header + "\",\"data\":{}}";
 }
 
+/// 生成连续视觉相对测量；距离为米、方位为机体坐标弧度。
+std::string car_status_json(double distance_m, double bearing_rad)
+{
+  std::ostringstream stream;
+  stream << "{\"header\":\"car_status\",\"data\":{\"distance_m\":" << distance_m
+         << ",\"bearing_rad\":" << bearing_rad << "}}";
+  return stream.str();
+}
+
+bool has_message(const NavigationDecision & decision, MessageType type)
+{
+  for (const auto & message : decision.messages) {
+    if (message.type == type) {return true;}
+  }
+  return false;
+}
+
 /// 将模拟的实际飞行器遥测更新为本周期发出的规划设定点。
 void follow_setpoint(Telemetry & telemetry, const std::optional<PositionSetpoint> & setpoint)
 {
@@ -200,7 +217,6 @@ TEST(SimulatedGroundStationTest, CompletesPayloadlessMissionOverLoopbackUdp)
   mission.height_stable_seconds = 3.0;
   mission.right_shift_m = 0.375;
   mission.forward_distance_m = 1.0;
-  mission.match_hold_seconds = 0.5;
   Navigation navigation(safety, mission);
 
   NavigationInput input;
@@ -297,35 +313,44 @@ TEST(SimulatedGroundStationTest, CompletesPayloadlessMissionOverLoopbackUdp)
   EXPECT_NEAR(navigation.planner().target_x_m(), mission.forward_distance_m, 1e-6);
   EXPECT_NEAR(navigation.planner().target_y_m(), -mission.right_shift_m, 1e-6);
 
-  // GCS-owned vision locates the car and sends match only once horizontal distance is below 0.1 m.
-  const double car_x_m = 0.60;
-  const double car_y_m = -mission.right_shift_m;
-  bool match_sent = false;
-  double match_command_at = 0.0;
-  NavigationDecision match_decision;
-  for (int count = 0; count < 200 && !match_sent; ++count) {
-    tick();
-    if (std::hypot(input.telemetry.local_x_m - car_x_m,
-        input.telemetry.local_y_m - car_y_m) < 0.10) {
-      match_command_at = now;
-      send_gcs(empty_command_json("match_car_ok"));
-      match_decision = tick();
-      match_sent = true;
-    }
-  }
-  ASSERT_TRUE(match_sent);
-  ASSERT_EQ(navigation.phase(), "match_hold") << "link rejection=" << link.last_rejection()
-    << ", navigation rejection=" << (match_decision.rejections.empty() ? "none" : match_decision.rejections.front());
-  for (int count = 0; count < 20 && navigation.phase() == "match_hold"; ++count) {tick();}
-  EXPECT_GE(now - match_command_at, mission.match_hold_seconds);
-  ASSERT_EQ(navigation.phase(), "throwing");
-  for (int count = 0; count < 20 && navigation.phase() == "throwing"; ++count) {tick();}
+  // The first visual packet replaces the fixed forward search with a relative ENU target.
+  const double visual_base_x_m = input.telemetry.local_x_m;
+  const double visual_base_y_m = input.telemetry.local_y_m;
+  send_gcs(car_status_json(0.80, 0.15));
+  auto tracking_decision = tick();
   ASSERT_TRUE(transport_ok);
-  ASSERT_EQ(navigation.phase(), "awaiting_b_ok");
+  ASSERT_EQ(navigation.phase(), "tracking_to_match") << "link rejection=" << link.last_rejection();
+  EXPECT_NEAR(navigation.planner().target_x_m(), visual_base_x_m + 0.80 * std::cos(0.15), 1e-6);
+  EXPECT_NEAR(navigation.planner().target_y_m(), visual_base_y_m + 0.80 * std::sin(0.15), 1e-6);
+  EXPECT_FALSE(tracking_decision.release_gripper);
+
+  // A fresh 0.2 m status plus match freezes the measured position before releasing.
+  send_gcs(car_status_json(0.20, 0.0));
+  send_gcs(empty_command_json("match_car_ok"));
+  auto match_decision = tick();
+  ASSERT_EQ(navigation.phase(), "match_hold");
+  EXPECT_FALSE(match_decision.release_gripper);
+  EXPECT_FALSE(has_message(match_decision, MessageType::ok_throw));
+  ASSERT_EQ(received_headers, std::vector<std::string>({"ok_wait", "ok_height"}));
+  EXPECT_EQ(gripper.state(), ReleaseState::idle);
+
+  const double match_started_at = now;
+  for (int count = 0; count < 20 && navigation.phase() == "match_hold"; ++count) {
+    match_decision = tick();
+  }
+  EXPECT_GE(now - match_started_at, mission.match_hold_seconds);
+  ASSERT_EQ(navigation.phase(), "throwing");
+  EXPECT_TRUE(match_decision.release_gripper);
+  EXPECT_EQ(gripper.state(), ReleaseState::holding_release);
+  for (int count = 0; count < 20 && navigation.phase() == "throwing"; ++count) {tick();}
+  ASSERT_EQ(navigation.phase(), "accompanying_car");
   ASSERT_EQ(received_headers, std::vector<std::string>({"ok_wait", "ok_height", "ok_throw"}));
   EXPECT_EQ(gripper.state(), ReleaseState::succeeded);
-  tick();
-  EXPECT_EQ(link.pending_event_count(), 0U);
+
+  send_gcs(car_status_json(0.30, -0.10));
+  match_decision = tick();
+  ASSERT_EQ(navigation.phase(), "accompanying_car");
+  EXPECT_FALSE(match_decision.release_gripper);
 
   wait_before_mission_command();
   send_gcs(empty_command_json("b_ok"));

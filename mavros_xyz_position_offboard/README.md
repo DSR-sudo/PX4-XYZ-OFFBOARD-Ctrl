@@ -21,8 +21,8 @@ Initialization -- health/Z ----------+
   IP/port allowlist and the complete V2 object shape, and sends only to the fixed remote.
 - `Navigation` is a pure C++ state machine. It keeps an immutable ARM-time `origin`, a task
   `mission_goal`, the published `commanded_setpoint`, and a separate temporary `hold_setpoint`.
-  It plans the bounded right shift and straight pursuit from the ARM-time heading; GCS vision
-  remains responsible for alignment and car-distance decisions.
+  It plans the bounded right shift and straight search from the ARM-time heading, then converts
+  each GCS visual relative measurement into an ENU target without turning toward the vehicle.
 - `Offboard` sends internal ENU position/yaw setpoints unchanged to MAVROS `PositionTarget`.
   MAVROS 2.14 `SetpointRawPlugin::local_cb()` converts the ROS ENU input to PX4 `LOCAL_NED`;
   the application must not convert it a second time.
@@ -38,7 +38,9 @@ Mission order:
 waiting_preflight -> ground-hold warmup -> ok_wait -> waiting_run_plan1
 -> run_plan1 -> OFFBOARD/ARM -> latch origin and climb 1.5 m -> hold stable for 3 s -> ok_height
 -> right-shift 0.375 m -> wait for go_ahead_ok -> bounded forward pursuit
--> GCS distance match (<0.1 m) -> hold 0.5 s -> PWM release -> ok_throw -> b_ok -> ok_return
+-> first car_status -> tracking_to_match -> fresh match_car_ok (distance <= 0.2 m)
+-> hold 0.5 s -> PWM release -> ok_throw -> accompanying_car (continuous car_status)
+-> b_ok -> ok_return
 -> return Init XY + world yaw 0 -> ok_downing -> descend Init Z -> Disarm -> MANUAL -> ok_down
 ```
 
@@ -56,28 +58,41 @@ Every packet has exactly this root shape:
 ```
 
 GCS sends `run_plan1`, `go_ahead_ok`, `match_car_ok`, `b_ok`, and `ack` with an empty `data`
-object. `car_status` is no longer an accepted UAV command.
+object. It sends continuous visual measurements as:
 
-UAV discrete events are `ok_wait`, `ok_height`, `ok_throw`, `ok_return`, `ok_downing`, and
-`ok_down`. They are ordered in an ACK queue. The UAV sends the earliest unsatisfied event right
+```json
+{"header":"car_status","data":{"distance_m":0.8,"bearing_rad":0.15}}
+```
+
+`distance_m` is in `[0, udp.max_tracking_distance_m]` (default `5.0`) and `bearing_rad` is in
+`[-pi, pi]`; zero means straight ahead and positive angles are counterclockwise in the body frame.
+
+UAV discrete events are `ok_wait`, `ok_height`, `ok_throw`, `ok_return`, `ok_downing`, and `ok_down`. They
+are ordered in an ACK queue. The UAV sends the earliest unsatisfied event right
 away and retries it every `udp.event_retry_period_s` (default `0.5`). A GCS
 `{"header":"ack","data":{}}` acknowledges only that earliest event. `xyzstatus` is continuous
 and is neither queued nor acknowledged.
 
 GCS may apply its own map or business condition before sending `b_ok`. The UAV knows only its
-relative local coordinates, accepts `b_ok` in `awaiting_b_ok`, and then returns to its latched
-Init XY origin. `position_z_m`, `z_valid`, and the selected Z source are unrelated to `b_ok`.
+relative local coordinates, accepts `b_ok` only while accompanying or in the matched visual-timeout
+hold, and then returns to its latched Init XY origin. `position_z_m`, `z_valid`, and the selected
+Z source are unrelated to `b_ok`.
 
 After `ok_height`, the UAV translates `mission.right_shift_m` (validated to 0.35--0.40 m) to its
 initial-heading right side and waits. The GCS must compare the initial and translated `xyzstatus`
 coordinates and independently verify that the black line is centered in its video before sending
-`go_ahead_ok`. The UAV then flies its bounded `mission.forward_distance_m` path. The GCS owns car
-recognition and the `<0.1 m` distance decision; it sends `match_car_ok` only after that check.
-The UAV holds the confirmed position for `mission.match_hold_seconds` (default `0.5`) before it
-immediately drives the verified 7% open position. It holds that signal for
-`gripper_pwm.open_hold_ms` (default `500`) before restoring the 4% closed position and sending
-`ok_throw`. Duplicate commands are phase-idempotent and cannot re-arm, release twice, or restart
-return.
+`go_ahead_ok`. The UAV then flies its bounded `mission.forward_distance_m` search path until the
+first `car_status`. For every valid measurement, it uses the actual local XY and current yaw to
+form an ENU XY target, preserves that yaw and task height, and tries to arrive in
+`mission.tracking_arrival_seconds` (default `1.0`). Existing speed/acceleration limits always
+win if that time is infeasible. Targets outside `mission.max_tracking_radius_m` (default `5.0`)
+of Init are rejected. If status updates stop for `mission.car_status_timeout_s` (default `2.0`),
+the UAV freezes at its measured position and resumes the prior tracking stage when a fresh target
+arrives. `match_car_ok` requires a fresh visual distance no greater than
+`mission.tracking_tolerance_m` (default `0.2`); it freezes at the measured position for
+`mission.match_hold_seconds` (default `0.5`), then opens the gripper. Once the configured
+open/close cycle succeeds, the UAV sends `ok_throw`, enters `accompanying_car`, and continues
+processing `car_status` until `b_ok` arrives.
 
 ## LCP and Z
 
@@ -89,11 +104,19 @@ fresh valid down range is baselined at the same point and checks relative Z cons
 (`z.range_cross_check_max_delta_m`, default `0.30 m`); set
 `z.prefer_range:true` only after field validation.
 
-When no selected source is fresh, valid, and consistent, LCP is still sent with exactly:
+Outside visual tracking, when no selected source is fresh, valid, and consistent, LCP is still
+sent with exactly:
 
 ```json
 "position_z_m":null,"z_source":"none","z_source_stamp":null,"z_quality":null,"z_valid":false
 ```
+
+During visual tracking, match hold, release, and post-release accompaniment,
+`z.tracking_use_local_pose:true` forces `xyzstatus` to use MAVROS local-pose Z even when
+`z.prefer_range:true`. This keeps a downward-lidar reading caused by an approximately 11 cm ground
+or target-height change from being reported to the GCS as a UAV descent; range remains a health
+input. This application-level policy cannot isolate PX4's EKF2 altitude estimate from a range
+sensor that PX4 has already fused through MAVLink.
 
 ## Build and Test
 
@@ -161,8 +184,9 @@ diagnosis.
 The deployed YAML enables the calibrated SG90 setup: BCM GPIO18 (physical pin 12), 50 Hz, 4%
 closed, 7% open, and a 500 ms open hold. Before flight, verify this on a no-prop bench with the
 signal wire connected to GPIO18 and ensure the launch user can access the RP1 gpiochip through the
-`dialout` group. If RP1 discovery, GPIO claim, or initial 4% PWM setup fails, node startup fails;
-if a later open/close PWM command fails, the release is withheld and a new `match_car_ok` may retry.
+`dialout` group. If RP1 discovery, GPIO claim, or initial 4% PWM setup fails, node startup fails.
+After a confirmed match hold, this mission opens the gripper. Successful completion of its
+configured open/close cycle emits `ok_throw` before visual accompaniment resumes.
 
 Install the C++ GPIO dependency on deployment images with `sudo apt install liblgpio-dev`.
 

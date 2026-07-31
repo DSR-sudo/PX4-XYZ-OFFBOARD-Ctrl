@@ -14,6 +14,7 @@ enum class MessageType
 {
   run_plan1,
   go_ahead_ok,
+  car_status,
   match_car_ok,
   b_ok,
   ack,
@@ -32,12 +33,20 @@ std::string to_string(MessageType type);
 /// True only for the ordered, ACK-required UAV event headers.
 bool is_discrete_event(MessageType type);
 
+/// Continuous visual vehicle measurement in the UAV body frame.
+struct CarStatus
+{
+  double distance_m{0.0};
+  double bearing_rad{0.0};
+};
+
 struct ProtocolEvent
 {
   MessageType type{MessageType::invalid};
   double received_at{0.0};
   bool accepted{false};
   std::string rejection_reason{};
+  std::optional<CarStatus> car_status{};
 };
 
 /// A ROS header represented without a ROS dependency in the protocol value layer.

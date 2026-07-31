@@ -21,6 +21,8 @@ OK_HEADERS = {
 GO_AHEAD_WAIT_S = 10.0
 GO_AHEAD_RETRY_S = 0.5
 PURSUIT_CONFIRM_DISTANCE_M = 0.10
+TRACKING_MATCH_DISTANCE_M = 0.20
+CAR_STATUS_PERIOD_S = 0.10
 
 
 class Scenario:
@@ -42,6 +44,7 @@ class Scenario:
         self.car_position = None
         self.go_ahead_reference = None
         self.go_ahead_last_sent_at = None
+        self.car_status_last_sent_at = None
 
     @staticmethod
     def payload(header, data=None):
@@ -92,7 +95,7 @@ class Scenario:
                 self.begin_phase("waiting_go_ahead")
         elif header == "ok_throw" and self.phase == "waiting_ok_throw":
             self.command_due_at = now + self.command_wait_s
-            self.begin_phase("waiting_b_ok")
+            self.begin_phase("accompanying_car")
         elif header == "ok_return" and self.phase == "waiting_ok_return":
             self.begin_phase("waiting_ok_downing")
         elif header == "ok_downing" and self.phase == "waiting_ok_downing":
@@ -130,12 +133,24 @@ class Scenario:
             current_y + self.car_forward_m * math.sin(yaw),
         )
 
-    def car_distance_below_match_threshold(self):
+    def car_status(self):
         if not self.latest_xyzstatus or not self.car_position:
-            return False
-        current_x, current_y, _ = self.latest_xyzstatus
+            return None
+        current_x, current_y, yaw = self.latest_xyzstatus
         car_x, car_y = self.car_position
-        return math.hypot(current_x - car_x, current_y - car_y) < 0.10
+        distance_m = math.hypot(car_x - current_x, car_y - current_y)
+        bearing_rad = math.atan2(car_y - current_y, car_x - current_x) - yaw
+        bearing_rad = math.atan2(math.sin(bearing_rad), math.cos(bearing_rad))
+        return distance_m, bearing_rad
+
+    def send_car_status(self, now):
+        status = self.car_status()
+        if not status:
+            return None
+        distance_m, bearing_rad = status
+        self.send("car_status", {"distance_m": distance_m, "bearing_rad": bearing_rad})
+        self.car_status_last_sent_at = now
+        return distance_m
 
     def pursuit_started(self):
         if not self.go_ahead_reference or not self.latest_xyzstatus:
@@ -174,17 +189,23 @@ class Scenario:
             self.begin_go_ahead_handshake(now)
         elif self.phase == "waiting_pursuit_start":
             if self.pursuit_started():
-                self.begin_phase("pursuing_car")
+                self.send_car_status(now)
+                self.begin_phase("tracking_to_match")
             elif now - self.go_ahead_last_sent_at >= GO_AHEAD_RETRY_S:
                 self.send("go_ahead_ok")
                 self.go_ahead_last_sent_at = now
-        elif self.phase == "pursuing_car" and self.car_distance_below_match_threshold():
-            self.send("match_car_ok")
-            self.begin_phase("waiting_ok_throw")
-        elif self.phase == "waiting_b_ok" and now >= self.command_due_at:
-            # Map and business criteria stay on the real GCS; the UAV receives only b_ok.
-            self.send("b_ok")
-            self.begin_phase("waiting_ok_return")
+        elif self.phase == "tracking_to_match":
+            if self.car_status_last_sent_at is None or now - self.car_status_last_sent_at >= CAR_STATUS_PERIOD_S:
+                distance_m = self.send_car_status(now)
+                if distance_m is not None and distance_m <= TRACKING_MATCH_DISTANCE_M:
+                    self.send("match_car_ok")
+                    self.begin_phase("waiting_ok_throw")
+        elif self.phase == "accompanying_car":
+            if self.car_status_last_sent_at is None or now - self.car_status_last_sent_at >= CAR_STATUS_PERIOD_S:
+                self.send_car_status(now)
+            if now >= self.command_due_at:
+                self.send("b_ok")
+                self.begin_phase("waiting_ok_return")
 
 
 
@@ -210,8 +231,8 @@ def parse_args():
             parser.error("ports must be within 1..65535")
     if args.max_duration_s <= 0.0:
         parser.error("--max-duration-s must be positive")
-    if args.simulated_car_forward_m <= 0.10:
-        parser.error("--simulated-car-forward-m must exceed the 0.1 m match threshold")
+    if args.simulated_car_forward_m <= TRACKING_MATCH_DISTANCE_M:
+        parser.error("--simulated-car-forward-m must exceed the 0.2 m match threshold")
     return args
 
 
@@ -242,7 +263,7 @@ def main():
     finally:
         sock.close()
 
-    expected = ["ok_wait", "ok_height", "ok_throw", "ok_return", "ok_downing", "ok_down"]
+    expected = ["ok_wait", "ok_height", "ok_return", "ok_downing", "ok_down"]
     if scenario.received_events != expected:
         print("FAIL unexpected event order: {}".format(scenario.received_events), file=sys.stderr, flush=True)
         return 1

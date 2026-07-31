@@ -23,7 +23,7 @@ Each timer cycle retains this order:
 3. Advance PWM state and call `Navigation::update` with health, protocol events, and gripper result.
 4. Apply the idempotent setpoint/mode/arm intent to MAVROS.
 5. Start a requested PWM release, queue each `ok_*`, and retry the earliest queued event.
-6. Write audit status (`px4.mavros_native_xyz.v2`).
+6. Write audit status (`px4.mavros_native_xyz.v3`).
 
 `/lcp/debug` is callback-driven rather than timer-driven: each new `lslidar_msgs/LcpDebug` sample
 is copied into one `xyzstatus` datagram immediately. It is independent of event retries.
@@ -33,12 +33,18 @@ is copied into one `xyzstatus` datagram immediately. It is independent of event 
 | Parameter | Default | Meaning |
 | --- | ---: | --- |
 | `udp.event_retry_period_s` | `0.5` | Retry period for the oldest unacknowledged `ok_*`. |
+| `udp.max_tracking_distance_m` | `5.0` | Maximum accepted `car_status.distance_m`. |
 | `--setpoint-warmup` / `setpoint_warmup_s` | `2.0` | Init-hold setpoint publication time before `ok_wait`. |
 | `mission.takeoff_height_m` | `1.5` | Relative MAVROS local-Z climb from Init. |
 | `mission.right_shift_m` | `0.375` | Initial-heading right shift; startup validation restricts it to 0.35--0.40 m. |
 | `mission.forward_distance_m` | `5.0` | Bounded straight-line distance after GCS `go_ahead_ok`. |
-| `mission.match_hold_seconds` | `0.5` | Wait at the GCS-confirmed match point before release. |
+| `mission.tracking_arrival_seconds` | `1.0` | Requested arrival time for each continuously replanned visual XY target. |
+| `mission.tracking_tolerance_m` | `0.2` | Fresh visual distance required before `match_car_ok` confirms release. |
+| `mission.match_hold_seconds` | `0.5` | Measured-position hold between a confirmed match and gripper release. |
+| `mission.car_status_timeout_s` | `2.0` | Time without a valid visual update before measured-position hold. |
+| `mission.max_tracking_radius_m` | `5.0` | Maximum visual target radius from the locked Init XY origin. |
 | `z.prefer_range` | `false` | Select Range-relative Z after field calibration. |
+| `z.tracking_use_local_pose` | `true` | Force local-pose Z during visual tracking and accompaniment. |
 | `z.source_timeout_s` | `0.5` | Freshness limit for pose/Range Z sources. |
 | `z.range_cross_check_max_delta_m` | `0.30` | Maximum local-vs-Range relative-Z disagreement. |
 | `gripper_pwm.enabled` | `true` | Enables the calibrated physical SG90 output; override to `false` for SITL. |
@@ -48,9 +54,10 @@ is copied into one `xyzstatus` datagram immediately. It is independent of event 
 | `gripper_pwm.open_duty_cycle` | `7.0` | Verified open position duty cycle, percent. |
 | `gripper_pwm.open_hold_ms` | `500` | Time to hold the open signal before restoring closed. |
 
-The existing `udp.bind_*`, `remote_*`, and `whitelist_*` parameters are unchanged. The match hold
-is the only pre-open delay: after `mission.match_hold_seconds`, the gripper opens immediately and
-restores closed after `open_hold_ms`.
+`car_status` is the only nonempty inbound message: its exact data object is
+`{"distance_m": <0..5>, "bearing_rad": <-pi..pi>}`. The existing `udp.bind_*`, `remote_*`, and
+`whitelist_*` parameters are unchanged. The planner records whether each requested visual arrival
+time was met; it extends the trajectory instead of exceeding configured speed or acceleration.
 
 ## PWM Procedure
 
@@ -62,9 +69,8 @@ restores closed after `open_hold_ms`.
 
 When enabled, node startup finds the RP1 gpiochip from its sysfs label, opens it with `lgpio`,
 claims BCM GPIO18, and starts the 4% closed PWM. Startup failures stop the node before a mission
-can begin. A later PWM failure reports `failed`, does not send `ok_throw`, and resumes bounded
-pursuit for a fresh `match_car_ok` retry. Automated tests use an injected GPIO fake rather than a
-real GPIO line.
+can begin. After the confirmed match hold, navigation commands the adapter to release. It emits
+`ok_throw` only after the configured open/close cycle succeeds, then resumes visual accompaniment.
 
 ## Build and Acceptance
 
@@ -89,11 +95,20 @@ values and the event order.
   normal ARM/Disarm requests.
 - `run_plan1` does not start setpoint warmup; Init is latched and held for the configured warmup
   before `ok_wait`, so `run_plan1` directly requests OFFBOARD/ARM and climb.
-- Duplicated `run_plan1`, `match_car_ok`, and `b_ok` do not repeat ARM, PWM release, return, or
-  landing actions.
+- Duplicated `run_plan1`, `match_car_ok`, and `b_ok` do not repeat ARM, gripper release, return, or landing actions.
 - `go_ahead_ok` is accepted only after the bounded 0.35--0.40 m right shift has completed.
-- `match_car_ok` is accepted only during bounded forward pursuit; the GCS owns black-line, car,
-  and `<0.1 m` distance verification.
+- The first valid `car_status` changes bounded forward pursuit to visual ENU tracking. Every later
+  status uses actual local XY and current yaw, keeps the task height/yaw, and is rejected if its
+  target exceeds the Init-radius bound.
+- `match_car_ok` is accepted only in `tracking_to_match` with a fresh distance no greater than
+  `mission.tracking_tolerance_m`; it freezes at the measured position for
+  `mission.match_hold_seconds`, then starts PWM release. Once release succeeds, `ok_throw` is sent
+  and fresh visual updates continue in `accompanying_car` until `b_ok`. A visual timeout freezes at
+  the measured position and a fresh status restores the interrupted tracking stage.
+- During visual tracking and accompaniment, the task Z target and `xyzstatus` both use MAVROS
+  local-pose Z. This prevents an inconsistent downward range value from being reported to the GCS
+  as a UAV descent, but cannot prevent a range sample already fused by PX4 EKF2 from moving the
+  FCU's local-pose estimate.
 - LCP failure during climb does not interrupt climb. Later LCP failure holds the measured
   position until recovery, then resumes the interrupted final target; mode/flight-health loss
   and max-flight timeout retain their existing safe paths.

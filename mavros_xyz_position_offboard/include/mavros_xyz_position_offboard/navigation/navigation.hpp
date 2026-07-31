@@ -27,6 +27,8 @@ public:
   void latch(double x_m, double y_m, double z_m, const common::Quaternion & orientation);
   /// 开始到世界坐标 XY 目标的有界五次轨迹。
   void set_xy_target(double x_m, double y_m);
+  /// 以期望到达时间重规划 XY；返回 false 表示安全约束要求更长时间。
+  bool set_xy_target_with_arrival_time(double x_m, double y_m, double arrival_seconds);
   /// 将水平设定点立即冻结在指定实测位置。
   void freeze_xy_at(double x_m, double y_m);
   /// 在当前规划水平位置保持。
@@ -67,6 +69,10 @@ public:
   double target_x_m() const {return target_x_m_;}
   /// 返回当前水平 Y 目标。
   double target_y_m() const {return target_y_m_;}
+  /// 返回当前 XY 轨迹的计划持续时间。
+  double xy_trajectory_duration_s() const {return xy_trajectory_duration_s_;}
+  /// 返回最近一次带到达时间约束的重规划是否满足该时间。
+  bool xy_arrival_time_met() const {return xy_arrival_time_met_;}
   /// 返回当前垂直目标。
   double target_z_m() const {return target_z_m_;}
   /// 返回当前命令 Z 设定点。
@@ -85,7 +91,9 @@ private:
   /// 根据垂直速度/加速度约束初始化 Z 轨迹。
   void begin_z_trajectory(double target_z_m);
   /// 根据平面速度/加速度约束初始化 XY 轨迹。
-  void begin_xy_trajectory(double target_x_m, double target_y_m);
+  bool begin_xy_trajectory(
+    double target_x_m, double target_y_m,
+    const std::optional<double> & arrival_seconds = std::nullopt);
   /// 确保调用者先锁存位姿，否则报告逻辑错误。
   void require_latched(const char * action) const;
 
@@ -100,6 +108,7 @@ private:
   double xy_velocity_y_m_s_{0.0};
   double xy_trajectory_elapsed_s_{0.0};
   double xy_trajectory_duration_s_{0.0};
+  bool xy_arrival_time_met_{true};
   std::array<Coefficients, 2> xy_coefficients_{};
   double command_z_m_{NAN};
   double target_z_m_{NAN};
@@ -126,9 +135,13 @@ struct MissionConfig
   double height_stable_seconds{3.0};
   double right_shift_m{0.375};
   double forward_distance_m{5.0};
+  double tracking_arrival_seconds{1.0};
+  double tracking_tolerance_m{0.2};
   double match_hold_seconds{0.5};
+  double car_status_timeout_s{2.0};
+  double max_tracking_radius_m{5.0};
 
-  /// 校验起飞、右移、前飞和匹配等待参数。
+  /// 校验起飞、右移、前飞和视觉跟踪参数。
   void validate() const;
 };
 
@@ -162,6 +175,7 @@ struct ControlState
   std::string hold_reason{};
   std::string hold_resume_phase{};
   bool mission_paused{false};
+  bool tracking_arrival_time_met{true};
 };
 
 /// 将完整控制状态编码为 JSON 对象，供 JSONL 审计和单元测试共同使用。
@@ -238,6 +252,12 @@ private:
   void begin_right_shift();
   /// 从右移终点沿锁存的初始航向规划受限的前飞追车动作。
   void begin_forward_pursuit();
+  /// 将车体相对视觉测量转换为 ENU 目标并连续重规划。
+  bool apply_car_status(const NavigationInput & input, const communication::CarStatus & status);
+  /// 判断最近一次有效视觉测量在当前控制周期仍然新鲜。
+  bool car_status_fresh(double now) const;
+  /// 当前视觉超时保持是否由投放后的伴飞阶段进入。
+  bool accompanying_timeout_hold() const;
   /// 判断阶段是否必须因 LCP 不健康冻结位置。
   bool lcp_required_in_phase() const;
 
@@ -253,6 +273,8 @@ private:
   std::vector<std::string> pending_rejections_{};
   std::string landing_reason_{};
   bool pending_release_gripper_{false};
+  std::optional<double> last_car_status_at_{};
+  std::optional<double> latest_car_distance_m_{};
 };
 
 }  // mavros_xyz_position_offboard::navigation 命名空间

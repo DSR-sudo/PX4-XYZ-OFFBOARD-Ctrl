@@ -158,6 +158,8 @@ communication::GroundStationConfig ApplicationNode::load_ground_station_config()
   value.whitelist_port = declare_parameter<int>("udp.whitelist_port", value.whitelist_port);
   value.event_retry_period_s = declare_parameter<double>(
     "udp.event_retry_period_s", value.event_retry_period_s);
+  value.max_tracking_distance_m = declare_parameter<double>(
+    "udp.max_tracking_distance_m", value.max_tracking_distance_m);
   value.validate();
   return value;
 }
@@ -171,8 +173,16 @@ navigation::MissionConfig ApplicationNode::load_mission_config()
   value.right_shift_m = declare_parameter<double>("mission.right_shift_m", value.right_shift_m);
   value.forward_distance_m = declare_parameter<double>(
     "mission.forward_distance_m", value.forward_distance_m);
+  value.tracking_arrival_seconds = declare_parameter<double>(
+    "mission.tracking_arrival_seconds", value.tracking_arrival_seconds);
+  value.tracking_tolerance_m = declare_parameter<double>(
+    "mission.tracking_tolerance_m", value.tracking_tolerance_m);
   value.match_hold_seconds = declare_parameter<double>(
     "mission.match_hold_seconds", value.match_hold_seconds);
+  value.car_status_timeout_s = declare_parameter<double>(
+    "mission.car_status_timeout_s", value.car_status_timeout_s);
+  value.max_tracking_radius_m = declare_parameter<double>(
+    "mission.max_tracking_radius_m", value.max_tracking_radius_m);
   value.validate();
   return value;
 }
@@ -189,6 +199,8 @@ ApplicationNode::ZConfig ApplicationNode::load_z_config()
 {
   ZConfig value;
   value.prefer_range = declare_parameter<bool>("z.prefer_range", value.prefer_range);
+  value.tracking_use_local_pose = declare_parameter<bool>(
+    "z.tracking_use_local_pose", value.tracking_use_local_pose);
   value.source_timeout_s = declare_parameter<double>("z.source_timeout_s", value.source_timeout_s);
   value.range_cross_check_max_delta_m = declare_parameter<double>(
     "z.range_cross_check_max_delta_m", value.range_cross_check_max_delta_m);
@@ -251,8 +263,17 @@ void ApplicationNode::lcp_debug_callback(const lslidar_msgs::msg::LcpDebug::Shar
   const bool sources_valid = local_z && range_z &&
     std::abs(*local_z - *range_z) <= z_config_.range_cross_check_max_delta_m;
 
-  if (sources_valid) {
-    const bool use_range = z_config_.prefer_range;
+  const auto & control = navigation_.control_state();
+  const bool visual_tracking_phase = navigation_.phase() == "tracking_to_match" ||
+    navigation_.phase() == "match_hold" || navigation_.phase() == "throwing" ||
+    navigation_.phase() == "accompanying_car" ||
+    (navigation_.phase() == "tracking_timeout_hold" &&
+    (control.hold_resume_phase == "tracking_to_match" ||
+    control.hold_resume_phase == "accompanying_car"));
+  const bool use_local_tracking_z = z_config_.tracking_use_local_pose && visual_tracking_phase;
+
+  if (local_z && (sources_valid || use_local_tracking_z)) {
+    const bool use_range = !use_local_tracking_z && z_config_.prefer_range;
     status.position_z_m = use_range ? range_z : local_z;
     status.z_source = use_range ? "range" : "local_pose";
     status.z_source_stamp = use_range ? telemetry.range_stamp : telemetry.local_pose_stamp;

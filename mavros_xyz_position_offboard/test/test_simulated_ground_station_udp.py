@@ -49,7 +49,8 @@ class GoAheadHandshakeTest(unittest.TestCase):
 
         self.scenario.latest_xyzstatus = (0.11, -0.375, 0.0)
         self.scenario.advance()
-        self.assertEqual(self.scenario.phase, "pursuing_car")
+        self.assertEqual(self.scenario.phase, "tracking_to_match")
+        self.assertEqual(self.sent_headers(), ["go_ahead_ok", "go_ahead_ok", "car_status"])
 
 
 if __name__ == "__main__":

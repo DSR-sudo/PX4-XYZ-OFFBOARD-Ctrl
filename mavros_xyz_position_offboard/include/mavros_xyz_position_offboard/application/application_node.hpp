@@ -36,6 +36,7 @@ private:
   struct ZConfig
   {
     bool prefer_range{false};
+    bool tracking_use_local_pose{true};
     double source_timeout_s{0.5};
     double range_cross_check_max_delta_m{0.30};
 

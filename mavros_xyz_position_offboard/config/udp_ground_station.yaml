@@ -17,6 +17,8 @@ mavros_native_xyz_position:
       whitelist_port: 5005
       # 需要确认的业务事件重发周期，单位：秒。
       event_retry_period_s: 0.5
+      # car_status 距离字段的最大可接受值，单位：米。
+      max_tracking_distance_m: 5.0
 
     safety:
       # 静态部署参数：YAML/launch 值覆盖应用 CLI 默认值，修改后必须重启节点。
@@ -126,12 +128,22 @@ mavros_native_xyz_position:
       right_shift_m: 0.375
       # 收到地面站 go_ahead_ok 后沿航向直线追踪的最大距离，单位：米。
       forward_distance_m: 5.0
-      # 在地面站确认的车辆匹配点保持后再释放的时长，单位：秒。
+      # 视觉相对目标的期望 XY 到达时间，单位：秒。
+      tracking_arrival_seconds: 1.0
+      # 允许 match_car_ok 确认投放的最新视觉距离阈值，单位：米。
+      tracking_tolerance_m: 0.2
+      # 收到有效 match_car_ok 后保持再触发投放的时长，单位：秒。
       match_hold_seconds: 0.5
+      # 连续 car_status 中断后冻结实测位置的时长，单位：秒。
+      car_status_timeout_s: 2.0
+      # 视觉目标相对起飞原点的最大允许半径，单位：米。
+      max_tracking_radius_m: 5.0
 
     z:
       # true 时优先使用测距高度，false 时优先使用本地位姿高度。
       prefer_range: false
+      # 视觉跟踪/伴飞时强制使用 MAVROS 本地位姿 Z，避免下视测距误将地面起伏识别为无人机下降。
+      tracking_use_local_pose: true
       # 高度来源数据的最大新鲜时间，单位：秒。
       source_timeout_s: 0.5
       # 本地位姿高度与测距高度的最大允许差值，单位：米。

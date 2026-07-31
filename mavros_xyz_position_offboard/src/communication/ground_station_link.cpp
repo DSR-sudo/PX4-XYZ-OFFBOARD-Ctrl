@@ -122,6 +122,7 @@ std::string to_string(MessageType type)
   switch (type) {
     case MessageType::run_plan1: return "run_plan1";
     case MessageType::go_ahead_ok: return "go_ahead_ok";
+    case MessageType::car_status: return "car_status";
     case MessageType::match_car_ok: return "match_car_ok";
     case MessageType::b_ok: return "b_ok";
     case MessageType::ack: return "ack";
@@ -155,6 +156,9 @@ void GroundStationConfig::validate() const
   }
   if (!std::isfinite(event_retry_period_s) || event_retry_period_s <= 0.0) {
     throw std::invalid_argument("UDP retry period must be finite and positive");
+  }
+  if (!std::isfinite(max_tracking_distance_m) || max_tracking_distance_m <= 0.0) {
+    throw std::invalid_argument("UDP maximum tracking distance must be finite and positive");
   }
 }
 
@@ -225,7 +229,27 @@ ProtocolEvent GroundStationLink::decode_datagram(
   event.received_at = now;
   const std::string header = root["header"].asString();
   const auto & data = root["data"];
-  if (header == "run_plan1" || header == "go_ahead_ok" || header == "match_car_ok" ||
+  if (header == "car_status") {
+    if (!only_members(data, {"distance_m", "bearing_rad"}) ||
+      !data.isMember("distance_m") || !data.isMember("bearing_rad") ||
+      !data["distance_m"].isNumeric() || !data["bearing_rad"].isNumeric()) {
+      return reject("invalid_car_status_data", now);
+    }
+    const double distance_m = data["distance_m"].asDouble();
+    const double bearing_rad = data["bearing_rad"].asDouble();
+    if (!std::isfinite(distance_m) || !std::isfinite(bearing_rad)) {
+      return reject("nonfinite_car_status", now);
+    }
+    if (distance_m < 0.0 || distance_m > config_.max_tracking_distance_m) {
+      return reject("car_status_distance_out_of_range", now);
+    }
+    const double pi = std::acos(-1.0);
+    if (bearing_rad < -pi || bearing_rad > pi) {
+      return reject("car_status_bearing_out_of_range", now);
+    }
+    event.type = MessageType::car_status;
+    event.car_status = CarStatus{distance_m, bearing_rad};
+  } else if (header == "run_plan1" || header == "go_ahead_ok" || header == "match_car_ok" ||
     header == "b_ok" || header == "ack") {
     if (!data.empty()) {return reject("nonempty_event_data", now);}
     event.type = header == "run_plan1" ? MessageType::run_plan1 :

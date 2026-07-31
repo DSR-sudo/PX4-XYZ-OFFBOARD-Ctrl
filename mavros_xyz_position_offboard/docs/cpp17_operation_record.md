@@ -6,7 +6,11 @@
 | --- | --- |
 | `application/` | Single `ApplicationNode`, fixed 20 Hz loop, LCP Debug subscription, Init-Z latching, and component assembly. |
 | `communication/` | Strict Plan1 value types, fixed-remote UDP, source allowlist, ordered ACK queue, and `xyzstatus` encoding. |
-| `navigation/` | ROS-free Plan1 state machine, ENU target tracker, and bounded XY/Z quintic planner. |
+| `navigation/navigation.hpp` | Compatibility aggregate header and ROS-free mission state-machine coordinator. |
+| `navigation/mission_config.*` | Mission defaults and configuration validation. |
+| `navigation/trajectory_planner.*` | Bounded quintic XYZ+yaw trajectories and continuous replanning. |
+| `navigation/target_tracker.*` | 2D constant-velocity Kalman filtering and intercept-time calculation. |
+| `navigation/navigation_types.*` | Controller inputs, auditable control state/decisions, and `control_json`. |
 | `gripper/` | Non-blocking SG90 adapter using `lgpio` and dynamic Pi 5 RP1 gpiochip discovery. |
 | `initialization/` | MAVROS telemetry, preflight/flight health, LCP start, RangeGuard, and ROS source timestamps. |
 | `bridge/` | LCP NWU-to-ENU external-vision publisher. |

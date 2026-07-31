@@ -1,283 +1,13 @@
 #include "mavros_xyz_position_offboard/navigation/navigation.hpp"
 
-#include "mavros_xyz_position_offboard/common/artifact_log.hpp"
-
-#include <algorithm>
 #include <cmath>
-#include <iomanip>
-#include <sstream>
 #include <stdexcept>
+#include <utility>
 
 namespace mavros_xyz_position_offboard::navigation
 {
-
-/// 用与 Offboard 相同的 ENU XYZ+yaw 表达审计每一个控制状态点。
-std::string control_json(const ControlState & control)
-{
-  const auto setpoint_json = [](const std::optional<common::PositionSetpoint> & setpoint) {
-      if (!setpoint) {return std::string("null");}
-      std::ostringstream encoded;
-      encoded << std::setprecision(12) << "{\"x_m\":" << setpoint->x_m
-              << ",\"y_m\":" << setpoint->y_m << ",\"z_m\":" << setpoint->z_m
-              << ",\"yaw_rad\":" << common::yaw_from_quaternion(setpoint->orientation)
-              << ",\"vertical_rate_m_s\":" << setpoint->vertical_rate_m_s << '}';
-      return encoded.str();
-    };
-  std::ostringstream encoded;
-  encoded << "{\"origin\":" << setpoint_json(control.origin)
-          << ",\"mission_goal\":" << setpoint_json(control.mission_goal)
-          << ",\"commanded_setpoint\":" << setpoint_json(control.commanded_setpoint)
-          << ",\"hold_setpoint\":" << setpoint_json(control.hold_setpoint)
-          << ",\"hold_reason\":\"" << common::json_escape(control.hold_reason)
-          << "\",\"hold_resume_phase\":\"" << common::json_escape(control.hold_resume_phase)
-          << "\",\"mission_paused\":" << (control.mission_paused ? "true" : "false")
-          << ",\"tracking_arrival_time_met\":" <<
-    (control.tracking_arrival_time_met ? "true" : "false")
-          << ",\"target_samples\":" << control.target_samples
-          << ",\"predicted_intercept_seconds\":";
-  if (control.predicted_intercept_seconds) {encoded << *control.predicted_intercept_seconds;}
-  else {encoded << "null";}
-  encoded << '}';
-  return encoded.str();
-}
-
-/// 保存共享配置引用，供所有轨迹约束计算使用。
-TrajectoryPlanner::TrajectoryPlanner(const common::SafetyConfig & config) : config_(config) {}
-
-/// 恢复未锁存状态并丢弃所有进行中的轨迹。
-void TrajectoryPlanner::reset()
-{
-  latched_ = false; flow_effective_ = false; x_m_ = NAN; y_m_ = NAN;
-  target_x_m_ = NAN; target_y_m_ = NAN; xy_velocity_x_m_s_ = 0.0; xy_velocity_y_m_s_ = 0.0;
-  xy_trajectory_elapsed_s_ = 0.0; xy_trajectory_duration_s_ = 0.0; xy_arrival_time_met_ = true;
-  xy_coefficients_ = {};
-  command_z_m_ = NAN; target_z_m_ = NAN; vertical_rate_m_s_ = 0.0; orientation_ = {};
-  trajectory_elapsed_s_ = 0.0; trajectory_duration_s_ = 0.0; coefficients_ = {};
-}
-
-/// 对依赖当前命令点的操作实施“必须先初始化”的不变量。
-void TrajectoryPlanner::require_latched(const char * action) const
-{
-  if (!latched_) {throw std::runtime_error(std::string("position must be latched before ") + action);}
-}
-
-/// 计算零初始加速度、零终点速度/加速度的五次轨迹系数。
-TrajectoryPlanner::Coefficients TrajectoryPlanner::quintic_coefficients(double start, double rate, double target, double duration_s)
-{
-  const double delta = target - start;
-  const double t = duration_s;
-  return {start, rate, 0.0,
-    (20.0 * delta - 12.0 * rate * t) / (2.0 * std::pow(t, 3)),
-    (-30.0 * delta + 16.0 * rate * t) / (2.0 * std::pow(t, 4)),
-    (12.0 * delta - 6.0 * rate * t) / (2.0 * std::pow(t, 5))};
-}
-
-/// 求出五次曲线在指定时间的位置、速度和加速度。
-std::array<double, 3> TrajectoryPlanner::evaluate(const Coefficients & a, double t)
-{
-  const double p = a[0] + a[1] * t + a[2] * t * t + a[3] * std::pow(t, 3) + a[4] * std::pow(t, 4) + a[5] * std::pow(t, 5);
-  const double v = a[1] + 2.0 * a[2] * t + 3.0 * a[3] * t * t + 4.0 * a[4] * std::pow(t, 3) + 5.0 * a[5] * std::pow(t, 4);
-  const double acceleration = 2.0 * a[2] + 6.0 * a[3] * t + 12.0 * a[4] * t * t + 20.0 * a[5] * std::pow(t, 3);
-  return {p, v, acceleration};
-}
-
-/// 校验当前位姿后锁存为轨迹的初始命令点。
-void TrajectoryPlanner::latch(double x_m, double y_m, double z_m, const common::Quaternion & orientation)
-{
-  if (!common::finite(x_m) || !common::finite(y_m) || !common::finite(z_m)) {
-    throw std::invalid_argument("local XYZ pose must be finite before latching");
-  }
-  orientation_ = common::normalize_quaternion(orientation.x, orientation.y, orientation.z, orientation.w);
-  x_m_ = x_m; y_m_ = y_m; target_x_m_ = x_m; target_y_m_ = y_m;
-  xy_velocity_x_m_s_ = 0.0; xy_velocity_y_m_s_ = 0.0; xy_trajectory_elapsed_s_ = 0.0; xy_trajectory_duration_s_ = 0.0;
-  xy_coefficients_ = {{{x_m, 0, 0, 0, 0, 0}, {y_m, 0, 0, 0, 0, 0}}};
-  command_z_m_ = z_m; target_z_m_ = z_m; vertical_rate_m_s_ = 0.0;
-  trajectory_elapsed_s_ = 0.0; trajectory_duration_s_ = 0.0; coefficients_ = {z_m, 0, 0, 0, 0, 0};
-  latched_ = true; flow_effective_ = false;
-}
-
-/// 从当前输出姿态返回偏航角。
-double TrajectoryPlanner::yaw_rad() const {return common::yaw_from_quaternion(orientation_);}
-
-/// 校验并开始一段受限的水平移动。
-void TrajectoryPlanner::set_xy_target(double x_m, double y_m)
-{
-  require_latched("setting an XY target");
-  if (!common::finite(x_m) || !common::finite(y_m)) {throw std::invalid_argument("XY target must be finite");}
-  begin_xy_trajectory(
-    x_m, y_m, std::nullopt, config_.target_xy_max_speed_m_s, config_.target_xy_max_accel_m_s2);
-}
-
-/// 使用调用方提供的速度上限和默认安全加速度约束规划 XY 轨迹。
-void TrajectoryPlanner::set_xy_target_with_max_speed(double x_m, double y_m, double max_speed_m_s)
-{
-  require_latched("setting an XY target with a speed limit");
-  if (!common::finite(x_m) || !common::finite(y_m) || !common::finite(max_speed_m_s) ||
-    max_speed_m_s <= 0.0) {
-    throw std::invalid_argument("XY target and speed limit must be finite and positive");
-  }
-  begin_xy_trajectory(
-    x_m, y_m, std::nullopt, max_speed_m_s, config_.target_xy_max_accel_m_s2);
-}
-
-/// 在不突破既有速度和加速度约束的前提下尝试按指定时长到达 XY 目标。
-bool TrajectoryPlanner::set_xy_target_with_arrival_time(
-  double x_m, double y_m, double arrival_seconds)
-{
-  require_latched("setting a timed XY target");
-  if (!common::finite(x_m) || !common::finite(y_m) || !common::finite(arrival_seconds) ||
-    arrival_seconds <= 0.0) {
-    throw std::invalid_argument("timed XY target and arrival time must be finite and positive");
-  }
-  return begin_xy_trajectory(
-    x_m, y_m, arrival_seconds, config_.target_xy_max_speed_m_s, config_.target_xy_max_accel_m_s2);
-}
-
-/// 立即把水平控制冻结在最新可靠的实测位置。
-void TrajectoryPlanner::freeze_xy_at(double x_m, double y_m)
-{
-  require_latched("freezing XY");
-  if (!common::finite(x_m) || !common::finite(y_m)) {throw std::invalid_argument("frozen XY pose must be finite");}
-  x_m_ = x_m; y_m_ = y_m; target_x_m_ = x_m; target_y_m_ = y_m; xy_velocity_x_m_s_ = 0.0; xy_velocity_y_m_s_ = 0.0;
-  xy_trajectory_elapsed_s_ = 0.0; xy_trajectory_duration_s_ = 0.0; xy_coefficients_ = {{{x_m, 0, 0, 0, 0, 0}, {y_m, 0, 0, 0, 0, 0}}};
-}
-
-/// 在当前规划位置建立零速度水平保持。
-void TrajectoryPlanner::hold_xy() {require_latched("holding XY"); freeze_xy_at(x_m_, y_m_);}
-
-/// 校验并开始一段受限的绝对高度轨迹。
-void TrajectoryPlanner::set_z_target(double z_m)
-{
-  require_latched("setting a Z target");
-  if (!common::finite(z_m)) {throw std::invalid_argument("Z target must be finite");}
-  begin_z_trajectory(z_m);
-}
-
-/// 从当前规划位置和速度连续重规划新的绝对 XYZ 地面站目标。
-void TrajectoryPlanner::set_target(double x_m, double y_m, double z_m)
-{
-  set_xy_target(x_m, y_m); set_z_target(z_m);
-}
-
-/// 停止垂直轨迹并将当前命令高度作为目标。
-void TrajectoryPlanner::freeze_z()
-{
-  require_latched("freezing Z");
-  target_z_m_ = command_z_m_; vertical_rate_m_s_ = 0.0; trajectory_elapsed_s_ = 0.0; trajectory_duration_s_ = 0.0;
-  coefficients_ = {command_z_m_, 0, 0, 0, 0, 0};
-}
-
-/// 立即将垂直保持点对齐到可靠的实测高度。
-void TrajectoryPlanner::freeze_z_at(double z_m)
-{
-  require_latched("freezing Z at a measurement");
-  if (!common::finite(z_m)) {throw std::invalid_argument("frozen Z must be finite");}
-  command_z_m_ = z_m; target_z_m_ = z_m; vertical_rate_m_s_ = 0.0;
-  trajectory_elapsed_s_ = 0.0; trajectory_duration_s_ = 0.0; coefficients_ = {z_m, 0, 0, 0, 0, 0};
-}
-
-/// 从给定偏航构造纯 Z 轴旋转四元数。
-void TrajectoryPlanner::set_yaw_rad(double yaw)
-{
-  if (!common::finite(yaw)) {throw std::invalid_argument("yaw target must be finite");}
-  orientation_ = {0.0, 0.0, std::sin(0.5 * yaw), std::cos(0.5 * yaw)};
-}
-
-/// 迭代拉长五次 Z 轨迹，直到速度与加速度峰值均满足配置。
-void TrajectoryPlanner::begin_z_trajectory(double target)
-{
-  target_z_m_ = target;
-  const double distance = std::abs(target - command_z_m_);
-  if (distance < 1e-9 && std::abs(vertical_rate_m_s_) < 1e-9) {
-    command_z_m_ = target; vertical_rate_m_s_ = 0.0; trajectory_elapsed_s_ = 0.0; trajectory_duration_s_ = 0.0; coefficients_ = {target, 0, 0, 0, 0, 0}; return;
-  }
-  double duration = std::max({0.5, 2.0 * distance / config_.max_z_setpoint_rate_m_s,
-    std::sqrt(6.0 * distance / config_.max_z_setpoint_accel_m_s2), 2.0 * std::abs(vertical_rate_m_s_) / config_.max_z_setpoint_accel_m_s2});
-  auto candidate = quintic_coefficients(command_z_m_, vertical_rate_m_s_, target, duration);
-  for (int iteration = 0; iteration < 12; ++iteration) {
-    double peak_rate = 0.0; double peak_acceleration = 0.0;
-    for (int index = 0; index <= 200; ++index) {
-      const auto state = evaluate(candidate, duration * static_cast<double>(index) / 200.0);
-      peak_rate = std::max(peak_rate, std::abs(state[1])); peak_acceleration = std::max(peak_acceleration, std::abs(state[2]));
-    }
-    const double scale = std::max({1.0, peak_rate / config_.max_z_setpoint_rate_m_s, std::sqrt(peak_acceleration / config_.max_z_setpoint_accel_m_s2)});
-    if (scale <= 1.000001) {break;}
-    duration *= scale * 1.01; candidate = quintic_coefficients(command_z_m_, vertical_rate_m_s_, target, duration);
-  }
-  trajectory_elapsed_s_ = 0.0; trajectory_duration_s_ = duration; coefficients_ = candidate;
-}
-
-/// 迭代拉长二维五次轨迹，直到合成速度与加速度满足配置。
-bool TrajectoryPlanner::begin_xy_trajectory(
-  double target_x, double target_y, const std::optional<double> & arrival_seconds,
-  double max_speed_m_s, double max_accel_m_s2)
-{
-  const double distance = std::hypot(target_x - x_m_, target_y - y_m_);
-  const double speed = std::hypot(xy_velocity_x_m_s_, xy_velocity_y_m_s_);
-  target_x_m_ = target_x; target_y_m_ = target_y;
-  if (distance < 1e-9 && speed < 1e-9) {
-    x_m_ = target_x; y_m_ = target_y; xy_velocity_x_m_s_ = 0.0; xy_velocity_y_m_s_ = 0.0; xy_trajectory_elapsed_s_ = 0.0; xy_trajectory_duration_s_ = 0.0;
-    xy_coefficients_ = {{{target_x, 0, 0, 0, 0, 0}, {target_y, 0, 0, 0, 0, 0}}};
-    xy_arrival_time_met_ = true;
-    return true;
-  }
-  double duration = arrival_seconds.value_or(std::max({0.5,
-    2.0 * distance / max_speed_m_s,
-    std::sqrt(6.0 * distance / max_accel_m_s2),
-    2.0 * speed / max_accel_m_s2}));
-  auto candidate = std::array<Coefficients, 2>{quintic_coefficients(x_m_, xy_velocity_x_m_s_, target_x, duration), quintic_coefficients(y_m_, xy_velocity_y_m_s_, target_y, duration)};
-  for (int iteration = 0; iteration < 12; ++iteration) {
-    double peak_rate = 0.0; double peak_acceleration = 0.0;
-    for (int index = 0; index <= 200; ++index) {
-      const auto x = evaluate(candidate[0], duration * static_cast<double>(index) / 200.0);
-      const auto y = evaluate(candidate[1], duration * static_cast<double>(index) / 200.0);
-      peak_rate = std::max(peak_rate, std::hypot(x[1], y[1])); peak_acceleration = std::max(peak_acceleration, std::hypot(x[2], y[2]));
-    }
-    const double scale = std::max({
-      1.0, peak_rate / max_speed_m_s, std::sqrt(peak_acceleration / max_accel_m_s2)});
-    if (scale <= 1.000001) {break;}
-    duration *= scale * 1.01;
-    candidate = {quintic_coefficients(x_m_, xy_velocity_x_m_s_, target_x, duration), quintic_coefficients(y_m_, xy_velocity_y_m_s_, target_y, duration)};
-  }
-  xy_trajectory_elapsed_s_ = 0.0;
-  xy_trajectory_duration_s_ = duration;
-  xy_coefficients_ = candidate;
-  xy_arrival_time_met_ = !arrival_seconds || duration <= *arrival_seconds * 1.000001;
-  return xy_arrival_time_met_;
-}
-
-/// 按有限正 dt 推进所有活动轨迹并钳制异常长控制周期。
-common::PositionSetpoint TrajectoryPlanner::update(double dt_s)
-{
-  require_latched("updating the planner");
-  if (!common::finite(dt_s) || dt_s <= 0.0) {throw std::invalid_argument("planner dt must be finite and positive");}
-  dt_s = std::min(dt_s, 0.25);
-  if (xy_trajectory_duration_s_ > 0.0) {
-    xy_trajectory_elapsed_s_ = std::min(xy_trajectory_elapsed_s_ + dt_s, xy_trajectory_duration_s_);
-    const auto x = evaluate(xy_coefficients_[0], xy_trajectory_elapsed_s_); const auto y = evaluate(xy_coefficients_[1], xy_trajectory_elapsed_s_);
-    x_m_ = x[0]; y_m_ = y[0]; xy_velocity_x_m_s_ = x[1]; xy_velocity_y_m_s_ = y[1];
-    if (xy_trajectory_elapsed_s_ >= xy_trajectory_duration_s_) {x_m_ = target_x_m_; y_m_ = target_y_m_; xy_velocity_x_m_s_ = 0.0; xy_velocity_y_m_s_ = 0.0; xy_trajectory_duration_s_ = 0.0;}
-  }
-  if (trajectory_duration_s_ > 0.0) {
-    trajectory_elapsed_s_ = std::min(trajectory_elapsed_s_ + dt_s, trajectory_duration_s_);
-    const auto state = evaluate(coefficients_, trajectory_elapsed_s_); command_z_m_ = state[0]; vertical_rate_m_s_ = state[1];
-    if (trajectory_elapsed_s_ >= trajectory_duration_s_) {command_z_m_ = target_z_m_; vertical_rate_m_s_ = 0.0; trajectory_duration_s_ = 0.0;}
-  }
-  return current();
-}
-
-/// 封装当前内部规划状态为跨层传递的 PositionSetpoint。
-common::PositionSetpoint TrajectoryPlanner::current() const
-{
-  require_latched("reading the planner");
-  return {x_m_, y_m_, command_z_m_, orientation_, vertical_rate_m_s_};
-}
-
 namespace
 {
-
-constexpr double kInnovationGate99Percent2d = 9.210340371976184;
-constexpr double kSmall = 1e-9;
 
 double normalized_angle(double angle)
 {
@@ -291,181 +21,6 @@ double nearest_cardinal(double angle)
 }
 
 }  // namespace
-
-void MissionConfig::validate() const
-{
-  const double values[] = {
-    takeoff_height_m, height_stable_seconds, b_right_m, b_forward_m,
-    throw_distance_m, filter_measurement_noise_m,
-    filter_acceleration_noise_m_s2, prediction_horizon_s, cardinal_tolerance_deg,
-    final_intercept_seconds, car_status_timeout_s, max_tracking_radius_m};
-  for (const double value : values) {
-    if (!common::finite(value) || value <= 0.0) {
-      throw std::invalid_argument("mission configuration values must be finite and positive");
-    }
-  }
-  if (filter_min_samples < 3) {
-    throw std::invalid_argument("target tracker requires at least three observations");
-  }
-  if (cardinal_tolerance_deg > 45.0) {
-    throw std::invalid_argument("cardinal tolerance must not exceed 45 degrees");
-  }
-  if (final_intercept_seconds >= prediction_horizon_s) {
-    throw std::invalid_argument("final intercept window must be shorter than prediction horizon");
-  }
-}
-
-TargetTracker::TargetTracker(const MissionConfig & config) : config_(config) {}
-
-void TargetTracker::reset()
-{
-  initialized_ = false;
-  samples_ = 0;
-  state_time_ = 0.0;
-  state_ = {};
-  covariance_ = {};
-}
-
-void TargetTracker::predict_to(double at)
-{
-  if (!initialized_ || at <= state_time_) {return;}
-  const double dt = at - state_time_;
-  const std::array<std::array<double, 4>, 4> transition{{
-    {{1.0, 0.0, dt, 0.0}}, {{0.0, 1.0, 0.0, dt}},
-    {{0.0, 0.0, 1.0, 0.0}}, {{0.0, 0.0, 0.0, 1.0}}}};
-  std::array<double, 4> predicted{};
-  std::array<std::array<double, 4>, 4> propagated{};
-  for (int row = 0; row < 4; ++row) {
-    for (int column = 0; column < 4; ++column) {
-      predicted[row] += transition[row][column] * state_[column];
-      for (int inner = 0; inner < 4; ++inner) {
-        propagated[row][column] += transition[row][inner] * covariance_[inner][column];
-      }
-    }
-  }
-  std::array<std::array<double, 4>, 4> predicted_covariance{};
-  for (int row = 0; row < 4; ++row) {
-    for (int column = 0; column < 4; ++column) {
-      for (int inner = 0; inner < 4; ++inner) {
-        predicted_covariance[row][column] += propagated[row][inner] * transition[column][inner];
-      }
-    }
-  }
-  const double acceleration_variance = std::pow(config_.filter_acceleration_noise_m_s2, 2);
-  const double dt2 = dt * dt;
-  const double dt3 = dt2 * dt;
-  const double dt4 = dt2 * dt2;
-  const double position_noise = 0.25 * dt4 * acceleration_variance;
-  const double cross_noise = 0.5 * dt3 * acceleration_variance;
-  const double velocity_noise = dt2 * acceleration_variance;
-  predicted_covariance[0][0] += position_noise;
-  predicted_covariance[1][1] += position_noise;
-  predicted_covariance[0][2] += cross_noise;
-  predicted_covariance[2][0] += cross_noise;
-  predicted_covariance[1][3] += cross_noise;
-  predicted_covariance[3][1] += cross_noise;
-  predicted_covariance[2][2] += velocity_noise;
-  predicted_covariance[3][3] += velocity_noise;
-  state_ = predicted;
-  covariance_ = predicted_covariance;
-  state_time_ = at;
-}
-
-bool TargetTracker::update(double x_m, double y_m, double received_at)
-{
-  if (!common::finite(x_m) || !common::finite(y_m) || !common::finite(received_at)) {
-    return false;
-  }
-  const double measurement_variance = std::pow(config_.filter_measurement_noise_m, 2);
-  if (!initialized_) {
-    reset();
-    initialized_ = true;
-    samples_ = 1;
-    state_time_ = received_at;
-    state_ = {{x_m, y_m, 0.0, 0.0}};
-    covariance_[0][0] = measurement_variance;
-    covariance_[1][1] = measurement_variance;
-    covariance_[2][2] = 4.0;
-    covariance_[3][3] = 4.0;
-    return true;
-  }
-  predict_to(received_at);
-  const double innovation_x = x_m - state_[0];
-  const double innovation_y = y_m - state_[1];
-  const double s00 = covariance_[0][0] + measurement_variance;
-  const double s01 = covariance_[0][1];
-  const double s11 = covariance_[1][1] + measurement_variance;
-  const double determinant = s00 * s11 - s01 * s01;
-  if (determinant <= kSmall) {return false;}
-  const double nis = (innovation_x * innovation_x * s11 - 2.0 * innovation_x * innovation_y * s01 +
-    innovation_y * innovation_y * s00) / determinant;
-  if (!common::finite(nis) || nis > kInnovationGate99Percent2d) {return false;}
-  std::array<std::array<double, 2>, 4> gain{};
-  for (int row = 0; row < 4; ++row) {
-    gain[row][0] = (covariance_[row][0] * s11 - covariance_[row][1] * s01) / determinant;
-    gain[row][1] = (covariance_[row][1] * s00 - covariance_[row][0] * s01) / determinant;
-  }
-  for (int row = 0; row < 4; ++row) {
-    state_[row] += gain[row][0] * innovation_x + gain[row][1] * innovation_y;
-  }
-  std::array<std::array<double, 4>, 4> corrected{};
-  for (int row = 0; row < 4; ++row) {
-    for (int column = 0; column < 4; ++column) {
-      corrected[row][column] = covariance_[row][column] - gain[row][0] * covariance_[0][column] -
-        gain[row][1] * covariance_[1][column];
-    }
-  }
-  for (int row = 0; row < 4; ++row) {
-    for (int column = row; column < 4; ++column) {
-      const double symmetric = 0.5 * (corrected[row][column] + corrected[column][row]);
-      covariance_[row][column] = symmetric;
-      covariance_[column][row] = symmetric;
-    }
-  }
-  ++samples_;
-  return true;
-}
-
-TargetEstimate TargetTracker::estimate(double at) const
-{
-  TargetEstimate result;
-  result.initialized = initialized_;
-  result.samples = samples_;
-  if (!initialized_) {return result;}
-  const double dt = std::max(0.0, at - state_time_);
-  result.x_m = state_[0] + state_[2] * dt;
-  result.y_m = state_[1] + state_[3] * dt;
-  result.vx_m_s = state_[2];
-  result.vy_m_s = state_[3];
-  return result;
-}
-
-std::optional<double> TargetTracker::time_to_distance(
-  double own_x_m, double own_y_m, double own_vx_m_s, double own_vy_m_s,
-  double distance_m, double now, double horizon_s) const
-{
-  if (!initialized_ || !common::finite(own_x_m) || !common::finite(own_y_m) ||
-    !common::finite(own_vx_m_s) || !common::finite(own_vy_m_s) ||
-    !common::finite(distance_m) || !common::finite(now) || !common::finite(horizon_s) ||
-    distance_m <= 0.0 || horizon_s <= 0.0) {
-    return std::nullopt;
-  }
-  const auto target = estimate(now);
-  const double relative_x = target.x_m - own_x_m;
-  const double relative_y = target.y_m - own_y_m;
-  const double relative_vx = target.vx_m_s - own_vx_m_s;
-  const double relative_vy = target.vy_m_s - own_vy_m_s;
-  const double a = relative_vx * relative_vx + relative_vy * relative_vy;
-  const double b = relative_x * relative_vx + relative_y * relative_vy;
-  const double c = relative_x * relative_x + relative_y * relative_y - distance_m * distance_m;
-  if (c <= 0.0) {return 0.0;}
-  if (a <= kSmall) {return std::nullopt;}
-  const double discriminant = b * b - a * c;
-  if (discriminant < 0.0) {return std::nullopt;}
-  const double root = (-b - std::sqrt(discriminant)) / a;
-  if (root < 0.0 || root > horizon_s) {return std::nullopt;}
-  return root;
-}
 
 Navigation::Navigation(const common::SafetyConfig & config, MissionConfig mission)
 : config_(config), mission_(std::move(mission)), planner_(config), target_tracker_(mission_)
@@ -502,9 +57,15 @@ void Navigation::transition(const std::string & phase, double now)
   phase_started_at_ = now;
 }
 
-void Navigation::emit(communication::MessageType type) {pending_messages_.push_back({type});}
+void Navigation::emit(communication::MessageType type)
+{
+  pending_messages_.push_back({type});
+}
 
-void Navigation::reject(const std::string & reason) {pending_rejections_.push_back(reason);}
+void Navigation::reject(const std::string & reason)
+{
+  pending_rejections_.push_back(reason);
+}
 
 bool Navigation::actual_xy_within(
   const common::Telemetry & telemetry, double x, double y, double tolerance) const
@@ -589,7 +150,8 @@ void Navigation::clear_hold()
 
 void Navigation::resume_hold(double now)
 {
-  const std::string resume = control_.hold_resume_phase.empty() ? "waiting_target" : control_.hold_resume_phase;
+  const std::string resume = control_.hold_resume_phase.empty() ?
+    "waiting_target" : control_.hold_resume_phase;
   plan_to_mission_goal();
   clear_hold();
   transition(resume, now);
@@ -626,7 +188,8 @@ void Navigation::begin_transit_to_b()
 
 void Navigation::update_own_velocity(const NavigationInput & input)
 {
-  if (common::finite(input.telemetry.velocity_x_m_s) && common::finite(input.telemetry.velocity_y_m_s)) {
+  if (common::finite(input.telemetry.velocity_x_m_s) &&
+    common::finite(input.telemetry.velocity_y_m_s)) {
     own_vx_m_s_ = input.telemetry.velocity_x_m_s;
     own_vy_m_s_ = input.telemetry.velocity_y_m_s;
   } else if (last_own_pose_at_ && last_own_x_m_ && last_own_y_m_ &&
@@ -643,7 +206,8 @@ void Navigation::update_own_velocity(const NavigationInput & input)
   }
 }
 
-bool Navigation::apply_car_status(const NavigationInput & input, const communication::CarStatus & status)
+bool Navigation::apply_car_status(
+  const NavigationInput & input, const communication::CarStatus & status)
 {
   if (!control_.origin || !common::finite(input.telemetry.local_x_m) ||
     !common::finite(input.telemetry.local_y_m)) {
@@ -853,7 +417,8 @@ NavigationDecision Navigation::update(const NavigationInput & input)
     } else if (input.controller.mode != "OFFBOARD") {
       begin_landing(input.now, "offboard_mode_lost");
     } else if (!input.flight_healthy) {
-      begin_landing(input.now, input.health_errors.empty() ? "flight_health_failure" : input.health_errors.front());
+      begin_landing(input.now, input.health_errors.empty() ?
+        "flight_health_failure" : input.health_errors.front());
     } else {
       planner_.latch(input.telemetry.local_x_m, input.telemetry.local_y_m,
         input.telemetry.local_z_m, input.telemetry.orientation);
@@ -897,8 +462,8 @@ NavigationDecision Navigation::update(const NavigationInput & input)
       enter_hold(input, "lcp_hold", "car_status_timeout", "waiting_target");
     } else if (phase_ == "final_intercept" && intercept_due_at_ && input.now >= *intercept_due_at_) {
       const auto estimate = target_tracker_.estimate(input.now);
-      if (std::hypot(estimate.x_m - input.telemetry.local_x_m, estimate.y_m - input.telemetry.local_y_m) <=
-        mission_.throw_distance_m) {
+      if (std::hypot(estimate.x_m - input.telemetry.local_x_m,
+          estimate.y_m - input.telemetry.local_y_m) <= mission_.throw_distance_m) {
         pending_release_gripper_ = true;
         transition("throwing", input.now);
       } else {
@@ -944,7 +509,8 @@ NavigationDecision Navigation::update(const NavigationInput & input)
 
   const bool waiting_gcs_phase = phase_ == "waiting_run_plan1" || phase_ == "setpoint_warmup";
   if (waiting_gcs_phase && !input.preflight_ready) {reset();}
-  const bool post_run_prearm_phase = phase_ == "offboard_request_pending" || phase_ == "arming_request_pending";
+  const bool post_run_prearm_phase =
+    phase_ == "offboard_request_pending" || phase_ == "arming_request_pending";
   if (post_run_prearm_phase && !input.controller.armed && !input.preflight_ready) {
     reset();
     transition("manual_request_pending", input.now);
@@ -956,7 +522,8 @@ NavigationDecision Navigation::update(const NavigationInput & input)
     phase_ != "arming_request_pending" && phase_ != "manual";
   if (airborne && phase_ != "landing" && phase_ != "downing" && phase_ != "disarming" &&
     phase_ != "manual_request_pending" && !input.flight_healthy) {
-    begin_landing(input.now, input.health_errors.empty() ? "flight_health_failure" : input.health_errors.front());
+    begin_landing(input.now, input.health_errors.empty() ?
+      "flight_health_failure" : input.health_errors.front());
   }
   if (airborne && phase_ != "landing" && phase_ != "downing" && phase_ != "disarming" &&
     phase_ != "manual_request_pending" && input.controller.mode != "OFFBOARD") {
@@ -986,15 +553,17 @@ NavigationDecision Navigation::update(const NavigationInput & input)
     decision.setpoint = planner_.update(input.dt);
     control_.commanded_setpoint = decision.setpoint;
   }
-  if (phase_ == "offboard_request_pending" || phase_ == "arming_request_pending" || phase_ == "climb" ||
-    phase_ == "height_stabilizing" || phase_ == "transit_to_b" || phase_ == "waiting_target" ||
-    phase_ == "cardinal_alignment" || phase_ == "final_intercept" || phase_ == "throwing" ||
-    phase_ == "returning" || phase_ == "lcp_hold" || phase_ == "downing") {
+  if (phase_ == "offboard_request_pending" || phase_ == "arming_request_pending" ||
+    phase_ == "climb" || phase_ == "height_stabilizing" || phase_ == "transit_to_b" ||
+    phase_ == "waiting_target" || phase_ == "cardinal_alignment" ||
+    phase_ == "final_intercept" || phase_ == "throwing" || phase_ == "returning" ||
+    phase_ == "lcp_hold" || phase_ == "downing") {
     decision.target_mode = "OFFBOARD";
   }
   if (phase_ == "landing" && !landing_reason_.empty()) {decision.target_mode = "AUTO.LAND";}
-  if (phase_ == "arming_request_pending" || phase_ == "climb" || phase_ == "height_stabilizing" ||
-    phase_ == "transit_to_b" || phase_ == "waiting_target" || phase_ == "cardinal_alignment" ||
+  if (phase_ == "arming_request_pending" || phase_ == "climb" ||
+    phase_ == "height_stabilizing" || phase_ == "transit_to_b" ||
+    phase_ == "waiting_target" || phase_ == "cardinal_alignment" ||
     phase_ == "final_intercept" || phase_ == "throwing" || phase_ == "returning" ||
     phase_ == "lcp_hold" || phase_ == "downing" || phase_ == "landing") {
     decision.arm_intent = true;
@@ -1005,4 +574,4 @@ NavigationDecision Navigation::update(const NavigationInput & input)
   return decision;
 }
 
-}  // mavros_xyz_position_offboard::navigation namespace
+}  // namespace mavros_xyz_position_offboard::navigation

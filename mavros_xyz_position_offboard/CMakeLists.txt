@@ -30,7 +30,11 @@ add_library(${PROJECT_NAME}_core
   src/communication/ground_station_link.cpp
   src/gripper/pwm_gripper.cpp
   src/initialization/initialization.cpp
+  src/navigation/mission_config.cpp
   src/navigation/navigation.cpp
+  src/navigation/navigation_types.cpp
+  src/navigation/target_tracker.cpp
+  src/navigation/trajectory_planner.cpp
   src/offboard/offboard.cpp)
 target_include_directories(${PROJECT_NAME}_core
   PUBLIC
@@ -67,6 +71,24 @@ if(BUILD_TESTING)
     ament_target_dependencies(test_lcp_navigation rclcpp lslidar_msgs)
     target_compile_definitions(test_lcp_navigation PRIVATE MAVROS_XYZ_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     target_compile_options(test_lcp_navigation PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+
+  ament_add_gtest(test_navigation_trajectory test/test_navigation_trajectory.cpp)
+  if(TARGET test_navigation_trajectory)
+    target_link_libraries(test_navigation_trajectory ${PROJECT_NAME}_core)
+    target_compile_options(test_navigation_trajectory PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+
+  ament_add_gtest(test_navigation_target_tracker test/test_navigation_target_tracker.cpp)
+  if(TARGET test_navigation_target_tracker)
+    target_link_libraries(test_navigation_target_tracker ${PROJECT_NAME}_core)
+    target_compile_options(test_navigation_target_tracker PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+
+  ament_add_gtest(test_navigation_state_machine test/test_navigation_state_machine.cpp)
+  if(TARGET test_navigation_state_machine)
+    target_link_libraries(test_navigation_state_machine ${PROJECT_NAME}_core)
+    target_compile_options(test_navigation_state_machine PRIVATE -Wall -Wextra -Wpedantic)
   endif()
 
   ament_add_gtest(test_simulated_ground_station test/test_simulated_ground_station.cpp SKIP_LINKING_MAIN_LIBRARIES)

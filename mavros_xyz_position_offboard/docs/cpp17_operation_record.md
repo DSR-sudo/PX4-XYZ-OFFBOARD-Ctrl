@@ -44,7 +44,6 @@ is copied into one `xyzstatus` datagram immediately. It is independent of event 
 | `mission.car_status_timeout_s` | `2.0` | Time without a valid visual update before measured-position hold. |
 | `mission.max_tracking_radius_m` | `5.0` | Maximum visual target radius from the locked Init XY origin. |
 | `z.prefer_range` | `false` | Select Range-relative Z after field calibration. |
-| `z.tracking_use_local_pose` | `true` | Force local-pose Z during visual tracking and accompaniment. |
 | `z.source_timeout_s` | `0.5` | Freshness limit for pose/Range Z sources. |
 | `z.range_cross_check_max_delta_m` | `0.30` | Maximum local-vs-Range relative-Z disagreement. |
 | `gripper_pwm.enabled` | `true` | Enables the calibrated physical SG90 output; override to `false` for SITL. |
@@ -105,10 +104,6 @@ values and the event order.
   `mission.match_hold_seconds`, then starts PWM release. Once release succeeds, `ok_throw` is sent
   and fresh visual updates continue in `accompanying_car` until `b_ok`. A visual timeout freezes at
   the measured position and a fresh status restores the interrupted tracking stage.
-- During visual tracking and accompaniment, the task Z target and `xyzstatus` both use MAVROS
-  local-pose Z. This prevents an inconsistent downward range value from being reported to the GCS
-  as a UAV descent, but cannot prevent a range sample already fused by PX4 EKF2 from moving the
-  FCU's local-pose estimate.
 - LCP failure during climb does not interrupt climb. Later LCP failure holds the measured
   position until recovery, then resumes the interrupted final target; mode/flight-health loss
   and max-flight timeout retain their existing safe paths.

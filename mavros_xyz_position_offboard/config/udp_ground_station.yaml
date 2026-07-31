@@ -142,8 +142,6 @@ mavros_native_xyz_position:
     z:
       # true 时优先使用测距高度，false 时优先使用本地位姿高度。
       prefer_range: false
-      # 视觉跟踪/伴飞时强制使用 MAVROS 本地位姿 Z，避免下视测距误将地面起伏识别为无人机下降。
-      tracking_use_local_pose: true
       # 高度来源数据的最大新鲜时间，单位：秒。
       source_timeout_s: 0.5
       # 本地位姿高度与测距高度的最大允许差值，单位：米。

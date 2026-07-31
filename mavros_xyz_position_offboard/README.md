@@ -104,19 +104,11 @@ fresh valid down range is baselined at the same point and checks relative Z cons
 (`z.range_cross_check_max_delta_m`, default `0.30 m`); set
 `z.prefer_range:true` only after field validation.
 
-Outside visual tracking, when no selected source is fresh, valid, and consistent, LCP is still
-sent with exactly:
+When no selected source is fresh, valid, and consistent, LCP is still sent with exactly:
 
 ```json
 "position_z_m":null,"z_source":"none","z_source_stamp":null,"z_quality":null,"z_valid":false
 ```
-
-During visual tracking, match hold, release, and post-release accompaniment,
-`z.tracking_use_local_pose:true` forces `xyzstatus` to use MAVROS local-pose Z even when
-`z.prefer_range:true`. This keeps a downward-lidar reading caused by an approximately 11 cm ground
-or target-height change from being reported to the GCS as a UAV descent; range remains a health
-input. This application-level policy cannot isolate PX4's EKF2 altitude estimate from a range
-sensor that PX4 has already fused through MAVLink.
 
 ## Build and Test
 

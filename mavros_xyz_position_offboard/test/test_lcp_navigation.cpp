@@ -513,7 +513,6 @@ TEST(NavigationV2Test, CompleteMissionAlignsRightThenPursuesAfterGcsApproval)
   EXPECT_EQ(navigation.phase(), "accompanying_car");
   EXPECT_NEAR(navigation.planner().target_x_m(), 0.60 + 0.30 * std::cos(0.20), 1e-9);
   EXPECT_NEAR(navigation.planner().target_y_m(), -0.475 + 0.30 * std::sin(0.20), 1e-9);
-  EXPECT_NEAR(navigation.planner().target_z_m(), 1.90, 1e-9);
 
   input.events = {event(MessageType::b_ok, input.now)};
   decision = navigation.update(input);
@@ -1447,7 +1446,6 @@ TEST(ApplicationNodeSafetyParameterTest, YamlParametersOverrideCliDefaultsAtStar
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.match_hold_seconds").as_double(), 0.5);
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.car_status_timeout_s").as_double(), 2.0);
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.max_tracking_radius_m").as_double(), 5.0);
-  EXPECT_TRUE(node->get_parameter("z.tracking_use_local_pose").as_bool());
   EXPECT_EQ(node->get_parameter("gripper_pwm.bcm_gpio").as_int(), 18);
   EXPECT_DOUBLE_EQ(node->get_parameter("gripper_pwm.pwm_frequency_hz").as_double(), 50.0);
   EXPECT_DOUBLE_EQ(node->get_parameter("gripper_pwm.closed_duty_cycle").as_double(), 4.0);

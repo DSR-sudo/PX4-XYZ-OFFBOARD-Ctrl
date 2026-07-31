@@ -18,8 +18,10 @@ constexpr int MAV_STATE_STANDBY = 3;
 constexpr int MAV_STATE_ACTIVE = 4;
 constexpr int MAV_LANDED_STATE_ON_GROUND = 1;
 constexpr std::uint32_t MAV_SYS_STATUS_PREARM_CHECK = 1U << 28U;
+constexpr std::uint32_t MAV_SYS_STATUS_SENSOR_BATTERY = 1U << 25U;
 constexpr std::uint32_t MAV_SYS_STATUS_ACCEPTABLE_UNHEALTHY_MASK =
-  (1U << 8U) | (1U << 9U) | (1U << 10U) | (1U << 11U) | (1U << 14U) | (1U << 16U);
+  (1U << 8U) | (1U << 9U) | (1U << 10U) | (1U << 11U) | (1U << 14U) | (1U << 16U) |
+  MAV_SYS_STATUS_SENSOR_BATTERY;
 
 /// 判断数值是否为可用于控制计算的有限值。
 inline bool finite(double value) {return std::isfinite(value);}

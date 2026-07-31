@@ -140,6 +140,9 @@ struct MissionConfig
   double match_hold_seconds{0.5};
   double car_status_timeout_s{2.0};
   double max_tracking_radius_m{5.0};
+  double accompanying_z_jump_threshold_m{0.10};
+  double accompanying_z_step_m{0.11};
+  double accompanying_z_jump_window_s{0.10};
 
   /// 校验起飞、右移、前飞和视觉跟踪参数。
   void validate() const;
@@ -176,6 +179,7 @@ struct ControlState
   std::string hold_resume_phase{};
   bool mission_paused{false};
   bool tracking_arrival_time_met{true};
+  double accompanying_z_offset_m{0.0};
 };
 
 /// 将完整控制状态编码为 JSON 对象，供 JSONL 审计和单元测试共同使用。
@@ -258,6 +262,10 @@ private:
   bool car_status_fresh(double now) const;
   /// 当前视觉超时保持是否由投放后的伴飞阶段进入。
   bool accompanying_timeout_hold() const;
+  /// 用 EKF 本地高度的突变抵消伴飞位置控制中的错误高度修正。
+  void update_accompanying_z_compensation(const NavigationInput & input);
+  /// 清除仅属于当前伴飞阶段的临时高度补偿。
+  void reset_accompanying_z_compensation();
   /// 判断阶段是否必须因 LCP 不健康冻结位置。
   bool lcp_required_in_phase() const;
 
@@ -275,6 +283,7 @@ private:
   bool pending_release_gripper_{false};
   std::optional<double> last_car_status_at_{};
   std::optional<double> latest_car_distance_m_{};
+  std::optional<double> last_accompanying_local_z_m_{};
 };
 
 }  // mavros_xyz_position_offboard::navigation 命名空间

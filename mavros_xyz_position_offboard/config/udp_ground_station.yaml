@@ -8,11 +8,11 @@ mavros_native_xyz_position:
       # 本机 UDP 监听端口。
       bind_port: 5005
       # 地面站 UDP 目标地址。
-      remote_ip: 192.168.10.59
+      remote_ip: 192.168.10.22
       # 地面站 UDP 目标端口。
       remote_port: 5005
       # 仅接受此 IP 地址发来的 UDP 数据报。
-      whitelist_ip: 192.168.10.59
+      whitelist_ip: 192.168.10.22
       # 仅接受此端口发来的 UDP 数据报。
       whitelist_port: 5005
       # 需要确认的业务事件重发周期，单位：秒。
@@ -138,6 +138,12 @@ mavros_native_xyz_position:
       car_status_timeout_s: 2.0
       # 视觉目标相对起飞原点的最大允许半径，单位：米。
       max_tracking_radius_m: 5.0
+      # 伴飞时触发 EKF 高度突变补偿的最小本地 Z 变化，单位：米。
+      accompanying_z_jump_threshold_m: 0.10
+      # 伴飞高度突变的临时设定点补偿步长，单位：米。
+      accompanying_z_step_m: 0.11
+      # 伴飞高度突变需在此时间窗口内发生，单位：秒。
+      accompanying_z_jump_window_s: 0.10
 
     z:
       # true 时优先使用测距高度，false 时优先使用本地位姿高度。

@@ -38,3 +38,21 @@ python3 /home/pi/px4-test-tools/mavros_xyz_position_offboard/test/simulated_grou
   --command-wait-s 4.0 \
   --max-duration-s 180.0 \
   --line-centered
+
+
+
+cd /home/pi/px4-test-tools
+source /opt/ros/jazzy/setup.bash
+source /home/pi/LSLIDARN10P/install/setup.bash
+source /home/pi/px4-test-tools/install/setup.bash
+
+ros2 launch mavros_xyz_position_offboard flight_stack.launch.py \
+  fcu_url:=/dev/serial/by-id/usb-3D_Robotics_PX4_FMU_v5.x_0-if00:2000000 \
+  enable_bounded_flight:=true \
+  flight_evidence_label:=px4_xy_fusion_verified \
+  udp_bind_ip:=0.0.0.0 \
+  udp_bind_port:=5005 \
+  udp_remote_ip:=192.168.10.22 \
+  udp_remote_port:=5005 \
+  udp_whitelist_ip:=192.168.10.22 \
+  udp_whitelist_port:=5005

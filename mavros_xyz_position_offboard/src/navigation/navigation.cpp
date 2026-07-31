@@ -32,7 +32,8 @@ std::string control_json(const ControlState & control)
           << "\",\"hold_resume_phase\":\"" << common::json_escape(control.hold_resume_phase)
           << "\",\"mission_paused\":" << (control.mission_paused ? "true" : "false")
           << ",\"tracking_arrival_time_met\":" <<
-    (control.tracking_arrival_time_met ? "true" : "false") << '}';
+    (control.tracking_arrival_time_met ? "true" : "false")
+          << ",\"accompanying_z_offset_m\":" << control.accompanying_z_offset_m << '}';
   return encoded.str();
 }
 
@@ -258,7 +259,8 @@ void MissionConfig::validate() const
   const double values[] = {
     takeoff_height_m, height_stable_seconds, right_shift_m, forward_distance_m,
     tracking_arrival_seconds, tracking_tolerance_m, match_hold_seconds, car_status_timeout_s,
-    max_tracking_radius_m};
+    max_tracking_radius_m, accompanying_z_jump_threshold_m, accompanying_z_step_m,
+    accompanying_z_jump_window_s};
   for (const double value : values) {
     if (!common::finite(value) || value <= 0.0) {
       throw std::invalid_argument("mission configuration values must be finite and positive");
@@ -291,6 +293,7 @@ void Navigation::reset()
   pending_release_gripper_ = false;
   last_car_status_at_.reset();
   latest_car_distance_m_.reset();
+  last_accompanying_local_z_m_.reset();
 }
 
 /// 切换任务阶段，并记录新阶段的开始时间。
@@ -339,6 +342,7 @@ bool Navigation::actual_yaw_within(
 /// 固定当前水平位置、规划下降到初始高度并进入降落阶段。
 void Navigation::begin_landing(double now, const std::string & reason)
 {
+  reset_accompanying_z_compensation();
   if (planner_.latched()) {
     clear_hold();
     planner_.hold_xy();
@@ -414,6 +418,9 @@ void Navigation::resume_hold(double now)
 {
   const std::string resume = control_.hold_resume_phase.empty() ? "pursuing_car" : control_.hold_resume_phase;
   plan_to_mission_goal();
+  if (resume == "accompanying_car" && control_.mission_goal) {
+    planner_.set_z_target(control_.mission_goal->z_m + control_.accompanying_z_offset_m);
+  }
   clear_hold();
   transition(resume, now);
 }
@@ -477,8 +484,11 @@ bool Navigation::apply_car_status(
     return false;
   }
 
+  const bool accompanying_context = phase_ == "accompanying_car" ||
+    (phase_ == "tracking_timeout_hold" && control_.hold_resume_phase == "accompanying_car");
   planner_.set_yaw_rad(yaw);
-  planner_.set_z_target(control_.mission_goal->z_m);
+  planner_.set_z_target(control_.mission_goal->z_m +
+    (accompanying_context ? control_.accompanying_z_offset_m : 0.0));
   control_.tracking_arrival_time_met = planner_.set_xy_target_with_arrival_time(
     target_x, target_y, mission_.tracking_arrival_seconds);
   last_car_status_at_ = input.now;
@@ -496,6 +506,37 @@ bool Navigation::accompanying_timeout_hold() const
 {
   return phase_ == "tracking_timeout_hold" &&
     control_.hold_resume_phase == "accompanying_car";
+}
+
+void Navigation::reset_accompanying_z_compensation()
+{
+  control_.accompanying_z_offset_m = 0.0;
+  last_accompanying_local_z_m_.reset();
+}
+
+void Navigation::update_accompanying_z_compensation(const NavigationInput & input)
+{
+  if (phase_ != "accompanying_car") {
+    last_accompanying_local_z_m_.reset();
+    return;
+  }
+  if (!common::finite(input.telemetry.local_z_m)) {
+    last_accompanying_local_z_m_.reset();
+    return;
+  }
+  if (!last_accompanying_local_z_m_ || input.dt > mission_.accompanying_z_jump_window_s) {
+    last_accompanying_local_z_m_ = input.telemetry.local_z_m;
+    return;
+  }
+
+  const double delta_m = input.telemetry.local_z_m - *last_accompanying_local_z_m_;
+  last_accompanying_local_z_m_ = input.telemetry.local_z_m;
+  if (std::abs(delta_m) < mission_.accompanying_z_jump_threshold_m || !control_.mission_goal) {
+    return;
+  }
+
+  control_.accompanying_z_offset_m += std::copysign(mission_.accompanying_z_step_m, delta_m);
+  planner_.set_z_target(control_.mission_goal->z_m + control_.accompanying_z_offset_m);
 }
 
 /// 爬升不依赖运行期 LCP，其余需要位置任务语义的阶段必须冻结。
@@ -578,6 +619,7 @@ void Navigation::process_events(const NavigationInput & input)
     if (event.type == communication::MessageType::b_ok) {
       if ((phase_ == "accompanying_car" || accompanying_timeout_hold()) && control_.origin) {
         clear_hold();
+        reset_accompanying_z_compensation();
         auto return_goal = *control_.origin;
         // Return horizontally at the current task altitude; the normal descent event owns origin Z.
         if (control_.mission_goal) {return_goal.z_m = control_.mission_goal->z_m;}
@@ -674,11 +716,13 @@ NavigationDecision Navigation::update(const NavigationInput & input)
       reject("gripper_release_failed");
       plan_to_mission_goal();
       clear_hold();
+      reset_accompanying_z_compensation();
       last_car_status_at_.reset();
       latest_car_distance_m_.reset();
       transition("pursuing_car", input.now);
     } else if (input.gripper_succeeded) {
       clear_hold();
+      reset_accompanying_z_compensation();
       emit(communication::MessageType::ok_throw);
       transition("accompanying_car", input.now);
     }
@@ -708,6 +752,8 @@ NavigationDecision Navigation::update(const NavigationInput & input)
     if (normal_completion_) {emit(communication::MessageType::ok_down);}
     transition("manual", input.now);
   }
+
+  update_accompanying_z_compensation(input);
 
   const bool waiting_gcs_phase = phase_ == "waiting_run_plan1" || phase_ == "setpoint_warmup";
   if (waiting_gcs_phase && !input.preflight_ready) {

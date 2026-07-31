@@ -43,6 +43,9 @@ is copied into one `xyzstatus` datagram immediately. It is independent of event 
 | `mission.match_hold_seconds` | `0.5` | Measured-position hold between a confirmed match and gripper release. |
 | `mission.car_status_timeout_s` | `2.0` | Time without a valid visual update before measured-position hold. |
 | `mission.max_tracking_radius_m` | `5.0` | Maximum visual target radius from the locked Init XY origin. |
+| `mission.accompanying_z_jump_threshold_m` | `0.10` | Minimum abrupt EKF local-Z change to compensate after release. |
+| `mission.accompanying_z_step_m` | `0.11` | Temporary Z setpoint adjustment per detected local-Z jump. |
+| `mission.accompanying_z_jump_window_s` | `0.10` | Maximum sample interval for a local-Z jump to qualify. |
 | `z.prefer_range` | `false` | Select Range-relative Z after field calibration. |
 | `z.source_timeout_s` | `0.5` | Freshness limit for pose/Range Z sources. |
 | `z.range_cross_check_max_delta_m` | `0.30` | Maximum local-vs-Range relative-Z disagreement. |
@@ -104,6 +107,9 @@ values and the event order.
   `mission.match_hold_seconds`, then starts PWM release. Once release succeeds, `ok_throw` is sent
   and fresh visual updates continue in `accompanying_car` until `b_ok`. A visual timeout freezes at
   the measured position and a fresh status restores the interrupted tracking stage.
+- During post-release accompaniment only, a sudden EKF local-Z step caused by the downward laser
+  intercepting the target shifts the temporary Z setpoint by 0.11 m in the same direction. Return,
+  landing, and gripper failure clear this compensation.
 - LCP failure during climb does not interrupt climb. Later LCP failure holds the measured
   position until recovery, then resumes the interrupted final target; mode/flight-health loss
   and max-flight timeout retain their existing safe paths.

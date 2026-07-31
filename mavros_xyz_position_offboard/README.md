@@ -94,6 +94,13 @@ arrives. `match_car_ok` requires a fresh visual distance no greater than
 open/close cycle succeeds, the UAV sends `ok_throw`, enters `accompanying_car`, and continues
 processing `car_status` until `b_ok` arrives.
 
+If the downward laser is briefly intercepted by the accompanied target, EKF2 can produce a sudden
+local-Z step even on level ground. During `accompanying_car` only, the UAV detects a local-Z change
+of at least `mission.accompanying_z_jump_threshold_m` (default `0.10 m`) within
+`mission.accompanying_z_jump_window_s` (default `0.10 s`) and offsets the commanded Z by one
+`mission.accompanying_z_step_m` (default `0.11 m`) in the same direction. This temporary offset
+persists through visual timeout recovery and is cleared for return, landing, or release failure.
+
 ## LCP and Z
 
 `xyzstatus` copies the raw LCP header and every geometry field from `/lcp/debug`. During preflight

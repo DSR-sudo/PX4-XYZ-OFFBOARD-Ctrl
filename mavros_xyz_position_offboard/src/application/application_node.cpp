@@ -183,6 +183,12 @@ navigation::MissionConfig ApplicationNode::load_mission_config()
     "mission.car_status_timeout_s", value.car_status_timeout_s);
   value.max_tracking_radius_m = declare_parameter<double>(
     "mission.max_tracking_radius_m", value.max_tracking_radius_m);
+  value.accompanying_z_jump_threshold_m = declare_parameter<double>(
+    "mission.accompanying_z_jump_threshold_m", value.accompanying_z_jump_threshold_m);
+  value.accompanying_z_step_m = declare_parameter<double>(
+    "mission.accompanying_z_step_m", value.accompanying_z_step_m);
+  value.accompanying_z_jump_window_s = declare_parameter<double>(
+    "mission.accompanying_z_jump_window_s", value.accompanying_z_jump_window_s);
   value.validate();
   return value;
 }

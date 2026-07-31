@@ -7,6 +7,10 @@
 | `application/` | Single `ApplicationNode`, fixed 20 Hz loop, LCP Debug subscription, Init-Z latching, and component assembly. |
 | `communication/` | Strict Plan1 value types, fixed-remote UDP, source allowlist, ordered ACK queue, and `xyzstatus` encoding. |
 | `navigation/navigation.hpp` | Compatibility aggregate header and ROS-free mission state-machine coordinator. |
+| `navigation/navigation.cpp` | Navigation object lifecycle, mission-goal normalization, and planner orchestration. |
+| `navigation/navigation_state_machine.cpp` | Phase transitions, protocol event dispatch, health gates, and cycle decisions. |
+| `navigation/navigation_mission.cpp` | B-point planning, own-velocity estimation, visual target conversion, and intercept/return planning. |
+| `navigation/navigation_safety.cpp` | Position/yaw stability checks, LCP hold/resume, and landing safety decisions. |
 | `navigation/mission_config.*` | Mission defaults and configuration validation. |
 | `navigation/trajectory_planner.*` | Bounded quintic XYZ+yaw trajectories and continuous replanning. |
 | `navigation/target_tracker.*` | 2D constant-velocity Kalman filtering and intercept-time calculation. |

@@ -31,7 +31,10 @@ add_library(${PROJECT_NAME}_core
   src/gripper/pwm_gripper.cpp
   src/initialization/initialization.cpp
   src/navigation/mission_config.cpp
+  src/navigation/navigation_mission.cpp
   src/navigation/navigation.cpp
+  src/navigation/navigation_safety.cpp
+  src/navigation/navigation_state_machine.cpp
   src/navigation/navigation_types.cpp
   src/navigation/target_tracker.cpp
   src/navigation/trajectory_planner.cpp

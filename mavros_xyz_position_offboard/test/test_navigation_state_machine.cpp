@@ -361,6 +361,8 @@ TEST(NavigationV3Test, SuccessfulThrowReturnsAndCompletesLandingWithoutAGcsRetur
   auto safety = intercept_safety();
   MissionConfig mission;
   mission.height_stable_seconds = 0.05;
+  mission.return_max_speed_m_s = 0.35;
+  mission.return_max_accel_m_s2 = 0.65;
   Navigation navigation(safety, mission);
   auto input = base_input(0.0);
   input.dt = 0.05;
@@ -376,6 +378,25 @@ TEST(NavigationV3Test, SuccessfulThrowReturnsAndCompletesLandingWithoutAGcsRetur
   EXPECT_FALSE(throw_decision.control.predicted_intercept_seconds);
   now += input.dt;
 
+  const auto return_start = navigation.planner().current();
+  const auto origin = *navigation.control_state().origin;
+  TrajectoryPlanner expected_return(safety);
+  expected_return.latch(
+    return_start.x_m, return_start.y_m, return_start.z_m, return_start.orientation);
+  expected_return.set_xy_target_with_limits(
+    origin.x_m, origin.y_m, mission.return_max_speed_m_s, mission.return_max_accel_m_s2);
+  expected_return.set_z_target(return_start.z_m);
+  expected_return.set_yaw_rad(0.0);
+  expected_return.update(input.dt);
+
+  TrajectoryPlanner expected_global(safety);
+  expected_global.latch(
+    return_start.x_m, return_start.y_m, return_start.z_m, return_start.orientation);
+  expected_global.set_xy_target(origin.x_m, origin.y_m);
+  expected_global.set_z_target(return_start.z_m);
+  expected_global.set_yaw_rad(0.0);
+  expected_global.update(input.dt);
+
   input.now = now;
   input.events.clear();
   input.gripper_succeeded = true;
@@ -383,6 +404,13 @@ TEST(NavigationV3Test, SuccessfulThrowReturnsAndCompletesLandingWithoutAGcsRetur
   input.gripper_succeeded = false;
   EXPECT_EQ(released.phase, "returning");
   EXPECT_TRUE(has_message(released, MessageType::ok_throw));
+  EXPECT_NEAR(navigation.planner().target_x_m(), origin.x_m, 1e-12);
+  EXPECT_NEAR(navigation.planner().target_y_m(), origin.y_m, 1e-12);
+  EXPECT_NEAR(
+    navigation.planner().xy_trajectory_duration_s(), expected_return.xy_trajectory_duration_s(),
+    1e-12);
+  EXPECT_GT(
+    navigation.planner().xy_trajectory_duration_s(), expected_global.xy_trajectory_duration_s());
 
   bool saw_return = false;
   bool saw_downing = false;

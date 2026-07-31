@@ -9,6 +9,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -607,10 +608,12 @@ TEST(ApplicationNodeSafetyParameterTest, YamlParametersOverrideCliDefaultsAtStar
   EXPECT_DOUBLE_EQ(node->safety_config().target_xy_max_speed_m_s, 10.0);
   EXPECT_DOUBLE_EQ(node->get_parameter("udp.max_tracking_distance_m").as_double(), 5.0);
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.b_right_m").as_double(), 0.375);
-  EXPECT_DOUBLE_EQ(node->get_parameter("mission.b_forward_m").as_double(), 2.375);
+  EXPECT_DOUBLE_EQ(node->get_parameter("mission.b_forward_m").as_double(), 1.8);
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.b_arrival_speed_m_s").as_double(), 0.05);
-  EXPECT_DOUBLE_EQ(node->get_parameter("mission.car_tracking_max_speed_m_s").as_double(), 10.0);
-  EXPECT_DOUBLE_EQ(node->get_parameter("mission.car_tracking_max_accel_m_s2").as_double(), 5.0);
+  EXPECT_DOUBLE_EQ(node->get_parameter("mission.car_tracking_max_speed_m_s").as_double(), 1.0);
+  EXPECT_DOUBLE_EQ(node->get_parameter("mission.car_tracking_max_accel_m_s2").as_double(), 0.5);
+  EXPECT_DOUBLE_EQ(node->get_parameter("mission.return_max_speed_m_s").as_double(), 1.0);
+  EXPECT_DOUBLE_EQ(node->get_parameter("mission.return_max_accel_m_s2").as_double(), 0.5);
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.throw_distance_m").as_double(), 0.2);
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.throw_bearing_rad").as_double(), 1.57079632679);
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.throw_bearing_tolerance_rad").as_double(), 0.08);
@@ -639,6 +642,26 @@ TEST(ApplicationNodeMissionParameterTest, CarTrackingLimitsInheritEffectiveSafet
 
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.car_tracking_max_speed_m_s").as_double(), 0.70);
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.car_tracking_max_accel_m_s2").as_double(), 1.30);
+  EXPECT_DOUBLE_EQ(node->get_parameter("mission.return_max_speed_m_s").as_double(), 0.70);
+  EXPECT_DOUBLE_EQ(node->get_parameter("mission.return_max_accel_m_s2").as_double(), 1.30);
+}
+
+TEST(ApplicationNodeMissionParameterTest, InvalidReturnLimitsAreRejectedAtStartup)
+{
+  for (const double value : {
+      0.0, -1.0, std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()}) {
+    EXPECT_THROW(
+      std::make_shared<ApplicationNode>(
+        application_test_options(), SafetyConfig{}, application_test_node_options({
+          rclcpp::Parameter("mission.return_max_speed_m_s", value)})),
+      std::invalid_argument);
+    EXPECT_THROW(
+      std::make_shared<ApplicationNode>(
+        application_test_options(), SafetyConfig{}, application_test_node_options({
+          rclcpp::Parameter("mission.return_max_accel_m_s2", value)})),
+      std::invalid_argument);
+  }
 }
 
 TEST(ApplicationNodeSafetyParameterTest, InvalidStartupOverrideIsRejected)

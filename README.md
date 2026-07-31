@@ -75,7 +75,11 @@ B 点 `(b_right_m, b_forward_m)`，与 ARM 原点和初始 yaw 无关。只有�
 车辆中心轨迹使用 `mission.car_tracking_max_speed_m_s`（默认 `10.0 m/s`）和
 `mission.car_tracking_max_accel_m_s2`（默认 `5.0 m/s²`）限制整个二维向量的合速度与合加速度；
 未显式配置时，这两个参数继承当前有效的 `safety.target_xy_max_speed_m_s` 和
-`safety.target_xy_max_accel_m_s2`。B 点、返航和降落继续使用全局 `safety.target_xy_*` 限制。
+`safety.target_xy_max_accel_m_s2`。返航轨迹独立使用
+`mission.return_max_speed_m_s`（默认 `10.0 m/s`）和
+`mission.return_max_accel_m_s2`（默认 `5.0 m/s²`），未显式配置时分别继承当前有效的
+`safety.target_xy_*`；示例 YAML 显式配置为 `1.0/0.5`。B 点和降落继续使用全局
+`safety.target_xy_*` 限制。
 `bearing_rad` 只用于坐标转换，不参与侧向对齐或释放判断；最新有效 raw `distance_m < 0.20 m`
 时立即投放，`distance_m == 0.20 m` 不触发投放。Kalman 参数和实现仍保留用于独立测试与审计兼容，
 但实时任务路径不调用它。

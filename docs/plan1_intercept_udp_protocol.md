@@ -45,8 +45,10 @@ Every accepted observation writes `car_x/car_y` to `mission_goal` and calls
 mission.car_tracking_max_accel_m_s2)`. These are independent two-dimensional resultant limits;
 when the mission parameters are omitted, they inherit the effective `safety.target_xy_*` values.
 The task altitude and ARM-time yaw are preserved, and a new observation immediately replaces the
-previous XY target. B-point, return, and landing trajectories continue to use the global safety
-limits. `bearing_rad` is used only for this ENU conversion. When the latest valid and fresh raw `distance_m < mission.throw_distance_m` (default
+previous XY target. B-point and landing trajectories continue to use the global safety limits.
+Return instead uses `mission.return_max_speed_m_s` and `mission.return_max_accel_m_s2`;
+when omitted, each inherits the effective `safety.target_xy_*` value. It still targets the ARM-time
+Init XY at the current altitude and commands world yaw zero. `bearing_rad` is used only for this ENU conversion. When the latest valid and fresh raw `distance_m < mission.throw_distance_m` (default
 `0.20 m`), the UAV enters `throwing` and requests the gripper in the same control cycle. The strict
 comparison means `distance_m == 0.20 m` does not release. The JSON fields and UDP envelope are
 unchanged.

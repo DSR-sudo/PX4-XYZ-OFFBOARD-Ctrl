@@ -12,7 +12,8 @@ void MissionConfig::validate() const
 {
   const double positive_values[] = {
     takeoff_height_m, height_stable_seconds, b_right_m, b_forward_m, b_arrival_speed_m_s,
-    car_tracking_max_speed_m_s, car_tracking_max_accel_m_s2, throw_distance_m,
+    car_tracking_max_speed_m_s, car_tracking_max_accel_m_s2, return_max_speed_m_s,
+    return_max_accel_m_s2, throw_distance_m,
     throw_bearing_tolerance_rad, filter_measurement_noise_m,
     filter_acceleration_noise_m_s2, prediction_horizon_s, cardinal_tolerance_deg,
     final_intercept_seconds, car_status_timeout_s, max_tracking_radius_m};

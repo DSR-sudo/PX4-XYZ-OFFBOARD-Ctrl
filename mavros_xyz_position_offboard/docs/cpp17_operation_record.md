@@ -40,6 +40,8 @@ writes audit status. Every `/lcp/debug` sample is separately sent as one unqueue
 | `mission.b_arrival_speed_m_s` | `0.05` | Maximum measured horizontal resultant speed and vertical speed for B arrival. |
 | `mission.car_tracking_max_speed_m_s` | `10.0` | Maximum resultant XY speed for `car_status` vehicle-center tracking; inherits `safety.target_xy_max_speed_m_s` when omitted. |
 | `mission.car_tracking_max_accel_m_s2` | `5.0` | Maximum resultant XY acceleration for `car_status` vehicle-center tracking; inherits `safety.target_xy_max_accel_m_s2` when omitted. |
+| `mission.return_max_speed_m_s` | `10.0` | Maximum resultant XY speed for return to the ARM-time origin; inherits `safety.target_xy_max_speed_m_s` when omitted. |
+| `mission.return_max_accel_m_s2` | `5.0` | Maximum resultant XY acceleration for return to the ARM-time origin; inherits `safety.target_xy_max_accel_m_s2` when omitted. |
 | `mission.throw_distance_m` | `0.20` | Strict raw distance threshold for immediate release. |
 | `mission.throw_bearing_rad` | `1.57079632679` | Retained compatibility parameter; unused by vehicle-center tracking. |
 | `mission.throw_bearing_tolerance_rad` | `0.08` | Retained compatibility parameter; unused by vehicle-center tracking. |
@@ -58,8 +60,9 @@ angle relative to measured UAV yaw: zero is forward, `+pi/2` is left, and `+/-pi
 sets the raw `car_x/car_y` as both `mission_goal` XY and the planner XY target while preserving the
 current task altitude and ARM-time yaw. The vehicle-center planner applies the independent
 `mission.car_tracking_max_speed_m_s` and `mission.car_tracking_max_accel_m_s2` limits to the
-two-dimensional resultant vector. B-point, return, and landing planning continue to use the global
-`safety.target_xy_*` limits. The active path does not filter, reject innovations, shape cardinal
+two-dimensional resultant vector. Return planning uses the independent
+`mission.return_max_speed_m_s` and `mission.return_max_accel_m_s2` limits, while B-point and
+landing planning continue to use the global `safety.target_xy_*` limits. The active path does not filter, reject innovations, shape cardinal
 motion, or calculate predicted intercept time. `target_samples` remains `0` and
 `predicted_intercept_seconds` remains `null` in audit JSON. Strict raw `distance_m < 0.20 m` enters
 `throwing` immediately; equality does not.

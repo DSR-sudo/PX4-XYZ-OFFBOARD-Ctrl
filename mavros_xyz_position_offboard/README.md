@@ -70,8 +70,11 @@ vehicle-center XY target. The mission altitude and ARM-time yaw are preserved, a
 observation replans the XY target in place with the two-dimensional resultant limits
 `mission.car_tracking_max_speed_m_s` (default `10.0 m/s`) and
 `mission.car_tracking_max_accel_m_s2` (default `5.0 m/s2`). If either parameter is omitted, its
-effective `safety.target_xy_*` value is inherited. B-point, return, and landing trajectories keep
-using the global `safety.target_xy_*` limits. When the latest fresh raw `distance_m <
+effective `safety.target_xy_*` value is inherited. Return uses the independent
+`mission.return_max_speed_m_s` (default `10.0 m/s`) and
+`mission.return_max_accel_m_s2` (default `5.0 m/s2`) limits, inheriting the effective
+`safety.target_xy_*` values when omitted; the example YAML sets them to `1.0/0.5`. B-point and
+landing trajectories keep using the global `safety.target_xy_*` limits. When the latest fresh raw `distance_m <
 mission.throw_distance_m` (default `0.20 m`), the UAV immediately enters `throwing`; equality does
 not release. `throw_bearing_rad` and `throw_bearing_tolerance_rad` remain accepted compatibility
 parameters but do not participate in target planning or release.

@@ -93,7 +93,11 @@ void Navigation::begin_return(double now)
   return_goal.z_m = planner_.latched() ? planner_.current().z_m : return_goal.z_m;
   return_goal.orientation = {0.0, 0.0, 0.0, 1.0};
   set_mission_goal(return_goal);
-  plan_to_mission_goal();
+  planner_.set_xy_target_with_limits(
+    return_goal.x_m, return_goal.y_m, mission_.return_max_speed_m_s,
+    mission_.return_max_accel_m_s2);
+  planner_.set_z_target(return_goal.z_m);
+  planner_.set_yaw_rad(0.0);
   transition("returning", now);
 }
 

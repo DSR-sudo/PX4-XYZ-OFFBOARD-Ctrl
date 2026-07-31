@@ -131,9 +131,13 @@ mavros_native_xyz_position:
       # B 点到达判定的水平合速度和垂直速度上限，单位：米/秒。
       b_arrival_speed_m_s: 0.05
       # car_status 车辆中心 XY 轨迹允许的最大合速度，单位：米/秒。
-      car_tracking_max_speed_m_s: 2.5
+      car_tracking_max_speed_m_s: 1.0
       # car_status 车辆中心 XY 轨迹允许的最大合加速度，单位：米/秒²。
-      car_tracking_max_accel_m_s2: 1.0
+      car_tracking_max_accel_m_s2: 0.5
+      # 返航原点 XY 轨迹允许的最大合速度，单位：米/秒。
+      return_max_speed_m_s: 1.0
+      # 返航原点 XY 轨迹允许的最大合加速度，单位：米/秒²。
+      return_max_accel_m_s2: 0.5
       # 车辆中心实时追踪的投掷距离门限，单位：米；严格使用 distance_m < 此值释放。
       throw_distance_m: 0.20
       # 保留历史参数接口；车辆中心追踪路径不使用该参数。

@@ -12,7 +12,7 @@ namespace
 using mavros_xyz_position_offboard::navigation::MissionConfig;
 using mavros_xyz_position_offboard::navigation::TargetTracker;
 
-TEST(MissionConfigTest, RejectsInvalidCarTrackingLimits)
+TEST(MissionConfigTest, RejectsInvalidIndependentXyLimits)
 {
   for (const double value : {
       0.0, -1.0, std::numeric_limits<double>::quiet_NaN(),
@@ -24,6 +24,14 @@ TEST(MissionConfigTest, RejectsInvalidCarTrackingLimits)
     MissionConfig invalid_accel;
     invalid_accel.car_tracking_max_accel_m_s2 = value;
     EXPECT_THROW(invalid_accel.validate(), std::invalid_argument);
+
+    MissionConfig invalid_return_speed;
+    invalid_return_speed.return_max_speed_m_s = value;
+    EXPECT_THROW(invalid_return_speed.validate(), std::invalid_argument);
+
+    MissionConfig invalid_return_accel;
+    invalid_return_accel.return_max_accel_m_s2 = value;
+    EXPECT_THROW(invalid_return_accel.validate(), std::invalid_argument);
   }
 }
 

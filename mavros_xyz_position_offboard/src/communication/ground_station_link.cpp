@@ -121,13 +121,10 @@ std::string to_string(MessageType type)
 {
   switch (type) {
     case MessageType::run_plan1: return "run_plan1";
-    case MessageType::go_ahead_ok: return "go_ahead_ok";
     case MessageType::car_status: return "car_status";
-    case MessageType::match_car_ok: return "match_car_ok";
-    case MessageType::b_ok: return "b_ok";
     case MessageType::ack: return "ack";
     case MessageType::ok_wait: return "ok_wait";
-    case MessageType::ok_height: return "ok_height";
+    case MessageType::ok_b: return "ok_b";
     case MessageType::ok_throw: return "ok_throw";
     case MessageType::ok_return: return "ok_return";
     case MessageType::ok_downing: return "ok_downing";
@@ -140,7 +137,7 @@ std::string to_string(MessageType type)
 /// 判断消息是否属于需要 ACK 的有序离散事件。
 bool is_discrete_event(MessageType type)
 {
-  return type == MessageType::ok_wait || type == MessageType::ok_height ||
+  return type == MessageType::ok_wait || type == MessageType::ok_b ||
          type == MessageType::ok_throw || type == MessageType::ok_return ||
          type == MessageType::ok_downing || type == MessageType::ok_down;
 }
@@ -249,14 +246,13 @@ ProtocolEvent GroundStationLink::decode_datagram(
     }
     event.type = MessageType::car_status;
     event.car_status = CarStatus{distance_m, bearing_rad};
-  } else if (header == "run_plan1" || header == "go_ahead_ok" || header == "match_car_ok" ||
-    header == "b_ok" || header == "ack") {
+  } else if (header == "run_plan1" || header == "ack") {
     if (!data.empty()) {return reject("nonempty_event_data", now);}
-    event.type = header == "run_plan1" ? MessageType::run_plan1 :
-      (header == "go_ahead_ok" ? MessageType::go_ahead_ok :
-      (header == "match_car_ok" ? MessageType::match_car_ok :
-      (header == "b_ok" ? MessageType::b_ok : MessageType::ack)));
+    event.type = header == "run_plan1" ? MessageType::run_plan1 : MessageType::ack;
     if (event.type == MessageType::ack) {acknowledge_earliest();}
+  } else if (header == "ok_height" || header == "go_ahead_ok" ||
+    header == "match_car_ok" || header == "b_ok") {
+    return reject("legacy_header_rejected", now);
   } else {
     return reject("unknown_or_wrong_direction_header", now);
   }

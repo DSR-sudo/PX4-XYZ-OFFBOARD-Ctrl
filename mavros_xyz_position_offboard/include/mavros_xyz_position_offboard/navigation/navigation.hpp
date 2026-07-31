@@ -131,25 +131,63 @@ struct ControllerFeedback
   std::string arm_request_status{"never_requested"};
 };
 
-/// 与部署 YAML 文件共享默认值的任务参数。
+/// 与部署 YAML 文件共享默认值的拦截投放任务参数。
 struct MissionConfig
 {
   double takeoff_height_m{1.5};
   double height_stable_seconds{3.0};
-  double right_shift_m{0.375};
-  double forward_distance_m{5.0};
-  double forward_max_speed_m_s{0.50};
-  double tracking_arrival_seconds{1.0};
-  double tracking_tolerance_m{0.2};
-  double match_hold_seconds{0.5};
+  double b_right_m{0.375};
+  double b_forward_m{2.375};
+  double throw_distance_m{0.20};
+  double filter_measurement_noise_m{0.05};
+  double filter_acceleration_noise_m_s2{0.50};
+  int filter_min_samples{3};
+  double prediction_horizon_s{2.0};
+  double cardinal_tolerance_deg{5.0};
+  double final_intercept_seconds{0.5};
   double car_status_timeout_s{2.0};
   double max_tracking_radius_m{5.0};
-  double accompanying_z_jump_threshold_m{0.10};
-  double accompanying_z_step_m{0.11};
-  double accompanying_z_jump_window_s{0.10};
 
-  /// 校验起飞、右移、前飞和视觉跟踪参数。
+  /// 校验 B 点、卡尔曼滤波与投放门限参数。
   void validate() const;
+};
+
+/// 目标的 ENU 匀速卡尔曼滤波输出。
+struct TargetEstimate
+{
+  bool initialized{false};
+  int samples{0};
+  double x_m{0.0};
+  double y_m{0.0};
+  double vx_m_s{0.0};
+  double vy_m_s{0.0};
+};
+
+/// 不依赖 ROS 的二维常速度目标滤波器，测量与状态均在 ENU 世界系。
+class TargetTracker
+{
+public:
+  explicit TargetTracker(const MissionConfig & config);
+  void reset();
+  /// 吸收一个世界系位置测量；创新超过 99% 二维门限时返回 false。
+  bool update(double x_m, double y_m, double received_at);
+  TargetEstimate estimate(double at) const;
+  /// 求相对直线运动第一次进入给定半径的时刻，超出 horizon 返回空。
+  std::optional<double> time_to_distance(
+    double own_x_m, double own_y_m, double own_vx_m_s, double own_vy_m_s,
+    double distance_m, double now, double horizon_s) const;
+  bool ready() const {return initialized_ && samples_ >= config_.filter_min_samples;}
+  int samples() const {return samples_;}
+
+private:
+  void predict_to(double at);
+
+  const MissionConfig & config_;
+  bool initialized_{false};
+  int samples_{0};
+  double state_time_{0.0};
+  std::array<double, 4> state_{};
+  std::array<std::array<double, 4>, 4> covariance_{};
 };
 
 /// 导航状态机在一个控制周期内消费的健康、协议和飞控反馈。
@@ -177,13 +215,14 @@ struct ControlState
   std::optional<common::PositionSetpoint> mission_goal{};
   /// 最近一次交给 Offboard 发布的 ENU XYZ+yaw 命令。
   std::optional<common::PositionSetpoint> commanded_setpoint{};
-  /// LCP 失效或匹配等待时锁定的实测 XYZ 与最近命令偏航。
+  /// LCP 失效或视觉超时时锁定的实测 XYZ 与最近命令偏航。
   std::optional<common::PositionSetpoint> hold_setpoint{};
   std::string hold_reason{};
   std::string hold_resume_phase{};
   bool mission_paused{false};
   bool tracking_arrival_time_met{true};
-  double accompanying_z_offset_m{0.0};
+  int target_samples{0};
+  std::optional<double> predicted_intercept_seconds{};
 };
 
 /// 将完整控制状态编码为 JSON 对象，供 JSONL 审计和单元测试共同使用。
@@ -238,8 +277,6 @@ private:
   void set_mission_goal(const common::PositionSetpoint & goal);
   /// 从当前命令点重新规划到任务最终目标。
   void plan_to_mission_goal();
-  /// 以 go_ahead_ok 前向搜索的独立速度上限重新规划当前任务目标。
-  void plan_to_forward_pursuit_goal();
   /// 使用新鲜实测 XYZ 和最近命令偏航构建临时保持点。
   common::PositionSetpoint measured_hold_setpoint(const NavigationInput & input) const;
   /// 在指定保持阶段冻结可靠实测位置，且绝不改写任务最终目标。
@@ -258,26 +295,25 @@ private:
   bool stable_at(const common::Telemetry & telemetry, const common::PositionSetpoint & target) const;
   /// 判断实测偏航角是否已接近目标世界航向。
   bool actual_yaw_within(const common::Telemetry & telemetry, double yaw_rad, double tolerance_rad) const;
-  /// 以锁存的初始偏航为基准规划 35--40 cm 的右移对线动作。
-  void begin_right_shift();
-  /// 从右移终点沿锁存的初始航向规划受限的前飞追车动作。
-  void begin_forward_pursuit();
-  /// 将车体相对视觉测量转换为 ENU 目标并连续重规划。
+  /// 从锁存原点和初始航向规划到 B 点的一次性斜向轨迹。
+  void begin_transit_to_b();
+  /// 将车体相对视觉测量转换为 ENU，更新滤波器并重规划拦截轨迹。
   bool apply_car_status(const NavigationInput & input, const communication::CarStatus & status);
   /// 判断最近一次有效视觉测量在当前控制周期仍然新鲜。
   bool car_status_fresh(double now) const;
-  /// 当前视觉超时保持是否由投放后的伴飞阶段进入。
-  bool accompanying_timeout_hold() const;
-  /// 用 EKF 本地高度的突变抵消伴飞位置控制中的错误高度修正。
-  void update_accompanying_z_compensation(const NavigationInput & input);
-  /// 清除仅属于当前伴飞阶段的临时高度补偿。
-  void reset_accompanying_z_compensation();
+  /// 使用最新本地位姿更新 UAV 水平速度估计。
+  void update_own_velocity(const NavigationInput & input);
+  /// 按卡尔曼预测重规划最近 90 度方位或最终直接拦截目标。
+  void plan_intercept(const NavigationInput & input, double bearing_rad);
+  /// 取消投掷计时并开始从当前高度返回锁存原点。
+  void begin_return(double now);
   /// 判断阶段是否必须因 LCP 不健康冻结位置。
   bool lcp_required_in_phase() const;
 
   const common::SafetyConfig & config_;
   const MissionConfig mission_;
   TrajectoryPlanner planner_;
+  TargetTracker target_tracker_;
   std::string phase_{"waiting_preflight"};
   double phase_started_at_{0.0};
   std::optional<double> flight_started_at_{};
@@ -288,8 +324,13 @@ private:
   std::string landing_reason_{};
   bool pending_release_gripper_{false};
   std::optional<double> last_car_status_at_{};
-  std::optional<double> latest_car_distance_m_{};
-  std::optional<double> last_accompanying_local_z_m_{};
+  std::optional<double> intercept_due_at_{};
+  bool cardinal_alignment_achieved_{false};
+  std::optional<double> last_own_pose_at_{};
+  std::optional<double> last_own_x_m_{};
+  std::optional<double> last_own_y_m_{};
+  double own_vx_m_s_{0.0};
+  double own_vy_m_s_{0.0};
 };
 
 }  // mavros_xyz_position_offboard::navigation 命名空间

@@ -33,7 +33,11 @@ std::string control_json(const ControlState & control)
           << "\",\"mission_paused\":" << (control.mission_paused ? "true" : "false")
           << ",\"tracking_arrival_time_met\":" <<
     (control.tracking_arrival_time_met ? "true" : "false")
-          << ",\"accompanying_z_offset_m\":" << control.accompanying_z_offset_m << '}';
+          << ",\"target_samples\":" << control.target_samples
+          << ",\"predicted_intercept_seconds\":";
+  if (control.predicted_intercept_seconds) {encoded << *control.predicted_intercept_seconds;}
+  else {encoded << "null";}
+  encoded << '}';
   return encoded.str();
 }
 
@@ -269,40 +273,210 @@ common::PositionSetpoint TrajectoryPlanner::current() const
   return {x_m_, y_m_, command_z_m_, orientation_, vertical_rate_m_s_};
 }
 
-/// 校验任务的起飞、右移、前飞和视觉跟踪参数。
+namespace
+{
+
+constexpr double kInnovationGate99Percent2d = 9.210340371976184;
+constexpr double kSmall = 1e-9;
+
+double normalized_angle(double angle)
+{
+  return std::atan2(std::sin(angle), std::cos(angle));
+}
+
+double nearest_cardinal(double angle)
+{
+  const double half_pi = std::acos(-1.0) / 2.0;
+  return normalized_angle(std::round(angle / half_pi) * half_pi);
+}
+
+}  // namespace
+
 void MissionConfig::validate() const
 {
   const double values[] = {
-    takeoff_height_m, height_stable_seconds, right_shift_m, forward_distance_m,
-    forward_max_speed_m_s, tracking_arrival_seconds, tracking_tolerance_m, match_hold_seconds,
-    car_status_timeout_s,
-    max_tracking_radius_m, accompanying_z_jump_threshold_m, accompanying_z_step_m,
-    accompanying_z_jump_window_s};
+    takeoff_height_m, height_stable_seconds, b_right_m, b_forward_m,
+    throw_distance_m, filter_measurement_noise_m,
+    filter_acceleration_noise_m_s2, prediction_horizon_s, cardinal_tolerance_deg,
+    final_intercept_seconds, car_status_timeout_s, max_tracking_radius_m};
   for (const double value : values) {
     if (!common::finite(value) || value <= 0.0) {
       throw std::invalid_argument("mission configuration values must be finite and positive");
     }
   }
-  if (right_shift_m < 0.35 || right_shift_m > 0.40) {
-    throw std::invalid_argument("right shift must be within 0.35..0.40 m");
+  if (filter_min_samples < 3) {
+    throw std::invalid_argument("target tracker requires at least three observations");
+  }
+  if (cardinal_tolerance_deg > 45.0) {
+    throw std::invalid_argument("cardinal tolerance must not exceed 45 degrees");
+  }
+  if (final_intercept_seconds >= prediction_horizon_s) {
+    throw std::invalid_argument("final intercept window must be shorter than prediction horizon");
   }
 }
 
-/// 保存安全与任务配置，并初始化对应的轨迹规划器。
+TargetTracker::TargetTracker(const MissionConfig & config) : config_(config) {}
+
+void TargetTracker::reset()
+{
+  initialized_ = false;
+  samples_ = 0;
+  state_time_ = 0.0;
+  state_ = {};
+  covariance_ = {};
+}
+
+void TargetTracker::predict_to(double at)
+{
+  if (!initialized_ || at <= state_time_) {return;}
+  const double dt = at - state_time_;
+  const std::array<std::array<double, 4>, 4> transition{{
+    {{1.0, 0.0, dt, 0.0}}, {{0.0, 1.0, 0.0, dt}},
+    {{0.0, 0.0, 1.0, 0.0}}, {{0.0, 0.0, 0.0, 1.0}}}};
+  std::array<double, 4> predicted{};
+  std::array<std::array<double, 4>, 4> propagated{};
+  for (int row = 0; row < 4; ++row) {
+    for (int column = 0; column < 4; ++column) {
+      predicted[row] += transition[row][column] * state_[column];
+      for (int inner = 0; inner < 4; ++inner) {
+        propagated[row][column] += transition[row][inner] * covariance_[inner][column];
+      }
+    }
+  }
+  std::array<std::array<double, 4>, 4> predicted_covariance{};
+  for (int row = 0; row < 4; ++row) {
+    for (int column = 0; column < 4; ++column) {
+      for (int inner = 0; inner < 4; ++inner) {
+        predicted_covariance[row][column] += propagated[row][inner] * transition[column][inner];
+      }
+    }
+  }
+  const double acceleration_variance = std::pow(config_.filter_acceleration_noise_m_s2, 2);
+  const double dt2 = dt * dt;
+  const double dt3 = dt2 * dt;
+  const double dt4 = dt2 * dt2;
+  const double position_noise = 0.25 * dt4 * acceleration_variance;
+  const double cross_noise = 0.5 * dt3 * acceleration_variance;
+  const double velocity_noise = dt2 * acceleration_variance;
+  predicted_covariance[0][0] += position_noise;
+  predicted_covariance[1][1] += position_noise;
+  predicted_covariance[0][2] += cross_noise;
+  predicted_covariance[2][0] += cross_noise;
+  predicted_covariance[1][3] += cross_noise;
+  predicted_covariance[3][1] += cross_noise;
+  predicted_covariance[2][2] += velocity_noise;
+  predicted_covariance[3][3] += velocity_noise;
+  state_ = predicted;
+  covariance_ = predicted_covariance;
+  state_time_ = at;
+}
+
+bool TargetTracker::update(double x_m, double y_m, double received_at)
+{
+  if (!common::finite(x_m) || !common::finite(y_m) || !common::finite(received_at)) {
+    return false;
+  }
+  const double measurement_variance = std::pow(config_.filter_measurement_noise_m, 2);
+  if (!initialized_) {
+    reset();
+    initialized_ = true;
+    samples_ = 1;
+    state_time_ = received_at;
+    state_ = {{x_m, y_m, 0.0, 0.0}};
+    covariance_[0][0] = measurement_variance;
+    covariance_[1][1] = measurement_variance;
+    covariance_[2][2] = 4.0;
+    covariance_[3][3] = 4.0;
+    return true;
+  }
+  predict_to(received_at);
+  const double innovation_x = x_m - state_[0];
+  const double innovation_y = y_m - state_[1];
+  const double s00 = covariance_[0][0] + measurement_variance;
+  const double s01 = covariance_[0][1];
+  const double s11 = covariance_[1][1] + measurement_variance;
+  const double determinant = s00 * s11 - s01 * s01;
+  if (determinant <= kSmall) {return false;}
+  const double nis = (innovation_x * innovation_x * s11 - 2.0 * innovation_x * innovation_y * s01 +
+    innovation_y * innovation_y * s00) / determinant;
+  if (!common::finite(nis) || nis > kInnovationGate99Percent2d) {return false;}
+  std::array<std::array<double, 2>, 4> gain{};
+  for (int row = 0; row < 4; ++row) {
+    gain[row][0] = (covariance_[row][0] * s11 - covariance_[row][1] * s01) / determinant;
+    gain[row][1] = (covariance_[row][1] * s00 - covariance_[row][0] * s01) / determinant;
+  }
+  for (int row = 0; row < 4; ++row) {
+    state_[row] += gain[row][0] * innovation_x + gain[row][1] * innovation_y;
+  }
+  std::array<std::array<double, 4>, 4> corrected{};
+  for (int row = 0; row < 4; ++row) {
+    for (int column = 0; column < 4; ++column) {
+      corrected[row][column] = covariance_[row][column] - gain[row][0] * covariance_[0][column] -
+        gain[row][1] * covariance_[1][column];
+    }
+  }
+  for (int row = 0; row < 4; ++row) {
+    for (int column = row; column < 4; ++column) {
+      const double symmetric = 0.5 * (corrected[row][column] + corrected[column][row]);
+      covariance_[row][column] = symmetric;
+      covariance_[column][row] = symmetric;
+    }
+  }
+  ++samples_;
+  return true;
+}
+
+TargetEstimate TargetTracker::estimate(double at) const
+{
+  TargetEstimate result;
+  result.initialized = initialized_;
+  result.samples = samples_;
+  if (!initialized_) {return result;}
+  const double dt = std::max(0.0, at - state_time_);
+  result.x_m = state_[0] + state_[2] * dt;
+  result.y_m = state_[1] + state_[3] * dt;
+  result.vx_m_s = state_[2];
+  result.vy_m_s = state_[3];
+  return result;
+}
+
+std::optional<double> TargetTracker::time_to_distance(
+  double own_x_m, double own_y_m, double own_vx_m_s, double own_vy_m_s,
+  double distance_m, double now, double horizon_s) const
+{
+  if (!initialized_ || !common::finite(own_x_m) || !common::finite(own_y_m) ||
+    !common::finite(own_vx_m_s) || !common::finite(own_vy_m_s) ||
+    !common::finite(distance_m) || !common::finite(now) || !common::finite(horizon_s) ||
+    distance_m <= 0.0 || horizon_s <= 0.0) {
+    return std::nullopt;
+  }
+  const auto target = estimate(now);
+  const double relative_x = target.x_m - own_x_m;
+  const double relative_y = target.y_m - own_y_m;
+  const double relative_vx = target.vx_m_s - own_vx_m_s;
+  const double relative_vy = target.vy_m_s - own_vy_m_s;
+  const double a = relative_vx * relative_vx + relative_vy * relative_vy;
+  const double b = relative_x * relative_vx + relative_y * relative_vy;
+  const double c = relative_x * relative_x + relative_y * relative_y - distance_m * distance_m;
+  if (c <= 0.0) {return 0.0;}
+  if (a <= kSmall) {return std::nullopt;}
+  const double discriminant = b * b - a * c;
+  if (discriminant < 0.0) {return std::nullopt;}
+  const double root = (-b - std::sqrt(discriminant)) / a;
+  if (root < 0.0 || root > horizon_s) {return std::nullopt;}
+  return root;
+}
+
 Navigation::Navigation(const common::SafetyConfig & config, MissionConfig mission)
-: config_(config), mission_(std::move(mission)), planner_(config)
+: config_(config), mission_(std::move(mission)), planner_(config), target_tracker_(mission_)
 {
   mission_.validate();
-  if (mission_.forward_max_speed_m_s > config_.max_flight_horizontal_speed_m_s) {
-    throw std::invalid_argument(
-            "forward pursuit speed must not exceed max flight horizontal speed");
-  }
 }
 
-/// 清除任务执行上下文并恢复到等待预检阶段。
 void Navigation::reset()
 {
   planner_.reset();
+  target_tracker_.reset();
   phase_ = "waiting_preflight";
   phase_started_at_ = 0.0;
   flight_started_at_.reset();
@@ -313,24 +487,25 @@ void Navigation::reset()
   landing_reason_.clear();
   pending_release_gripper_ = false;
   last_car_status_at_.reset();
-  latest_car_distance_m_.reset();
-  last_accompanying_local_z_m_.reset();
+  intercept_due_at_.reset();
+  cardinal_alignment_achieved_ = false;
+  last_own_pose_at_.reset();
+  last_own_x_m_.reset();
+  last_own_y_m_.reset();
+  own_vx_m_s_ = 0.0;
+  own_vy_m_s_ = 0.0;
 }
 
-/// 切换任务阶段，并记录新阶段的开始时间。
 void Navigation::transition(const std::string & phase, double now)
 {
   phase_ = phase;
   phase_started_at_ = now;
 }
 
-/// 将一条待发送的 GCS 协议消息加入本周期输出队列。
 void Navigation::emit(communication::MessageType type) {pending_messages_.push_back({type});}
 
-/// 将机器可读的拒绝原因加入本周期输出队列。
 void Navigation::reject(const std::string & reason) {pending_rejections_.push_back(reason);}
 
-/// 判断实测本地 XY 与目标点的欧氏距离是否在给定容差内。
 bool Navigation::actual_xy_within(
   const common::Telemetry & telemetry, double x, double y, double tolerance) const
 {
@@ -338,7 +513,6 @@ bool Navigation::actual_xy_within(
          std::hypot(telemetry.local_x_m - x, telemetry.local_y_m - y) <= tolerance;
 }
 
-/// 判断实测 XY 和 Z 是否均已达到设定点稳定容差。
 bool Navigation::stable_at(
   const common::Telemetry & telemetry, const common::PositionSetpoint & target) const
 {
@@ -347,34 +521,18 @@ bool Navigation::stable_at(
          std::abs(telemetry.local_z_m - target.z_m) <= config_.target_tolerance_m;
 }
 
-/// 判断实测姿态换算出的偏航角是否接近目标偏航角。
 bool Navigation::actual_yaw_within(
   const common::Telemetry & telemetry, double yaw_rad, double tolerance_rad) const
 {
   try {
     const double actual = common::yaw_from_quaternion(common::normalize_quaternion(
       telemetry.orientation.x, telemetry.orientation.y, telemetry.orientation.z, telemetry.orientation.w));
-    return std::abs(std::atan2(std::sin(actual - yaw_rad), std::cos(actual - yaw_rad))) <= tolerance_rad;
+    return std::abs(normalized_angle(actual - yaw_rad)) <= tolerance_rad;
   } catch (const std::invalid_argument &) {
     return false;
   }
 }
 
-/// 固定当前水平位置、规划下降到初始高度并进入降落阶段。
-void Navigation::begin_landing(double now, const std::string & reason)
-{
-  reset_accompanying_z_compensation();
-  if (planner_.latched()) {
-    clear_hold();
-    planner_.hold_xy();
-    if (control_.origin) {planner_.set_z_target(control_.origin->z_m);}
-  }
-  landing_reason_ = reason;
-  normal_completion_ = false;
-  transition("landing", now);
-}
-
-/// 写入经校验的任务最终目标，保持点和轨迹中间点不允许调用此函数。
 void Navigation::set_mission_goal(const common::PositionSetpoint & goal)
 {
   if (!common::finite(goal.x_m) || !common::finite(goal.y_m) || !common::finite(goal.z_m)) {
@@ -387,7 +545,6 @@ void Navigation::set_mission_goal(const common::PositionSetpoint & goal)
   control_.mission_goal = normalized;
 }
 
-/// 规划器只接受当前命令点到调用方给定最终目标的轨迹计算。
 void Navigation::plan_to_mission_goal()
 {
   if (!planner_.latched() || !control_.mission_goal) {return;}
@@ -396,21 +553,9 @@ void Navigation::plan_to_mission_goal()
   planner_.set_yaw_rad(common::yaw_from_quaternion(goal.orientation));
 }
 
-/// 为前向搜索使用任务专属速度上限，其他任务段保持全局 XY 限制。
-void Navigation::plan_to_forward_pursuit_goal()
-{
-  if (!planner_.latched() || !control_.mission_goal) {return;}
-  const auto & goal = *control_.mission_goal;
-  planner_.set_xy_target_with_max_speed(goal.x_m, goal.y_m, mission_.forward_max_speed_m_s);
-  planner_.set_z_target(goal.z_m);
-  planner_.set_yaw_rad(common::yaw_from_quaternion(goal.orientation));
-}
-
-/// 保持使用实测 XYZ，偏航始终沿用最近实际发布的命令。
 common::PositionSetpoint Navigation::measured_hold_setpoint(const NavigationInput & input) const
 {
-  common::PositionSetpoint fallback = control_.commanded_setpoint.value_or(planner_.current());
-  common::PositionSetpoint hold = fallback;
+  common::PositionSetpoint hold = control_.commanded_setpoint.value_or(planner_.current());
   if (common::finite(input.telemetry.local_x_m)) {hold.x_m = input.telemetry.local_x_m;}
   if (common::finite(input.telemetry.local_y_m)) {hold.y_m = input.telemetry.local_y_m;}
   if (common::finite(input.telemetry.local_z_m)) {hold.z_m = input.telemetry.local_z_m;}
@@ -418,7 +563,6 @@ common::PositionSetpoint Navigation::measured_hold_setpoint(const NavigationInpu
   return hold;
 }
 
-/// 冻结发布命令但保留 mission_goal，供后续恢复时重新规划。
 void Navigation::enter_hold(
   const NavigationInput & input, const std::string & hold_phase,
   const std::string & reason, const std::optional<std::string> & resume_phase)
@@ -435,7 +579,6 @@ void Navigation::enter_hold(
   transition(hold_phase, input.now);
 }
 
-/// 保持元数据与任务最终目标有独立的生命周期。
 void Navigation::clear_hold()
 {
   control_.hold_setpoint.reset();
@@ -444,62 +587,69 @@ void Navigation::clear_hold()
   control_.mission_paused = false;
 }
 
-/// LCP 恢复后从冻结的实测位置连续重规划到中断前的任务目标。
 void Navigation::resume_hold(double now)
 {
-  const std::string resume = control_.hold_resume_phase.empty() ? "pursuing_car" : control_.hold_resume_phase;
-  if (resume == "pursuing_car") {
-    plan_to_forward_pursuit_goal();
-  } else {
-    plan_to_mission_goal();
-  }
-  if (resume == "accompanying_car" && control_.mission_goal) {
-    planner_.set_z_target(control_.mission_goal->z_m + control_.accompanying_z_offset_m);
-  }
+  const std::string resume = control_.hold_resume_phase.empty() ? "waiting_target" : control_.hold_resume_phase;
+  plan_to_mission_goal();
   clear_hold();
   transition(resume, now);
 }
 
-/// 使用锁存起飞航向的右侧方向，为地面站的黑线对线检查规划横移。
-void Navigation::begin_right_shift()
+void Navigation::begin_landing(double now, const std::string & reason)
+{
+  intercept_due_at_.reset();
+  if (planner_.latched()) {
+    clear_hold();
+    planner_.hold_xy();
+    if (control_.origin) {planner_.set_z_target(control_.origin->z_m);}
+  }
+  landing_reason_ = reason;
+  normal_completion_ = false;
+  transition("landing", now);
+}
+
+void Navigation::begin_transit_to_b()
 {
   if (!control_.origin || !control_.mission_goal) {
-    throw std::logic_error("right shift requires a latched mission origin and climb goal");
+    throw std::logic_error("B-point transit requires a latched origin and climb goal");
   }
-  const double yaw = common::yaw_from_quaternion(control_.origin->orientation);
-  auto goal = *control_.mission_goal;
-  goal.x_m = control_.origin->x_m + mission_.right_shift_m * std::sin(yaw);
-  goal.y_m = control_.origin->y_m - mission_.right_shift_m * std::cos(yaw);
-  goal.orientation = control_.origin->orientation;
-  set_mission_goal(goal);
+  const double psi0 = common::yaw_from_quaternion(control_.origin->orientation);
+  auto b_goal = *control_.mission_goal;
+  b_goal.x_m = control_.origin->x_m + mission_.b_forward_m * std::cos(psi0) +
+    mission_.b_right_m * std::sin(psi0);
+  b_goal.y_m = control_.origin->y_m + mission_.b_forward_m * std::sin(psi0) -
+    mission_.b_right_m * std::cos(psi0);
+  b_goal.orientation = control_.origin->orientation;
+  set_mission_goal(b_goal);
   plan_to_mission_goal();
 }
 
-/// 从横移后的目标沿锁存起飞航向前飞；距离由部署参数限制。
-void Navigation::begin_forward_pursuit()
+void Navigation::update_own_velocity(const NavigationInput & input)
 {
-  if (!control_.mission_goal || !control_.origin) {
-    throw std::logic_error("forward pursuit requires a right-shift mission goal");
+  if (common::finite(input.telemetry.velocity_x_m_s) && common::finite(input.telemetry.velocity_y_m_s)) {
+    own_vx_m_s_ = input.telemetry.velocity_x_m_s;
+    own_vy_m_s_ = input.telemetry.velocity_y_m_s;
+  } else if (last_own_pose_at_ && last_own_x_m_ && last_own_y_m_ &&
+    input.now > *last_own_pose_at_ && common::finite(input.telemetry.local_x_m) &&
+    common::finite(input.telemetry.local_y_m)) {
+    const double dt = input.now - *last_own_pose_at_;
+    own_vx_m_s_ = (input.telemetry.local_x_m - *last_own_x_m_) / dt;
+    own_vy_m_s_ = (input.telemetry.local_y_m - *last_own_y_m_) / dt;
   }
-  const double yaw = common::yaw_from_quaternion(control_.origin->orientation);
-  auto goal = *control_.mission_goal;
-  goal.x_m += mission_.forward_distance_m * std::cos(yaw);
-  goal.y_m += mission_.forward_distance_m * std::sin(yaw);
-  goal.orientation = control_.origin->orientation;
-  set_mission_goal(goal);
-  plan_to_forward_pursuit_goal();
+  if (common::finite(input.telemetry.local_x_m) && common::finite(input.telemetry.local_y_m)) {
+    last_own_pose_at_ = input.now;
+    last_own_x_m_ = input.telemetry.local_x_m;
+    last_own_y_m_ = input.telemetry.local_y_m;
+  }
 }
 
-/// 把相对机体的距离和方位角换算成 ENU 目标，不改变机头指向或任务高度。
-bool Navigation::apply_car_status(
-  const NavigationInput & input, const communication::CarStatus & status)
+bool Navigation::apply_car_status(const NavigationInput & input, const communication::CarStatus & status)
 {
-  if (!control_.origin || !control_.mission_goal || !common::finite(input.telemetry.local_x_m) ||
+  if (!control_.origin || !common::finite(input.telemetry.local_x_m) ||
     !common::finite(input.telemetry.local_y_m)) {
     reject("car_status_requires_local_pose");
     return false;
   }
-
   double yaw = 0.0;
   try {
     yaw = common::yaw_from_quaternion(common::normalize_quaternion(
@@ -509,25 +659,32 @@ bool Navigation::apply_car_status(
     reject("car_status_requires_valid_yaw");
     return false;
   }
-
   const double world_bearing = yaw + status.bearing_rad;
   const double target_x = input.telemetry.local_x_m + status.distance_m * std::cos(world_bearing);
   const double target_y = input.telemetry.local_y_m + status.distance_m * std::sin(world_bearing);
   if (std::hypot(target_x - control_.origin->x_m, target_y - control_.origin->y_m) >
     mission_.max_tracking_radius_m) {
     reject("car_status_target_outside_tracking_radius");
+    target_tracker_.reset();
+    control_.target_samples = 0;
+    last_car_status_at_.reset();
+    intercept_due_at_.reset();
+    enter_hold(input, "lcp_hold", "car_status_target_outside_tracking_radius", "waiting_target");
     return false;
   }
-
-  const bool accompanying_context = phase_ == "accompanying_car" ||
-    (phase_ == "tracking_timeout_hold" && control_.hold_resume_phase == "accompanying_car");
-  planner_.set_yaw_rad(yaw);
-  planner_.set_z_target(control_.mission_goal->z_m +
-    (accompanying_context ? control_.accompanying_z_offset_m : 0.0));
-  control_.tracking_arrival_time_met = planner_.set_xy_target_with_arrival_time(
-    target_x, target_y, mission_.tracking_arrival_seconds);
+  if (!target_tracker_.update(target_x, target_y, input.now)) {
+    reject("car_status_innovation_outlier");
+    target_tracker_.reset();
+    control_.target_samples = 0;
+    last_car_status_at_.reset();
+    intercept_due_at_.reset();
+    enter_hold(input, "lcp_hold", "car_status_innovation_outlier", "waiting_target");
+    return false;
+  }
   last_car_status_at_ = input.now;
-  latest_car_distance_m_ = status.distance_m;
+  control_.target_samples = target_tracker_.samples();
+  clear_hold();
+  if (target_tracker_.ready()) {plan_intercept(input, status.bearing_rad);}
   return true;
 }
 
@@ -537,53 +694,99 @@ bool Navigation::car_status_fresh(double now) const
          now - *last_car_status_at_ <= mission_.car_status_timeout_s;
 }
 
-bool Navigation::accompanying_timeout_hold() const
+void Navigation::plan_intercept(const NavigationInput & input, double bearing_rad)
 {
-  return phase_ == "tracking_timeout_hold" &&
-    control_.hold_resume_phase == "accompanying_car";
+  if (!target_tracker_.ready() || !control_.origin || !common::finite(input.telemetry.local_x_m) ||
+    !common::finite(input.telemetry.local_y_m)) {
+    return;
+  }
+  const auto remaining = target_tracker_.time_to_distance(
+    input.telemetry.local_x_m, input.telemetry.local_y_m, own_vx_m_s_, own_vy_m_s_,
+    mission_.throw_distance_m, input.now, mission_.prediction_horizon_s);
+  if (!remaining) {
+    intercept_due_at_.reset();
+    control_.predicted_intercept_seconds.reset();
+    enter_hold(input, "lcp_hold", "intercept_prediction_outside_window", "waiting_target");
+    return;
+  }
+  const auto target = target_tracker_.estimate(input.now + *remaining);
+  const double initial_yaw = common::yaw_from_quaternion(control_.origin->orientation);
+  auto goal = control_.mission_goal.value_or(*control_.origin);
+  goal.z_m = control_.origin->z_m + mission_.takeoff_height_m;
+  goal.orientation = control_.origin->orientation;
+  control_.predicted_intercept_seconds = *remaining;
+  intercept_due_at_ = input.now + *remaining;
+  if (*remaining <= mission_.final_intercept_seconds) {
+    goal.x_m = target.x_m;
+    goal.y_m = target.y_m;
+    set_mission_goal(goal);
+    if (*remaining <= 0.01) {
+      planner_.set_xy_target(goal.x_m, goal.y_m);
+      control_.tracking_arrival_time_met = true;
+    } else {
+      control_.tracking_arrival_time_met = planner_.set_xy_target_with_arrival_time(
+        goal.x_m, goal.y_m, *remaining);
+    }
+    planner_.set_z_target(goal.z_m);
+    planner_.set_yaw_rad(initial_yaw);
+    cardinal_alignment_achieved_ = true;
+    transition("final_intercept", input.now);
+    return;
+  }
+
+  const double cardinal_relative = nearest_cardinal(bearing_rad);
+  cardinal_alignment_achieved_ = std::abs(normalized_angle(bearing_rad - cardinal_relative)) <=
+    mission_.cardinal_tolerance_deg * std::acos(-1.0) / 180.0;
+  if (cardinal_alignment_achieved_) {
+    goal.x_m = target.x_m;
+    goal.y_m = target.y_m;
+  } else {
+    const double range = std::hypot(target.x_m - input.telemetry.local_x_m,
+      target.y_m - input.telemetry.local_y_m);
+    const double world_cardinal = initial_yaw + cardinal_relative;
+    goal.x_m = input.telemetry.local_x_m + range * std::cos(world_cardinal);
+    goal.y_m = input.telemetry.local_y_m + range * std::sin(world_cardinal);
+  }
+  set_mission_goal(goal);
+  control_.tracking_arrival_time_met = planner_.set_xy_target_with_arrival_time(
+    goal.x_m, goal.y_m, *remaining);
+  planner_.set_z_target(goal.z_m);
+  planner_.set_yaw_rad(initial_yaw);
+  if (!control_.tracking_arrival_time_met) {
+    intercept_due_at_.reset();
+    enter_hold(input, "lcp_hold", "intercept_unreachable_with_constraints", "waiting_target");
+    return;
+  }
+  transition("cardinal_alignment", input.now);
 }
 
-void Navigation::reset_accompanying_z_compensation()
+void Navigation::begin_return(double now)
 {
-  control_.accompanying_z_offset_m = 0.0;
-  last_accompanying_local_z_m_.reset();
+  if (!control_.origin) {
+    begin_landing(now, "return_without_origin");
+    return;
+  }
+  intercept_due_at_.reset();
+  target_tracker_.reset();
+  control_.target_samples = 0;
+  control_.predicted_intercept_seconds.reset();
+  clear_hold();
+  auto return_goal = *control_.origin;
+  return_goal.z_m = planner_.latched() ? planner_.current().z_m : return_goal.z_m;
+  return_goal.orientation = {0.0, 0.0, 0.0, 1.0};
+  set_mission_goal(return_goal);
+  plan_to_mission_goal();
+  transition("returning", now);
 }
 
-void Navigation::update_accompanying_z_compensation(const NavigationInput & input)
-{
-  if (phase_ != "accompanying_car") {
-    last_accompanying_local_z_m_.reset();
-    return;
-  }
-  if (!common::finite(input.telemetry.local_z_m)) {
-    last_accompanying_local_z_m_.reset();
-    return;
-  }
-  if (!last_accompanying_local_z_m_ || input.dt > mission_.accompanying_z_jump_window_s) {
-    last_accompanying_local_z_m_ = input.telemetry.local_z_m;
-    return;
-  }
-
-  const double delta_m = input.telemetry.local_z_m - *last_accompanying_local_z_m_;
-  last_accompanying_local_z_m_ = input.telemetry.local_z_m;
-  if (std::abs(delta_m) < mission_.accompanying_z_jump_threshold_m || !control_.mission_goal) {
-    return;
-  }
-
-  control_.accompanying_z_offset_m += std::copysign(mission_.accompanying_z_step_m, delta_m);
-  planner_.set_z_target(control_.mission_goal->z_m + control_.accompanying_z_offset_m);
-}
-
-/// 爬升不依赖运行期 LCP，其余需要位置任务语义的阶段必须冻结。
 bool Navigation::lcp_required_in_phase() const
 {
-  return phase_ == "height_stabilizing" || phase_ == "right_shift" ||
-    phase_ == "waiting_go_ahead" || phase_ == "pursuing_car" ||
-    phase_ == "tracking_to_match" || phase_ == "accompanying_car" || phase_ == "tracking_timeout_hold" ||
-    phase_ == "match_hold" || phase_ == "throwing" || phase_ == "returning";
+  return phase_ == "height_stabilizing" || phase_ == "transit_to_b" ||
+    phase_ == "waiting_target" || phase_ == "cardinal_alignment" ||
+    phase_ == "final_intercept" || phase_ == "throwing" || phase_ == "returning" ||
+    phase_ == "downing";
 }
 
-/// 按当前任务阶段处理 ACK、前飞放行、连续视觉测量、匹配和返航协议事件。
 void Navigation::process_events(const NavigationInput & input)
 {
   for (const auto & event : input.events) {
@@ -601,77 +804,26 @@ void Navigation::process_events(const NavigationInput & input)
       }
       continue;
     }
-    if (event.type == communication::MessageType::go_ahead_ok) {
-      if (phase_ == "waiting_go_ahead") {
-        begin_forward_pursuit();
-        transition("pursuing_car", input.now);
-      } else if (phase_ != "pursuing_car" && phase_ != "tracking_to_match" &&
-        phase_ != "accompanying_car" && phase_ != "tracking_timeout_hold" &&
-        phase_ != "match_hold" && phase_ != "throwing" &&
-        phase_ != "returning" && phase_ != "downing" &&
-        phase_ != "disarming" && phase_ != "manual_request_pending" && phase_ != "manual") {
-        reject("go_ahead_ok_not_allowed_in_phase");
-      }
-      continue;
-    }
     if (event.type == communication::MessageType::car_status) {
       if (!event.car_status) {
         reject("car_status_missing_measurement");
-      } else if (phase_ == "pursuing_car") {
-        if (apply_car_status(input, *event.car_status)) {transition("tracking_to_match", input.now);}
-      } else if (phase_ == "tracking_to_match" || phase_ == "accompanying_car") {
+      } else if (phase_ == "waiting_target" || phase_ == "cardinal_alignment" ||
+        phase_ == "final_intercept") {
         apply_car_status(input, *event.car_status);
-      } else if (phase_ == "tracking_timeout_hold" &&
-        (control_.hold_resume_phase == "tracking_to_match" ||
-        control_.hold_resume_phase == "accompanying_car")) {
-        const std::string resume_phase = control_.hold_resume_phase;
-        if (apply_car_status(input, *event.car_status)) {
-          clear_hold();
-          transition(resume_phase, input.now);
-        }
+      } else if (phase_ == "lcp_hold" && control_.hold_reason != "lcp_unhealthy") {
+        const auto resume = control_.hold_resume_phase;
+        clear_hold();
+        transition(resume.empty() ? "waiting_target" : resume, input.now);
+        apply_car_status(input, *event.car_status);
       } else {
         reject("car_status_not_allowed_in_phase");
       }
       continue;
     }
-    if (event.type == communication::MessageType::match_car_ok) {
-      if (phase_ == "tracking_to_match") {
-        if (!car_status_fresh(input.now) || !latest_car_distance_m_) {
-          reject("match_car_ok_requires_fresh_car_status");
-        } else if (*latest_car_distance_m_ > mission_.tracking_tolerance_m) {
-          reject("match_car_ok_distance_above_tracking_tolerance");
-        } else {
-          enter_hold(input, "match_hold", "match_confirmed_hold", "tracking_to_match");
-        }
-      } else if (phase_ != "match_hold" && phase_ != "throwing" && phase_ != "accompanying_car" &&
-        phase_ != "returning" &&
-        phase_ != "downing" && phase_ != "disarming" &&
-        phase_ != "manual_request_pending" && phase_ != "manual") {
-        reject("match_car_ok_not_allowed_in_phase");
-      }
-      continue;
-    }
-    if (event.type == communication::MessageType::b_ok) {
-      if ((phase_ == "accompanying_car" || accompanying_timeout_hold()) && control_.origin) {
-        clear_hold();
-        reset_accompanying_z_compensation();
-        auto return_goal = *control_.origin;
-        // Return horizontally at the current task altitude; the normal descent event owns origin Z.
-        if (control_.mission_goal) {return_goal.z_m = control_.mission_goal->z_m;}
-        return_goal.orientation = {0.0, 0.0, 0.0, 1.0};
-        set_mission_goal(return_goal);
-        plan_to_mission_goal();
-        emit(communication::MessageType::ok_return);
-        transition("returning", input.now);
-      } else if (phase_ != "returning" && phase_ != "downing" && phase_ != "disarming" &&
-        phase_ != "manual_request_pending" && phase_ != "manual") {
-        reject("b_ok_not_allowed_in_phase");
-      }
-    }
+    reject("message_not_allowed_in_phase");
   }
 }
 
-/// 推进完整任务状态机，输出位置、飞控模式、解锁和通信决策。
 NavigationDecision Navigation::update(const NavigationInput & input)
 {
   if (!common::finite(input.now) || !common::finite(input.dt) || input.dt <= 0.0) {
@@ -680,6 +832,7 @@ NavigationDecision Navigation::update(const NavigationInput & input)
   pending_messages_.clear();
   pending_rejections_.clear();
   pending_release_gripper_ = false;
+  update_own_velocity(input);
   process_events(input);
 
   if (phase_ == "waiting_preflight") {
@@ -700,10 +853,8 @@ NavigationDecision Navigation::update(const NavigationInput & input)
     } else if (input.controller.mode != "OFFBOARD") {
       begin_landing(input.now, "offboard_mode_lost");
     } else if (!input.flight_healthy) {
-      begin_landing(input.now,
-        input.health_errors.empty() ? "flight_health_failure" : input.health_errors.front());
+      begin_landing(input.now, input.health_errors.empty() ? "flight_health_failure" : input.health_errors.front());
     } else {
-      // The flight origin is immutable and is not created by ground setpoint warmup.
       planner_.latch(input.telemetry.local_x_m, input.telemetry.local_y_m,
         input.telemetry.local_z_m, input.telemetry.orientation);
       control_.origin = planner_.current();
@@ -716,7 +867,7 @@ NavigationDecision Navigation::update(const NavigationInput & input)
     }
   }
 
-  if (lcp_required_in_phase() && !input.lcp_healthy) {
+  if (lcp_required_in_phase() && !input.lcp_healthy && phase_ != "lcp_hold") {
     enter_hold(input, "lcp_hold", "lcp_unhealthy");
   }
 
@@ -726,45 +877,48 @@ NavigationDecision Navigation::update(const NavigationInput & input)
     }
   } else if (phase_ == "height_stabilizing") {
     if (!planner_.target_reached() || !stable_at(input.telemetry, planner_.current())) {
-      // 高度、水平位置任一离开容差时，必须重新满足连续稳定时长。
       phase_started_at_ = input.now;
     } else if (input.now - phase_started_at_ >= mission_.height_stable_seconds) {
-      emit(communication::MessageType::ok_height);
-      begin_right_shift();
-      transition("right_shift", input.now);
+      begin_transit_to_b();
+      transition("transit_to_b", input.now);
     }
-  } else if (phase_ == "right_shift") {
+  } else if (phase_ == "transit_to_b") {
     if (planner_.target_reached() && stable_at(input.telemetry, planner_.current())) {
-      transition("waiting_go_ahead", input.now);
+      emit(communication::MessageType::ok_b);
+      transition("waiting_target", input.now);
     }
-  } else if (phase_ == "tracking_to_match" || phase_ == "accompanying_car") {
-    if (!car_status_fresh(input.now)) {
-      enter_hold(input, "tracking_timeout_hold", "car_status_timeout", phase_);
-    }
-  } else if (phase_ == "match_hold") {
-    if (input.now - phase_started_at_ >= mission_.match_hold_seconds) {
-      pending_release_gripper_ = true;
-      transition("throwing", input.now);
+  } else if (phase_ == "waiting_target" || phase_ == "cardinal_alignment" ||
+    phase_ == "final_intercept") {
+    if (last_car_status_at_ && !car_status_fresh(input.now)) {
+      target_tracker_.reset();
+      control_.target_samples = 0;
+      intercept_due_at_.reset();
+      control_.predicted_intercept_seconds.reset();
+      enter_hold(input, "lcp_hold", "car_status_timeout", "waiting_target");
+    } else if (phase_ == "final_intercept" && intercept_due_at_ && input.now >= *intercept_due_at_) {
+      const auto estimate = target_tracker_.estimate(input.now);
+      if (std::hypot(estimate.x_m - input.telemetry.local_x_m, estimate.y_m - input.telemetry.local_y_m) <=
+        mission_.throw_distance_m) {
+        pending_release_gripper_ = true;
+        transition("throwing", input.now);
+      } else {
+        intercept_due_at_.reset();
+        plan_intercept(input, 0.0);
+      }
     }
   } else if (phase_ == "throwing") {
     if (input.gripper_failed) {
       reject("gripper_release_failed");
-      plan_to_forward_pursuit_goal();
-      clear_hold();
-      reset_accompanying_z_compensation();
-      last_car_status_at_.reset();
-      latest_car_distance_m_.reset();
-      transition("pursuing_car", input.now);
+      begin_return(input.now);
     } else if (input.gripper_succeeded) {
-      clear_hold();
-      reset_accompanying_z_compensation();
       emit(communication::MessageType::ok_throw);
-      transition("accompanying_car", input.now);
+      begin_return(input.now);
     }
   } else if (phase_ == "returning") {
     if (control_.origin && planner_.target_reached() && actual_xy_within(
         input.telemetry, control_.origin->x_m, control_.origin->y_m, config_.target_tolerance_m) &&
       actual_yaw_within(input.telemetry, 0.0, 0.10)) {
+      emit(communication::MessageType::ok_return);
       auto descent_goal = *control_.origin;
       descent_goal.orientation = {0.0, 0.0, 0.0, 1.0};
       set_mission_goal(descent_goal);
@@ -774,7 +928,7 @@ NavigationDecision Navigation::update(const NavigationInput & input)
       transition("downing", input.now);
     }
   } else if (phase_ == "lcp_hold") {
-    if (input.lcp_healthy) {resume_hold(input.now);}
+    if (input.lcp_healthy && control_.hold_reason == "lcp_unhealthy") {resume_hold(input.now);}
   } else if (phase_ == "downing" || phase_ == "landing") {
     const bool on_ground = input.telemetry.landed_state == common::MAV_LANDED_STATE_ON_GROUND;
     const bool at_origin = common::finite(input.telemetry.local_z_m) && control_.origin &&
@@ -788,16 +942,10 @@ NavigationDecision Navigation::update(const NavigationInput & input)
     transition("manual", input.now);
   }
 
-  update_accompanying_z_compensation(input);
-
   const bool waiting_gcs_phase = phase_ == "waiting_run_plan1" || phase_ == "setpoint_warmup";
-  if (waiting_gcs_phase && !input.preflight_ready) {
-    reset();
-  }
-
+  if (waiting_gcs_phase && !input.preflight_ready) {reset();}
   const bool post_run_prearm_phase = phase_ == "offboard_request_pending" || phase_ == "arming_request_pending";
   if (post_run_prearm_phase && !input.controller.armed && !input.preflight_ready) {
-    // 已发出的 OFFBOARD/ARM 服务请求不能撤销；复用既有安全收尾状态显式反向请求。
     reset();
     transition("manual_request_pending", input.now);
     reject("preflight_lost_before_arm");
@@ -805,7 +953,7 @@ NavigationDecision Navigation::update(const NavigationInput & input)
 
   const bool airborne = phase_ != "waiting_preflight" && phase_ != "waiting_run_plan1" &&
     phase_ != "setpoint_warmup" && phase_ != "offboard_request_pending" &&
-    phase_ != "arming_request_pending" && phase_ != "preflight_abort" && phase_ != "manual";
+    phase_ != "arming_request_pending" && phase_ != "manual";
   if (airborne && phase_ != "landing" && phase_ != "downing" && phase_ != "disarming" &&
     phase_ != "manual_request_pending" && !input.flight_healthy) {
     begin_landing(input.now, input.health_errors.empty() ? "flight_health_failure" : input.health_errors.front());
@@ -839,20 +987,16 @@ NavigationDecision Navigation::update(const NavigationInput & input)
     control_.commanded_setpoint = decision.setpoint;
   }
   if (phase_ == "offboard_request_pending" || phase_ == "arming_request_pending" || phase_ == "climb" ||
-    phase_ == "height_stabilizing" || phase_ == "right_shift" || phase_ == "waiting_go_ahead" ||
-    phase_ == "pursuing_car" || phase_ == "tracking_to_match" || phase_ == "accompanying_car" ||
-    phase_ == "tracking_timeout_hold" || phase_ == "match_hold" || phase_ == "throwing" ||
-    phase_ == "returning" ||
-    phase_ == "lcp_hold" || phase_ == "downing") {
+    phase_ == "height_stabilizing" || phase_ == "transit_to_b" || phase_ == "waiting_target" ||
+    phase_ == "cardinal_alignment" || phase_ == "final_intercept" || phase_ == "throwing" ||
+    phase_ == "returning" || phase_ == "lcp_hold" || phase_ == "downing") {
     decision.target_mode = "OFFBOARD";
   }
   if (phase_ == "landing" && !landing_reason_.empty()) {decision.target_mode = "AUTO.LAND";}
   if (phase_ == "arming_request_pending" || phase_ == "climb" || phase_ == "height_stabilizing" ||
-    phase_ == "right_shift" || phase_ == "waiting_go_ahead" || phase_ == "pursuing_car" ||
-    phase_ == "tracking_to_match" || phase_ == "accompanying_car" ||
-    phase_ == "tracking_timeout_hold" || phase_ == "match_hold" || phase_ == "throwing" ||
-    phase_ == "returning" || phase_ == "lcp_hold" ||
-    phase_ == "downing" || phase_ == "landing") {
+    phase_ == "transit_to_b" || phase_ == "waiting_target" || phase_ == "cardinal_alignment" ||
+    phase_ == "final_intercept" || phase_ == "throwing" || phase_ == "returning" ||
+    phase_ == "lcp_hold" || phase_ == "downing" || phase_ == "landing") {
     decision.arm_intent = true;
   }
   if (phase_ == "disarming" || phase_ == "manual_request_pending") {decision.arm_intent = false;}
@@ -861,4 +1005,4 @@ NavigationDecision Navigation::update(const NavigationInput & input)
   return decision;
 }
 
-}  // mavros_xyz_position_offboard::navigation 命名空间
+}  // mavros_xyz_position_offboard::navigation namespace

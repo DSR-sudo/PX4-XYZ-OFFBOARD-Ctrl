@@ -27,7 +27,7 @@ struct GroundStationConfig
   void validate() const;
 };
 
-/// Owns the non-blocking UDP endpoint and the strict V2 JSON codec.
+/// Owns the non-blocking UDP endpoint and the strict Plan1 JSON codec.
 class GroundStationLink
 {
 public:
@@ -48,7 +48,7 @@ public:
   /// Resends the earliest unacknowledged event at the configured period.
   bool retry_events(double now);
 
-  /// Encodes an event using the fixed V2 common structure.
+  /// Encodes an event using the fixed Plan1 common structure.
   std::string encode(const OutgoingMessage & message) const;
   /// Encodes a complete xyzstatus document, including explicit null Z metadata when invalid.
   std::string encode_xyzstatus(const XyzStatus & status) const;

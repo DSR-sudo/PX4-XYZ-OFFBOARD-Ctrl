@@ -8,8 +8,9 @@
 2.14.0 和 MTF02P 光流/测距。实际运行前必须重新确认硬件、话题来源、PX4 参数和坐标系；
 本文档中的设备型号和命令不构成自动识别或飞行授权。
 
-完整的 GCS-UAV V0.7 协议位于工作区外层的
-`/home/pi/GCS_UAV_JSON通信协议.md`。该版本已移除 JSON V1 导航三包，不提供兼容回退。
+Plan1 B 点拦截协议位于
+[`docs/plan1_intercept_udp_protocol.md`](docs/plan1_intercept_udp_protocol.md)。该版本不提供旧的
+右移、GCS 前飞放行、匹配确认或返航命令兼容回退。
 
 ## 核心能力
 
@@ -21,9 +22,9 @@
   `/mavros/cmd/arming` 客户端。
 - 所有模式和解锁结果都必须由后续 `/mavros/state` heartbeat 确认；服务响应本身不代表飞控
   状态已经改变。
-- 通过固定远端、IP/端口白名单的 UDP 发送 V0.7 JSON，并拒绝错误方向、重复键、未知字段、
+- 通过固定远端、IP/端口白名单的 UDP 发送 Plan1 JSON，并拒绝错误方向、重复键、未知字段、
   非 UTF-8 或无效数值的入站报文。
-- 按阶段执行“起飞、跟车、PWM 投放、返航、下降、普通解锁、`MANUAL`”任务流程。
+- 按阶段执行“B 点直达、视觉卡尔曼预测投放、自主返航、下降、普通解锁、`MANUAL`”任务流程。
 
 ## 内部架构
 
@@ -42,7 +43,7 @@ LcpVisionBridge ─────────> LCP NWU 到 ENU 外部视觉位姿
 适配器；`ApplicationNode` 在 20 Hz 单线程定时器中连接遥测、飞控服务、导航和通信。
 控制超时使用单调时钟，不受 ROS 时间跳变影响。
 
-## GCS-UAV V0.7 通信
+## GCS-UAV V0.8 通信
 
 每个 UDP 数据报恰好包含一个 UTF-8 JSON 对象：
 
@@ -55,24 +56,22 @@ UAV 读取 `udp.bind_*`、`udp.remote_*`、`udp.whitelist_*` 参数。入站数�
 
 | 方向 | 消息 | 含义 |
 | --- | --- | --- |
-| GCS -> UAV | `run_plan1` | 在 `ok_wait` 后启动设定点预热、OFFBOARD、ARM 和 1.5 m 爬升。 |
-| GCS -> UAV | `go_ahead_ok` | 仅在坐标右移 0.35--0.40 m 且图传黑线居中后放行前飞。 |
-| GCS -> UAV | `match_car_ok` | GCS 图传识别小车并确认水平距离 `<0.1 m` 后请求投放。 |
-| GCS -> UAV | `b_ok` | 在成功投放后启动返航。 |
+| GCS -> UAV | `run_plan1` | 在 `ok_wait` 后启动 OFFBOARD、ARM 和 1.5 m 爬升。 |
+| GCS -> UAV | `car_status` | 在 ACK `ok_b` 后持续发送目标相对距离与相对方位。 |
 | GCS -> UAV | `ack` | 确认当前最早的未确认 `ok_*` 事件。 |
-| UAV -> GCS | `ok_wait`、`ok_height`、`ok_throw`、`ok_return`、`ok_downing`、`ok_down` | 有序、需要 ACK 的离散阶段事件。 |
+| UAV -> GCS | `ok_wait`、`ok_b`、`ok_throw`、`ok_return`、`ok_downing`、`ok_down` | 有序、需要 ACK 的离散阶段事件。 |
 | UAV -> GCS | `xyzstatus` | 每个新 `/lcp/debug` 样本的 LCP 数据和相对 Z 元数据；不需要 ACK。 |
 
 离散 `ok_*` 事件按顺序入队，首个事件立即发送，并以
 `udp.event_retry_period_s`（默认 `0.5 s`）重发，直至收到 `{"header":"ack","data":{}}`。
 `xyzstatus` 不进入该队列，不能 ACK。
 
-UAV 不再接收 `car_status`。到达高度并稳定 3 s 后，UAV 按锁存起飞航向右移
-`mission.right_shift_m`（强制限制为 0.35--0.40 m）。GCS 对比移前/移后 `xyzstatus` 坐标，
-并独立验证图传黑线位于视觉中心后发送 `go_ahead_ok`。UAV 随后沿初始航向前飞，最大距离由
-`mission.forward_distance_m`（默认 `5.0 m`）限制；GCS 持续计算图传中小车和飞机的距离，在
-`<0.1 m` 时发送 `match_car_ok`。UAV 保持当前位置 `mission.match_hold_seconds`（默认 `0.5 s`）
-后进入默认禁用夹爪的投放流程。
+到达高度并连续稳定 3 s 后，UAV 从 ARM 锁存的 Init 与初始偏航直达 B 点，保持高度和初始偏航。
+到 B 点并实测落入容差后仅发送一次 `ok_b`。GCS ACK 后开始特定图形识别，并持续发送
+`car_status`。UAV 用收包时间和实测 yaw 进行 ENU 转换，以二维匀速卡尔曼滤波预测首次进入
+0.20 m 投放距离的时刻。预测窗口大于 0.5 s 时只整形平移到最近直角相对方位，不转动机头；最后
+0.5 s 直接拦截预测目标。旧 `ok_height`、`go_ahead_ok`、`match_car_ok` 和 `b_ok` 一律拒绝并
+记录 `legacy_header_rejected`。
 
 ## 任务状态机
 
@@ -83,19 +82,17 @@ UAV 不再接收 `car_status`。到达高度并稳定 3 s 后，UAV 按锁存起
   -> 锁存 Init XYZ、发送 ok_wait
   -> 等待 run_plan1
   -> 设定点预热 -> OFFBOARD -> 普通 ARM
-  -> 相对 Init 爬升 1.5 m、发送 ok_height
-  -> 右移 0.35--0.40 m，等待 go_ahead_ok
-  -> 受限前飞，GCS 距离 <0.1 m 后发送 match_car_ok
-  -> 保持 0.5 s -> PWM 投放 -> ok_throw
-  -> b_ok -> 返航 Init XY、世界偏航 0 -> ok_return
+  -> 相对 Init 爬升 1.5 m、连续稳定 3 s
+  -> B 点直达 -> ok_b -> 等待连续 car_status
+  -> 直角方位整形 -> 最终预测拦截 -> PWM 投放 -> ok_throw
+  -> 自主返航 Init XY、世界偏航 0 -> ok_return
   -> 开始下降 -> ok_downing
   -> 着陆 -> 普通 Disarm -> MANUAL -> ok_down
 ```
 
-`Navigation` 对 XY 和 Z 使用五次多项式轨迹，并通过延长轨迹时间限制速度和加速度。前飞目标由
-`mission.forward_distance_m` 限制。LCP 在爬升、右移、前飞、投放或返航阶段失效时，
-任务会冻结可靠位置；超过 LCP 保持超时、飞控模式丢失、飞行健康失败或最大飞行时间后，进入安全
-降落路径。
+`Navigation` 对 XY 和 Z 使用五次多项式轨迹，并通过延长轨迹时间限制速度和加速度。LCP 在
+高度稳定、B 点、拦截、投放或返航阶段失效时，任务会冻结可靠位置；超过保持超时、飞控模式丢失、
+飞行健康失败或最大飞行时间后，进入安全降落路径。
 
 `ok_down` 的语义是已着陆、PX4 已普通解锁（Disarm）且已确认 `MANUAL`；不会关闭 Raspberry Pi
 或飞控电源。
@@ -135,8 +132,8 @@ SITL；此时适配器执行定时空操作，不访问硬件。
 - `gripper_pwm.pinmux_path` 可读且包含 `gripper_pwm.pinmux_expected`；
 - PWM 通道可导出，且 `period`、`duty_cycle`、`enable` 均可写。
 
-任一准备或写入失败都不会发送 `ok_throw`，状态机会回到跟车阶段。之后一条满足门限的
-`match_car_ok` 可以重新尝试投放。自动测试仅使用 sysfs 仿真目录，不驱动真实 PWM 引脚。
+任一准备或写入失败都不会发送 `ok_throw`，状态机会记录失败并返航；本流程不重试投放。自动测试
+仅使用 sysfs 仿真目录，不驱动真实 PWM 引脚。
 
 ## 预检与显式确认
 
@@ -192,7 +189,7 @@ colcon test --packages-select mavros_xyz_position_offboard --event-handlers cons
 colcon test-result --all --verbose
 ```
 
-测试覆盖 V0.7 入站校验、白名单拒绝、ACK 重传队列、有效/无效 Z 的 `xyzstatus` 编码、完整任务
+测试覆盖 Plan1 入站校验、白名单拒绝、ACK 重传队列、有效/无效 Z 的 `xyzstatus` 编码、完整任务
 顺序、PWM sysfs 仿真和 UDP 回环。真实 PWM 引脚和实际飞行不在自动测试范围内。
 
 ## 配置与运行
@@ -226,7 +223,7 @@ ros2 run mavros_xyz_position_offboard mavros_xyz_position_node \
 ```text
 px4-test-tools/
 ├── mavros_xyz_position_offboard/       ROS 2 C++17 UAV 节点、库、测试和包级 README
-│   ├── src/communication/              UDP V0.7 协议、ACK 队列与 xyzstatus 编码
+│   ├── src/communication/              Plan1 UDP 协议、ACK 队列与 xyzstatus 编码
 │   ├── src/navigation/                 五次轨迹和任务状态机
 │   ├── src/gripper/                    非阻塞 Linux PWM sysfs 夹爪适配器
 │   ├── src/initialization/             遥测订阅、预检、RangeGuard 与 LCP 门禁

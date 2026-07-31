@@ -124,28 +124,28 @@ mavros_native_xyz_position:
       takeoff_height_m: 1.5
       # 到达任务高度后必须持续稳定的时间，单位：秒。
       height_stable_seconds: 3.0
-      # 按初始航向向机体右侧平移的距离，用于黑线对齐，单位：米。
-      right_shift_m: 0.375
-      # 收到地面站 go_ahead_ok 后沿航向直线追踪的最大距离，单位：米。
-      forward_distance_m: 5.0
-      # go_ahead_ok 前向搜索的最大水平速度，不能超过 safety.max_flight_horizontal_speed_m_s，单位：米/秒。
-      forward_max_speed_m_s: 0.9
-      # 视觉相对目标的期望 XY 到达时间，单位：秒。
-      tracking_arrival_seconds: 1.0
-      # 允许 match_car_ok 确认投放的最新视觉距离阈值，单位：米。
-      tracking_tolerance_m: 0.2
-      # 收到有效 match_car_ok 后保持再触发投放的时长，单位：秒。
-      match_hold_seconds: 0.5
+      # B 点相对初始航向的右偏距离，单位：米。
+      b_right_m: 0.375
+      # B 点相对初始航向的前向距离，单位：米。
+      b_forward_m: 2.375
+      # 预测目标与 UAV 的距离不大于此值时触发投放，单位：米。
+      throw_distance_m: 0.20
+      # 二维位置观测的标准差，单位：米。
+      filter_measurement_noise_m: 0.05
+      # 匀速卡尔曼模型的白噪声加速度标准差，单位：米/秒²。
+      filter_acceleration_noise_m_s2: 0.50
+      # 进入预测拦截前所需的最少有效观测数。
+      filter_min_samples: 3
+      # 预测交会的最大前瞻窗口，单位：秒。
+      prediction_horizon_s: 2.0
+      # 相对机头最近直角方位的容差，单位：度。
+      cardinal_tolerance_deg: 5.0
+      # 预测剩余时间进入此窗口后取消强制直角方位，单位：秒。
+      final_intercept_seconds: 0.5
       # 连续 car_status 中断后冻结实测位置的时长，单位：秒。
       car_status_timeout_s: 2.0
       # 视觉目标相对起飞原点的最大允许半径，单位：米。
       max_tracking_radius_m: 5.0
-      # 伴飞时触发 EKF 高度突变补偿的最小本地 Z 变化，单位：米。
-      accompanying_z_jump_threshold_m: 0.10
-      # 伴飞高度突变的临时设定点补偿步长，单位：米。
-      accompanying_z_step_m: 0.11
-      # 伴飞高度突变需在此时间窗口内发生，单位：秒。
-      accompanying_z_jump_window_s: 0.10
 
     z:
       # true 时优先使用测距高度，false 时优先使用本地位姿高度。

@@ -170,27 +170,26 @@ navigation::MissionConfig ApplicationNode::load_mission_config()
   value.takeoff_height_m = declare_parameter<double>("mission.takeoff_height_m", value.takeoff_height_m);
   value.height_stable_seconds = declare_parameter<double>(
     "mission.height_stable_seconds", value.height_stable_seconds);
-  value.right_shift_m = declare_parameter<double>("mission.right_shift_m", value.right_shift_m);
-  value.forward_distance_m = declare_parameter<double>(
-    "mission.forward_distance_m", value.forward_distance_m);
-  value.forward_max_speed_m_s = declare_parameter<double>(
-    "mission.forward_max_speed_m_s", value.forward_max_speed_m_s);
-  value.tracking_arrival_seconds = declare_parameter<double>(
-    "mission.tracking_arrival_seconds", value.tracking_arrival_seconds);
-  value.tracking_tolerance_m = declare_parameter<double>(
-    "mission.tracking_tolerance_m", value.tracking_tolerance_m);
-  value.match_hold_seconds = declare_parameter<double>(
-    "mission.match_hold_seconds", value.match_hold_seconds);
+  value.b_right_m = declare_parameter<double>("mission.b_right_m", value.b_right_m);
+  value.b_forward_m = declare_parameter<double>("mission.b_forward_m", value.b_forward_m);
+  value.throw_distance_m = declare_parameter<double>(
+    "mission.throw_distance_m", value.throw_distance_m);
+  value.filter_measurement_noise_m = declare_parameter<double>(
+    "mission.filter_measurement_noise_m", value.filter_measurement_noise_m);
+  value.filter_acceleration_noise_m_s2 = declare_parameter<double>(
+    "mission.filter_acceleration_noise_m_s2", value.filter_acceleration_noise_m_s2);
+  value.filter_min_samples = declare_parameter<int>(
+    "mission.filter_min_samples", value.filter_min_samples);
+  value.prediction_horizon_s = declare_parameter<double>(
+    "mission.prediction_horizon_s", value.prediction_horizon_s);
+  value.cardinal_tolerance_deg = declare_parameter<double>(
+    "mission.cardinal_tolerance_deg", value.cardinal_tolerance_deg);
+  value.final_intercept_seconds = declare_parameter<double>(
+    "mission.final_intercept_seconds", value.final_intercept_seconds);
   value.car_status_timeout_s = declare_parameter<double>(
     "mission.car_status_timeout_s", value.car_status_timeout_s);
   value.max_tracking_radius_m = declare_parameter<double>(
     "mission.max_tracking_radius_m", value.max_tracking_radius_m);
-  value.accompanying_z_jump_threshold_m = declare_parameter<double>(
-    "mission.accompanying_z_jump_threshold_m", value.accompanying_z_jump_threshold_m);
-  value.accompanying_z_step_m = declare_parameter<double>(
-    "mission.accompanying_z_step_m", value.accompanying_z_step_m);
-  value.accompanying_z_jump_window_s = declare_parameter<double>(
-    "mission.accompanying_z_jump_window_s", value.accompanying_z_jump_window_s);
   value.validate();
   return value;
 }

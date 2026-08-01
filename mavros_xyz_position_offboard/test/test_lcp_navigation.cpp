@@ -604,6 +604,21 @@ TEST(ApplicationNodeMissionParameterTest, CarTrackingLimitsInheritEffectiveSafet
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.return_max_accel_m_s2").as_double(), 1.30);
 }
 
+TEST(ApplicationNodeMissionParameterTest, DowningLimitsUseIndependentDefaultsAndOverrides)
+{
+  const auto defaults = std::make_shared<ApplicationNode>(
+    application_test_options(), SafetyConfig{}, application_test_node_options());
+  EXPECT_DOUBLE_EQ(defaults->get_parameter("mission.downing_max_speed_m_s").as_double(), 0.30);
+  EXPECT_DOUBLE_EQ(defaults->get_parameter("mission.downing_max_accel_m_s2").as_double(), 0.30);
+
+  const auto overridden = std::make_shared<ApplicationNode>(
+    application_test_options(), SafetyConfig{}, application_test_node_options({
+      rclcpp::Parameter("mission.downing_max_speed_m_s", 0.22),
+      rclcpp::Parameter("mission.downing_max_accel_m_s2", 0.27)}));
+  EXPECT_DOUBLE_EQ(overridden->get_parameter("mission.downing_max_speed_m_s").as_double(), 0.22);
+  EXPECT_DOUBLE_EQ(overridden->get_parameter("mission.downing_max_accel_m_s2").as_double(), 0.27);
+}
+
 TEST(ApplicationNodeMissionParameterTest, InvalidMissionTimingAndReturnLimitsAreRejectedAtStartup)
 {
   for (const double value : {
@@ -618,6 +633,16 @@ TEST(ApplicationNodeMissionParameterTest, InvalidMissionTimingAndReturnLimitsAre
       std::make_shared<ApplicationNode>(
         application_test_options(), SafetyConfig{}, application_test_node_options({
           rclcpp::Parameter("mission.return_max_accel_m_s2", value)})),
+      std::invalid_argument);
+    EXPECT_THROW(
+      std::make_shared<ApplicationNode>(
+        application_test_options(), SafetyConfig{}, application_test_node_options({
+          rclcpp::Parameter("mission.downing_max_speed_m_s", value)})),
+      std::invalid_argument);
+    EXPECT_THROW(
+      std::make_shared<ApplicationNode>(
+        application_test_options(), SafetyConfig{}, application_test_node_options({
+          rclcpp::Parameter("mission.downing_max_accel_m_s2", value)})),
       std::invalid_argument);
 
     EXPECT_THROW(

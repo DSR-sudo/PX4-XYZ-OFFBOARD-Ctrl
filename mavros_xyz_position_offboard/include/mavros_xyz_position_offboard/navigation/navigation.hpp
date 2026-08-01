@@ -83,6 +83,8 @@ private:
   bool car_status_fresh(double now) const;
   /// 取消投掷计时并开始从当前高度返回锁存原点。
   void begin_return(double now);
+  /// 使用正常下降 Z 轴限制从返航原点规划到 Init 高度。
+  void begin_downing(double now);
   /// 判断阶段是否必须因 LCP 不健康冻结位置。
   bool lcp_required_in_phase() const;
 

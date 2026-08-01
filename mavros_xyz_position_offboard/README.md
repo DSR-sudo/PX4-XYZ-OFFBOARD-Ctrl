@@ -76,8 +76,11 @@ are preserved, and each new observation replans the XY target in place with the 
 effective `safety.target_xy_*` value is inherited. Return uses the independent
 `mission.return_max_speed_m_s` (default `10.0 m/s`) and
 `mission.return_max_accel_m_s2` (default `5.0 m/s2`) limits, inheriting the effective
-`safety.target_xy_*` values when omitted; the example YAML sets them to `1.0/0.5`. B-point and
-landing trajectories keep using the global `safety.target_xy_*` limits. After the lock-follow timer
+`safety.target_xy_*` values when omitted; the example YAML sets them to `1.0/0.5`. Normal
+`downing` uses the independent Z limits `mission.downing_max_speed_m_s` and
+`mission.downing_max_accel_m_s2` (both default `0.3`), while failure `landing` keeps the global
+Z limits. B-point and landing XY trajectories keep using the global `safety.target_xy_*` limits.
+After the lock-follow timer
 completes, the latest fresh raw `distance_m < mission.throw_distance_m` (default `0.20 m`)
 immediately enters `throwing`; equality does not release. Subsequent car_status messages use the
 normal live distance gate. `throw_bearing_rad` and `throw_bearing_tolerance_rad` remain accepted compatibility

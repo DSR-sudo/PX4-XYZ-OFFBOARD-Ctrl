@@ -33,6 +33,14 @@ TEST(MissionConfigTest, RejectsInvalidIndependentXyLimits)
     invalid_return_accel.return_max_accel_m_s2 = value;
     EXPECT_THROW(invalid_return_accel.validate(), std::invalid_argument);
 
+    MissionConfig invalid_downing_speed;
+    invalid_downing_speed.downing_max_speed_m_s = value;
+    EXPECT_THROW(invalid_downing_speed.validate(), std::invalid_argument);
+
+    MissionConfig invalid_downing_accel;
+    invalid_downing_accel.downing_max_accel_m_s2 = value;
+    EXPECT_THROW(invalid_downing_accel.validate(), std::invalid_argument);
+
     MissionConfig invalid_target_lock;
     invalid_target_lock.target_lock_follow_seconds = value;
     EXPECT_THROW(invalid_target_lock.validate(), std::invalid_argument);

@@ -2,8 +2,12 @@
 cd /home/pi/px4-test-tools
 source /opt/ros/jazzy/setup.bash
 source /home/pi/LSLIDARN10P/install/setup.bash
-colcon build --symlink-install --packages-select mavros_xyz_position_offboard --parallel-workers 1
-source install/setup.bash
+
+MAKEFLAGS=-j4 CMAKE_BUILD_PARALLEL_LEVEL=4 \
+colcon build --packages-select mavros_xyz_position_offboard \
+  --parallel-workers 1 \
+  --cmake-force-configure \
+  --event-handlers console_direct+
 
 # Terminal A: launch the bounded flight with the SG90 enabled by the default YAML.
 # gripper_pwm: BCM18, 50 Hz, 4% closed, 7% open, 500 ms open hold.

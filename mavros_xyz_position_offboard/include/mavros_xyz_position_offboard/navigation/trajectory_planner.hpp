@@ -37,6 +37,9 @@ public:
   void hold_xy();
   /// 开始到绝对 Z 目标的有界五次轨迹。
   void set_z_target(double z_m);
+  /// 使用调用方给定的 Z 轴速度和加速度上限开始五次轨迹。
+  void set_z_target_with_limits(
+    double z_m, double max_speed_m_s, double max_accel_m_s2);
   /// 冻结当前 Z 设定点并清除垂直速度。
   void freeze_z();
   /// 立即将 Z 设定点冻结在指定实测高度并清除垂直速度。
@@ -90,8 +93,8 @@ private:
   static Coefficients quintic_coefficients(double start, double rate, double target, double duration_s);
   /// 计算五次多项式在 t 时刻的位置、速度和加速度。
   static std::array<double, 3> evaluate(const Coefficients & coefficients, double t);
-  /// 根据垂直速度/加速度约束初始化 Z 轨迹。
-  void begin_z_trajectory(double target_z_m);
+  /// 根据给定的垂直速度/加速度约束初始化 Z 轨迹。
+  void begin_z_trajectory(double target_z_m, double max_speed_m_s, double max_accel_m_s2);
   /// 根据平面速度/加速度约束初始化 XY 轨迹。
   bool begin_xy_trajectory(
     double target_x_m, double target_y_m,

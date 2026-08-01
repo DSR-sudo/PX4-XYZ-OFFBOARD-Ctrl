@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <cmath>
+#include <stdexcept>
 
 #include <gtest/gtest.h>
 
@@ -100,6 +102,61 @@ TEST(TrajectoryPlannerTest, CustomXyLimitsConstrainResultantMotionWithoutChangin
     previous_vy = vy;
   }
   EXPECT_TRUE(custom.xy_target_reached());
+}
+
+TEST(TrajectoryPlannerTest, CustomZLimitsConstrainDownwardMotionWithoutChangingGlobalApi)
+{
+  SafetyConfig config;
+  config.max_z_setpoint_rate_m_s = 10.0;
+  config.max_z_setpoint_accel_m_s2 = 10.0;
+  constexpr double kCustomSpeed = 0.30;
+  constexpr double kCustomAccel = 0.30;
+  constexpr double kDt = 0.01;
+
+  TrajectoryPlanner global(config);
+  global.latch(0.0, 0.0, 1.4, {0.0, 0.0, 0.0, 1.0});
+  global.set_z_target(0.0);
+
+  TrajectoryPlanner custom(config);
+  custom.latch(0.0, 0.0, 1.4, {0.0, 0.0, 0.0, 1.0});
+  custom.set_z_target_with_limits(0.0, kCustomSpeed, kCustomAccel);
+
+  double previous_custom_rate = 0.0;
+  double custom_peak_rate = 0.0;
+  double custom_peak_accel = 0.0;
+  double global_peak_rate = 0.0;
+  for (int i = 0; i < 4000 && (!custom.target_reached() || !global.target_reached()); ++i) {
+    if (!custom.target_reached()) {
+      const auto current = custom.update(kDt);
+      custom_peak_rate = std::max(custom_peak_rate, std::abs(current.vertical_rate_m_s));
+      custom_peak_accel = std::max(
+        custom_peak_accel, std::abs(current.vertical_rate_m_s - previous_custom_rate) / kDt);
+      previous_custom_rate = current.vertical_rate_m_s;
+      EXPECT_LE(std::abs(current.vertical_rate_m_s), kCustomSpeed * 1.002);
+    }
+    if (!global.target_reached()) {
+      const auto current = global.update(kDt);
+      global_peak_rate = std::max(global_peak_rate, std::abs(current.vertical_rate_m_s));
+    }
+  }
+
+  EXPECT_TRUE(custom.target_reached());
+  EXPECT_TRUE(global.target_reached());
+  EXPECT_LE(custom_peak_rate, kCustomSpeed * 1.002);
+  EXPECT_LE(custom_peak_accel, kCustomAccel * 1.05);
+  EXPECT_GT(global_peak_rate, kCustomSpeed * 1.5);
+}
+
+TEST(TrajectoryPlannerTest, CustomZLimitsRejectNonPositiveOrNonFiniteValues)
+{
+  SafetyConfig config;
+  TrajectoryPlanner planner(config);
+  planner.latch(0.0, 0.0, 1.0, {0.0, 0.0, 0.0, 1.0});
+  const double invalid_values[] = {0.0, -1.0, NAN, INFINITY, -INFINITY};
+  for (const double value : invalid_values) {
+    EXPECT_THROW(planner.set_z_target_with_limits(0.0, value, 0.3), std::invalid_argument);
+    EXPECT_THROW(planner.set_z_target_with_limits(0.0, 0.3, value), std::invalid_argument);
+  }
 }
 
 }  // namespace

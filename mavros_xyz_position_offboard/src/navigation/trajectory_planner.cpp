@@ -145,7 +145,20 @@ void TrajectoryPlanner::set_z_target(double z_m)
 {
   require_latched("setting a Z target");
   if (!common::finite(z_m)) {throw std::invalid_argument("Z target must be finite");}
-  begin_z_trajectory(z_m);
+  begin_z_trajectory(
+    z_m, config_.max_z_setpoint_rate_m_s, config_.max_z_setpoint_accel_m_s2);
+}
+
+/// 校验并开始一段使用调用方限制的绝对高度轨迹。
+void TrajectoryPlanner::set_z_target_with_limits(
+  double z_m, double max_speed_m_s, double max_accel_m_s2)
+{
+  require_latched("setting a Z target with custom limits");
+  if (!common::finite(z_m) || !common::finite(max_speed_m_s) ||
+    !common::finite(max_accel_m_s2) || max_speed_m_s <= 0.0 || max_accel_m_s2 <= 0.0) {
+    throw std::invalid_argument("Z target and limits must be finite and positive");
+  }
+  begin_z_trajectory(z_m, max_speed_m_s, max_accel_m_s2);
 }
 
 /// 从当前规划位置和速度连续重规划新的绝对 XYZ 地面站目标。
@@ -181,8 +194,9 @@ void TrajectoryPlanner::set_yaw_rad(double yaw)
   orientation_ = {0.0, 0.0, std::sin(0.5 * yaw), std::cos(0.5 * yaw)};
 }
 
-/// 迭代拉长五次 Z 轨迹，直到速度与加速度峰值均满足配置。
-void TrajectoryPlanner::begin_z_trajectory(double target)
+/// 迭代拉长五次 Z 轨迹，直到速度与加速度峰值均满足给定限制。
+void TrajectoryPlanner::begin_z_trajectory(
+  double target, double max_speed_m_s, double max_accel_m_s2)
 {
   target_z_m_ = target;
   const double distance = std::abs(target - command_z_m_);
@@ -192,9 +206,9 @@ void TrajectoryPlanner::begin_z_trajectory(double target)
     coefficients_ = {target, 0, 0, 0, 0, 0};
     return;
   }
-  double duration = std::max({0.5, 2.0 * distance / config_.max_z_setpoint_rate_m_s,
-    std::sqrt(6.0 * distance / config_.max_z_setpoint_accel_m_s2),
-    2.0 * std::abs(vertical_rate_m_s_) / config_.max_z_setpoint_accel_m_s2});
+  double duration = std::max({0.5, 2.0 * distance / max_speed_m_s,
+    std::sqrt(6.0 * distance / max_accel_m_s2),
+    2.0 * std::abs(vertical_rate_m_s_) / max_accel_m_s2});
   auto candidate = quintic_coefficients(command_z_m_, vertical_rate_m_s_, target, duration);
   for (int iteration = 0; iteration < 12; ++iteration) {
     double peak_rate = 0.0;
@@ -205,8 +219,8 @@ void TrajectoryPlanner::begin_z_trajectory(double target)
       peak_acceleration = std::max(peak_acceleration, std::abs(state[2]));
     }
     const double scale = std::max({
-      1.0, peak_rate / config_.max_z_setpoint_rate_m_s,
-      std::sqrt(peak_acceleration / config_.max_z_setpoint_accel_m_s2)});
+      1.0, peak_rate / max_speed_m_s,
+      std::sqrt(peak_acceleration / max_accel_m_s2)});
     if (scale <= 1.000001) {break;}
     duration *= scale * 1.01;
     candidate = quintic_coefficients(command_z_m_, vertical_rate_m_s_, target, duration);

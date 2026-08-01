@@ -182,6 +182,10 @@ navigation::MissionConfig ApplicationNode::load_mission_config()
     "mission.return_max_speed_m_s", config_.target_xy_max_speed_m_s);
   value.return_max_accel_m_s2 = declare_parameter<double>(
     "mission.return_max_accel_m_s2", config_.target_xy_max_accel_m_s2);
+  value.downing_max_speed_m_s = declare_parameter<double>(
+    "mission.downing_max_speed_m_s", value.downing_max_speed_m_s);
+  value.downing_max_accel_m_s2 = declare_parameter<double>(
+    "mission.downing_max_accel_m_s2", value.downing_max_accel_m_s2);
   value.target_lock_follow_seconds = declare_parameter<double>(
     "mission.target_lock_follow_seconds", value.target_lock_follow_seconds);
   value.throw_distance_m = declare_parameter<double>(

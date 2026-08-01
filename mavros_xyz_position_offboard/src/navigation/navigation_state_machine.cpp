@@ -164,13 +164,7 @@ NavigationDecision Navigation::update(const NavigationInput & input)
         input.telemetry, control_.origin->x_m, control_.origin->y_m, config_.target_tolerance_m) &&
       actual_yaw_within(input.telemetry, 0.0, 0.10)) {
       emit(communication::MessageType::ok_return);
-      auto descent_goal = *control_.origin;
-      descent_goal.orientation = {0.0, 0.0, 0.0, 1.0};
-      set_mission_goal(descent_goal);
-      plan_to_mission_goal();
-      normal_completion_ = true;
-      emit(communication::MessageType::ok_downing);
-      transition("downing", input.now);
+      begin_downing(input.now);
     }
   } else if (phase_ == "lcp_hold") {
     if (input.lcp_healthy && control_.hold_reason == "lcp_unhealthy") {resume_hold(input.now);}

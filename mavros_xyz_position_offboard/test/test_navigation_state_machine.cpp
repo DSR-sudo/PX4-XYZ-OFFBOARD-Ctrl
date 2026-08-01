@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -350,6 +351,8 @@ TEST(NavigationV3Test, SuccessfulThrowReturnsAndCompletesLandingWithoutAGcsRetur
   mission.target_lock_follow_seconds = 0.04;
   mission.return_max_speed_m_s = 0.35;
   mission.return_max_accel_m_s2 = 0.65;
+  mission.downing_max_speed_m_s = 0.30;
+  mission.downing_max_accel_m_s2 = 0.30;
   Navigation navigation(safety, mission);
   auto input = base_input(0.0);
   input.dt = 0.05;
@@ -407,11 +410,27 @@ TEST(NavigationV3Test, SuccessfulThrowReturnsAndCompletesLandingWithoutAGcsRetur
 
   bool saw_return = false;
   bool saw_downing = false;
+  double peak_downing_rate = 0.0;
+  double peak_downing_accel = 0.0;
+  double previous_downing_rate = 0.0;
+  bool have_previous_downing_rate = false;
+  const auto record_downing_setpoint = [&](const NavigationDecision & decision) {
+      if (decision.phase != "downing" || !decision.setpoint) {return;}
+      const double rate = decision.setpoint->vertical_rate_m_s;
+      peak_downing_rate = std::max(peak_downing_rate, std::abs(rate));
+      if (have_previous_downing_rate) {
+        peak_downing_accel = std::max(
+          peak_downing_accel, std::abs(rate - previous_downing_rate) / input.dt);
+      }
+      previous_downing_rate = rate;
+      have_previous_downing_rate = true;
+    };
   for (int count = 0; count < 400 && navigation.phase() != "downing"; ++count) {
     follow_planner(navigation, input);
     input.now = now;
     input.events.clear();
     const auto decision = navigation.update(input);
+    record_downing_setpoint(decision);
     saw_return = saw_return || has_message(decision, MessageType::ok_return);
     saw_downing = saw_downing || has_message(decision, MessageType::ok_downing);
     now += input.dt;
@@ -424,13 +443,16 @@ TEST(NavigationV3Test, SuccessfulThrowReturnsAndCompletesLandingWithoutAGcsRetur
     follow_planner(navigation, input);
     input.now = now;
     input.events.clear();
-    navigation.update(input);
+    record_downing_setpoint(navigation.update(input));
     now += input.dt;
   }
   input.telemetry.landed_state = mavros_xyz_position_offboard::common::MAV_LANDED_STATE_ON_GROUND;
   input.now = now;
   navigation.update(input);
   EXPECT_EQ(navigation.phase(), "disarming");
+  EXPECT_LE(peak_downing_rate, mission.downing_max_speed_m_s * 1.002);
+  EXPECT_LE(peak_downing_accel, mission.downing_max_accel_m_s2 * 1.05);
+  EXPECT_GT(peak_downing_rate, mission.downing_max_speed_m_s * 0.80);
   input.controller.armed = false;
   input.now += input.dt;
   navigation.update(input);

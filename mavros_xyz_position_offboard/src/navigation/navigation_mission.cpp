@@ -135,4 +135,22 @@ void Navigation::begin_return(double now)
   transition("returning", now);
 }
 
+void Navigation::begin_downing(double now)
+{
+  if (!control_.origin) {
+    begin_landing(now, "downing_without_origin");
+    return;
+  }
+  auto descent_goal = *control_.origin;
+  descent_goal.orientation = {0.0, 0.0, 0.0, 1.0};
+  set_mission_goal(descent_goal);
+  planner_.set_xy_target(descent_goal.x_m, descent_goal.y_m);
+  planner_.set_z_target_with_limits(
+    descent_goal.z_m, mission_.downing_max_speed_m_s, mission_.downing_max_accel_m_s2);
+  planner_.set_yaw_rad(0.0);
+  normal_completion_ = true;
+  emit(communication::MessageType::ok_downing);
+  transition("downing", now);
+}
+
 }  // namespace mavros_xyz_position_offboard::navigation

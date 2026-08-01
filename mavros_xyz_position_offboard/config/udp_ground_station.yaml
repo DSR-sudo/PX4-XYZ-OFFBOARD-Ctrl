@@ -8,11 +8,11 @@ mavros_native_xyz_position:
       # 本机 UDP 监听端口。
       bind_port: 5005
       # 地面站 UDP 目标地址。
-      remote_ip: 192.168.10.22
+      remote_ip: 192.168.10.59
       # 地面站 UDP 目标端口。
       remote_port: 5005
       # 仅接受此 IP 地址发来的 UDP 数据报。
-      whitelist_ip: 192.168.10.22
+      whitelist_ip: 192.168.10.59
       # 仅接受此端口发来的 UDP 数据报。
       whitelist_port: 5005
       # 需要确认的业务事件重发周期，单位：秒。
@@ -138,6 +138,10 @@ mavros_native_xyz_position:
       return_max_speed_m_s: 0.3
       # 返航原点 XY 轨迹允许的最大合加速度，单位：米/秒²。
       return_max_accel_m_s2: 0.3
+      # 正常下降 Z 轴轨迹允许的最大速度，单位：米/秒。
+      downing_max_speed_m_s: 0.3
+      # 正常下降 Z 轴轨迹允许的最大加速度，单位：米/秒²。
+      downing_max_accel_m_s2: 0.3
       # 首条有效 car_status 后持续动态跟随锁定目标的时长，单位：秒。
       target_lock_follow_seconds: 10.0
       # 车辆中心实时追踪的投掷距离门限，单位：米；严格使用 distance_m < 此值释放。
@@ -179,8 +183,8 @@ mavros_native_xyz_position:
       # SG90 PWM 频率，单位：Hz。
       pwm_frequency_hz: 50.0
       # 已验证的 SG90 关闭位置占空比，单位：百分比。
-      closed_duty_cycle: 4.0
+      closed_duty_cycle: 7.0
       # 已验证的 SG90 打开位置占空比，单位：百分比。
-      open_duty_cycle: 7.0
+      open_duty_cycle: 12.0
       # 输出打开信号后的保持时长，单位：毫秒；之后恢复关闭信号。
       open_hold_ms: 500

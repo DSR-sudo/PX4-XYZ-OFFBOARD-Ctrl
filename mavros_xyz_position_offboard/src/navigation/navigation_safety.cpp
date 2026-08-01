@@ -69,6 +69,7 @@ void Navigation::enter_hold(
   const std::string & reason, const std::optional<std::string> & resume_phase)
 {
   if (!planner_.latched() || phase_ == hold_phase) {return;}
+  if (phase_ == "target_lock_following") {pause_target_lock_follow(input.now);}
   const auto hold = measured_hold_setpoint(input);
   planner_.freeze_xy_at(hold.x_m, hold.y_m);
   planner_.freeze_z_at(hold.z_m);
@@ -96,11 +97,16 @@ void Navigation::resume_hold(double now)
   plan_to_mission_goal();
   clear_hold();
   transition(resume, now);
+  if (resume == "target_lock_following") {resume_target_lock_follow(now);}
 }
 
 void Navigation::begin_landing(double now, const std::string & reason)
 {
   pending_release_gripper_ = false;
+  latest_car_status_.reset();
+  target_lock_follow_elapsed_s_ = 0.0;
+  target_lock_follow_started_at_.reset();
+  target_lock_follow_completed_ = false;
   if (planner_.latched()) {
     clear_hold();
     planner_.hold_xy();
@@ -114,7 +120,8 @@ void Navigation::begin_landing(double now, const std::string & reason)
 bool Navigation::lcp_required_in_phase() const
 {
   return phase_ == "height_stabilizing" || phase_ == "transit_to_b" ||
-    phase_ == "waiting_target" || phase_ == "throwing" || phase_ == "returning" ||
+    phase_ == "waiting_target" || phase_ == "target_lock_following" ||
+    phase_ == "throwing" || phase_ == "returning" ||
     phase_ == "downing";
 }
 

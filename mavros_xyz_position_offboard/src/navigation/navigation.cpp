@@ -25,6 +25,10 @@ void Navigation::reset()
   landing_reason_.clear();
   pending_release_gripper_ = false;
   last_car_status_at_.reset();
+  latest_car_status_.reset();
+  target_lock_follow_elapsed_s_ = 0.0;
+  target_lock_follow_started_at_.reset();
+  target_lock_follow_completed_ = false;
 }
 
 void Navigation::transition(const std::string & phase, double now)

@@ -46,7 +46,10 @@ bool Navigation::apply_car_status(
     reject("car_status_target_outside_tracking_radius");
     control_.target_samples = 0;
     last_car_status_at_.reset();
-    enter_hold(input, "lcp_hold", "car_status_target_outside_tracking_radius", "waiting_target");
+    const std::string resume_phase = phase_ == "target_lock_following" ?
+      "target_lock_following" : "waiting_target";
+    enter_hold(
+      input, "lcp_hold", "car_status_target_outside_tracking_radius", resume_phase);
     return false;
   }
 
@@ -64,14 +67,41 @@ bool Navigation::apply_car_status(
   planner_.set_yaw_rad(common::yaw_from_quaternion(control_.origin->orientation));
 
   last_car_status_at_ = input.now;
+  latest_car_status_ = status;
   control_.target_samples = 0;
   control_.predicted_intercept_seconds.reset();
   clear_hold();
-  if (status.distance_m < mission_.throw_distance_m) {
-    pending_release_gripper_ = true;
-    transition("throwing", input.now);
-  }
   return true;
+}
+
+void Navigation::begin_target_lock_follow(double now)
+{
+  target_lock_follow_elapsed_s_ = 0.0;
+  target_lock_follow_started_at_ = now;
+  transition("target_lock_following", now);
+}
+
+void Navigation::pause_target_lock_follow(double now)
+{
+  if (!target_lock_follow_started_at_) {return;}
+  if (now > *target_lock_follow_started_at_) {
+    target_lock_follow_elapsed_s_ += now - *target_lock_follow_started_at_;
+  }
+  target_lock_follow_started_at_.reset();
+}
+
+void Navigation::resume_target_lock_follow(double now)
+{
+  target_lock_follow_started_at_ = now;
+}
+
+double Navigation::target_lock_follow_elapsed(double now) const
+{
+  double elapsed = target_lock_follow_elapsed_s_;
+  if (target_lock_follow_started_at_ && now > *target_lock_follow_started_at_) {
+    elapsed += now - *target_lock_follow_started_at_;
+  }
+  return elapsed;
 }
 
 bool Navigation::car_status_fresh(double now) const
@@ -89,6 +119,10 @@ void Navigation::begin_return(double now)
   control_.target_samples = 0;
   control_.predicted_intercept_seconds.reset();
   clear_hold();
+  latest_car_status_.reset();
+  target_lock_follow_elapsed_s_ = 0.0;
+  target_lock_follow_started_at_.reset();
+  target_lock_follow_completed_ = false;
   auto return_goal = *control_.origin;
   return_goal.z_m = planner_.latched() ? planner_.current().z_m : return_goal.z_m;
   return_goal.orientation = {0.0, 0.0, 0.0, 1.0};

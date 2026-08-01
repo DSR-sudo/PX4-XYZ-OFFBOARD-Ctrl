@@ -26,12 +26,33 @@ void Navigation::process_events(const NavigationInput & input)
     if (event.type == communication::MessageType::car_status) {
       if (!event.car_status) {
         reject("car_status_missing_measurement");
-      } else if (phase_ == "waiting_target") {
-        apply_car_status(input, *event.car_status);
+      } else if (phase_ == "waiting_target" || phase_ == "target_lock_following") {
+        const bool begin_lock = phase_ == "waiting_target" && !target_lock_follow_completed_;
+        const bool allow_release = phase_ == "waiting_target" && target_lock_follow_completed_;
+        if (apply_car_status(input, *event.car_status)) {
+          if (begin_lock) {
+            begin_target_lock_follow(input.now);
+          } else if (allow_release && event.car_status->distance_m < mission_.throw_distance_m) {
+            pending_release_gripper_ = true;
+            transition("throwing", input.now);
+          }
+        }
       } else if (phase_ == "lcp_hold" && control_.hold_reason != "lcp_unhealthy") {
+        const std::string resume_phase = control_.hold_resume_phase.empty() ?
+          "waiting_target" : control_.hold_resume_phase;
+        const bool resume_lock = resume_phase == "target_lock_following";
         clear_hold();
-        transition("waiting_target", input.now);
-        apply_car_status(input, *event.car_status);
+        transition(resume_phase, input.now);
+        if (resume_lock) {resume_target_lock_follow(input.now);}
+        if (apply_car_status(input, *event.car_status)) {
+          if (!resume_lock && !target_lock_follow_completed_) {
+            begin_target_lock_follow(input.now);
+          } else if (!resume_lock && target_lock_follow_completed_ &&
+            event.car_status->distance_m < mission_.throw_distance_m) {
+            pending_release_gripper_ = true;
+            transition("throwing", input.now);
+          }
+        }
       } else {
         reject("car_status_not_allowed_in_phase");
       }
@@ -110,6 +131,24 @@ NavigationDecision Navigation::update(const NavigationInput & input)
       control_.predicted_intercept_seconds.reset();
       last_car_status_at_.reset();
       enter_hold(input, "lcp_hold", "car_status_timeout", "waiting_target");
+    }
+  } else if (phase_ == "target_lock_following") {
+    if (last_car_status_at_ && !car_status_fresh(input.now)) {
+      const double timeout_at = *last_car_status_at_ + mission_.car_status_timeout_s;
+      pause_target_lock_follow(input.now < timeout_at ? input.now : timeout_at);
+      control_.target_samples = 0;
+      control_.predicted_intercept_seconds.reset();
+      last_car_status_at_.reset();
+      enter_hold(input, "lcp_hold", "car_status_timeout", "target_lock_following");
+    } else if (target_lock_follow_elapsed(input.now) >= mission_.target_lock_follow_seconds) {
+      target_lock_follow_completed_ = true;
+      if (latest_car_status_ && car_status_fresh(input.now) &&
+        latest_car_status_->distance_m < mission_.throw_distance_m) {
+        pending_release_gripper_ = true;
+        transition("throwing", input.now);
+      } else {
+        transition("waiting_target", input.now);
+      }
     }
   } else if (phase_ == "throwing") {
     if (input.gripper_failed) {
@@ -195,14 +234,16 @@ NavigationDecision Navigation::update(const NavigationInput & input)
   }
   if (phase_ == "offboard_request_pending" || phase_ == "arming_request_pending" ||
     phase_ == "climb" || phase_ == "height_stabilizing" || phase_ == "transit_to_b" ||
-    phase_ == "waiting_target" || phase_ == "throwing" || phase_ == "returning" ||
+    phase_ == "waiting_target" || phase_ == "target_lock_following" ||
+    phase_ == "throwing" || phase_ == "returning" ||
     phase_ == "lcp_hold" || phase_ == "downing") {
     decision.target_mode = "OFFBOARD";
   }
   if (phase_ == "landing" && !landing_reason_.empty()) {decision.target_mode = "AUTO.LAND";}
   if (phase_ == "arming_request_pending" || phase_ == "climb" ||
     phase_ == "height_stabilizing" || phase_ == "transit_to_b" ||
-    phase_ == "waiting_target" || phase_ == "throwing" || phase_ == "returning" ||
+    phase_ == "waiting_target" || phase_ == "target_lock_following" ||
+    phase_ == "throwing" || phase_ == "returning" ||
     phase_ == "lcp_hold" || phase_ == "downing" || phase_ == "landing") {
     decision.arm_intent = true;
   }

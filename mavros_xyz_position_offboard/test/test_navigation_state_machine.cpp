@@ -288,7 +288,7 @@ TEST(NavigationV3Test, SingleCarStatusDirectlyTargetsVehicleCenterWithYawConvers
 
   const double expected_x = input.telemetry.local_x_m + distance * std::cos(yaw + bearing);
   const double expected_y = input.telemetry.local_y_m + distance * std::sin(yaw + bearing);
-  EXPECT_EQ(decision.phase, "waiting_target");
+  EXPECT_EQ(decision.phase, "target_lock_following");
   EXPECT_FALSE(decision.release_gripper);
   EXPECT_NEAR(navigation.planner().target_x_m(), expected_x, 1e-9);
   EXPECT_NEAR(navigation.planner().target_y_m(), expected_y, 1e-9);
@@ -348,7 +348,7 @@ TEST(NavigationV3Test, CarStatusUsesMissionLimitsWhileBUsesGlobalXyLimits)
   input.now = now;
   input.events = {car_status_event(distance, bearing, now)};
   const auto decision = navigation.update(input);
-  EXPECT_EQ(decision.phase, "waiting_target");
+  EXPECT_EQ(decision.phase, "target_lock_following");
   EXPECT_NEAR(
     navigation.planner().xy_trajectory_duration_s(), expected_tracking.xy_trajectory_duration_s(),
     1e-12);
@@ -361,6 +361,7 @@ TEST(NavigationV3Test, SuccessfulThrowReturnsAndCompletesLandingWithoutAGcsRetur
   auto safety = intercept_safety();
   MissionConfig mission;
   mission.height_stable_seconds = 0.05;
+  mission.target_lock_follow_seconds = 0.04;
   mission.return_max_speed_m_s = 0.35;
   mission.return_max_accel_m_s2 = 0.65;
   Navigation navigation(safety, mission);
@@ -370,7 +371,13 @@ TEST(NavigationV3Test, SuccessfulThrowReturnsAndCompletesLandingWithoutAGcsRetur
   advance_to_b(navigation, input, now);
 
   input.now = now;
-  input.events = {car_status_event(0.15, 0.0, now)};
+  input.events = {car_status_event(0.0, 0.0, now)};
+  const auto locked_decision = navigation.update(input);
+  EXPECT_EQ(locked_decision.phase, "target_lock_following");
+  EXPECT_FALSE(locked_decision.release_gripper);
+  now += input.dt;
+  input.now = now;
+  input.events.clear();
   const auto throw_decision = navigation.update(input);
   EXPECT_EQ(throw_decision.phase, "throwing");
   EXPECT_TRUE(throw_decision.release_gripper);
@@ -471,7 +478,7 @@ TEST(NavigationV3Test, NewCarStatusImmediatelyUpdatesRawVehicleCenterTarget)
   const auto first = navigation.update(input);
   const double first_x = uav_x + first_distance * std::cos(yaw + first_bearing);
   const double first_y = uav_y + first_distance * std::sin(yaw + first_bearing);
-  EXPECT_EQ(first.phase, "waiting_target");
+  EXPECT_EQ(first.phase, "target_lock_following");
   EXPECT_NEAR(navigation.planner().target_x_m(), first_x, 1e-9);
   EXPECT_NEAR(navigation.planner().target_y_m(), first_y, 1e-9);
 
@@ -483,7 +490,7 @@ TEST(NavigationV3Test, NewCarStatusImmediatelyUpdatesRawVehicleCenterTarget)
   const auto second = navigation.update(input);
   const double second_x = uav_x + second_distance * std::cos(yaw + second_bearing);
   const double second_y = uav_y + second_distance * std::sin(yaw + second_bearing);
-  EXPECT_EQ(second.phase, "waiting_target");
+  EXPECT_EQ(second.phase, "target_lock_following");
   EXPECT_TRUE(second.rejections.empty());
   EXPECT_NEAR(navigation.planner().target_x_m(), second_x, 1e-9);
   EXPECT_NEAR(navigation.planner().target_y_m(), second_y, 1e-9);
@@ -491,11 +498,12 @@ TEST(NavigationV3Test, NewCarStatusImmediatelyUpdatesRawVehicleCenterTarget)
   EXPECT_FALSE(second.control.predicted_intercept_seconds);
 }
 
-TEST(NavigationV3Test, RawDistanceBelowThrowThresholdImmediatelyReleases)
+TEST(NavigationV3Test, RawDistanceBelowThrowThresholdWaitsForTargetLock)
 {
   auto safety = intercept_safety();
   MissionConfig mission;
   mission.height_stable_seconds = 0.05;
+  mission.target_lock_follow_seconds = 0.09;
   Navigation navigation(safety, mission);
   auto input = base_input(0.0);
   input.dt = 0.05;
@@ -504,6 +512,19 @@ TEST(NavigationV3Test, RawDistanceBelowThrowThresholdImmediatelyReleases)
 
   input.now = now;
   input.events = {car_status_event(mission.throw_distance_m - 0.01, 0.0, now)};
+  const auto locked = navigation.update(input);
+  EXPECT_EQ(locked.phase, "target_lock_following");
+  EXPECT_FALSE(locked.release_gripper);
+
+  now += input.dt;
+  input.now = now;
+  input.events.clear();
+  const auto still_locked = navigation.update(input);
+  EXPECT_EQ(still_locked.phase, "target_lock_following");
+  EXPECT_FALSE(still_locked.release_gripper);
+
+  now += input.dt;
+  input.now = now;
   const auto decision = navigation.update(input);
   EXPECT_EQ(decision.phase, "throwing");
   EXPECT_TRUE(decision.release_gripper);
@@ -514,6 +535,7 @@ TEST(NavigationV3Test, LcpFailureCancelsSameCycleRawReleaseAndEntersHold)
   auto safety = intercept_safety();
   MissionConfig mission;
   mission.height_stable_seconds = 0.05;
+  mission.target_lock_follow_seconds = 0.04;
   Navigation navigation(safety, mission);
   auto input = base_input(0.0);
   input.dt = 0.05;
@@ -535,6 +557,7 @@ TEST(NavigationV3Test, ThrowDistanceBoundaryDoesNotRelease)
   auto safety = intercept_safety();
   MissionConfig mission;
   mission.height_stable_seconds = 0.05;
+  mission.target_lock_follow_seconds = 0.04;
   Navigation navigation(safety, mission);
   auto input = base_input(0.0);
   input.dt = 0.05;
@@ -543,11 +566,24 @@ TEST(NavigationV3Test, ThrowDistanceBoundaryDoesNotRelease)
 
   input.now = now;
   input.events = {car_status_event(mission.throw_distance_m, 1.2, now)};
+  const auto locked = navigation.update(input);
+  EXPECT_EQ(locked.phase, "target_lock_following");
+  EXPECT_FALSE(locked.release_gripper);
+  now += input.dt;
+  input.now = now;
+  input.events.clear();
   const auto decision = navigation.update(input);
   EXPECT_EQ(decision.phase, "waiting_target");
   EXPECT_FALSE(decision.release_gripper);
   EXPECT_EQ(decision.control.target_samples, 0);
   EXPECT_FALSE(decision.control.predicted_intercept_seconds);
+
+  now += input.dt;
+  input.now = now;
+  input.events = {car_status_event(mission.throw_distance_m - 0.01, 1.2, now)};
+  const auto normal_tracking_release = navigation.update(input);
+  EXPECT_EQ(normal_tracking_release.phase, "throwing");
+  EXPECT_TRUE(normal_tracking_release.release_gripper);
 }
 
 TEST(NavigationV3Test, TrackingRadiusViolationStillEntersLcpHold)
@@ -585,7 +621,7 @@ TEST(NavigationV3Test, CarStatusTimeoutStillEntersLcpHold)
   input.now = now;
   input.events = {car_status_event(1.0, 0.0, now)};
   const auto observed = navigation.update(input);
-  EXPECT_EQ(observed.phase, "waiting_target");
+  EXPECT_EQ(observed.phase, "target_lock_following");
   now += mission.car_status_timeout_s + input.dt;
   input.now = now;
   input.events.clear();
@@ -593,6 +629,98 @@ TEST(NavigationV3Test, CarStatusTimeoutStillEntersLcpHold)
   EXPECT_EQ(timed_out.phase, "lcp_hold");
   EXPECT_TRUE(timed_out.control.mission_paused);
   EXPECT_EQ(timed_out.control.hold_reason, "car_status_timeout");
+}
+
+TEST(NavigationV3Test, TargetLockLcpHoldPausesAndResumesRemainingTime)
+{
+  auto safety = intercept_safety();
+  MissionConfig mission;
+  mission.height_stable_seconds = 0.05;
+  mission.target_lock_follow_seconds = 1.0;
+  Navigation navigation(safety, mission);
+  auto input = base_input(0.0);
+  input.dt = 0.10;
+  double now = 0.0;
+  advance_to_b(navigation, input, now);
+
+  input.now = now;
+  input.events = {car_status_event(1.0, 0.0, now)};
+  ASSERT_EQ(navigation.update(input).phase, "target_lock_following");
+
+  now += 0.4;
+  input.now = now;
+  input.lcp_healthy = false;
+  input.events.clear();
+  const auto held = navigation.update(input);
+  EXPECT_EQ(held.phase, "lcp_hold");
+  EXPECT_FALSE(held.release_gripper);
+
+  now += 1.0;
+  input.now = now;
+  input.lcp_healthy = true;
+  const auto resumed = navigation.update(input);
+  EXPECT_EQ(resumed.phase, "target_lock_following");
+  EXPECT_FALSE(resumed.release_gripper);
+
+  now += 0.4;
+  input.now = now;
+  input.events = {car_status_event(1.0, 0.0, now)};
+  const auto active = navigation.update(input);
+  EXPECT_EQ(active.phase, "target_lock_following");
+  EXPECT_FALSE(active.release_gripper);
+
+  now += 0.2;
+  input.now = now;
+  input.events.clear();
+  const auto completed = navigation.update(input);
+  EXPECT_EQ(completed.phase, "waiting_target");
+  EXPECT_FALSE(completed.release_gripper);
+}
+
+TEST(NavigationV3Test, TargetLockTimeoutPausesAtObservationTimeoutAndResumesRemainingTime)
+{
+  auto safety = intercept_safety();
+  MissionConfig mission;
+  mission.height_stable_seconds = 0.05;
+  mission.target_lock_follow_seconds = 3.0;
+  Navigation navigation(safety, mission);
+  auto input = base_input(0.0);
+  input.dt = 0.10;
+  double now = 0.0;
+  advance_to_b(navigation, input, now);
+
+  input.now = now;
+  input.events = {car_status_event(1.0, 0.0, now)};
+  ASSERT_EQ(navigation.update(input).phase, "target_lock_following");
+
+  now += 0.4;
+  input.now = now;
+  input.events = {car_status_event(1.0, 0.0, now)};
+  ASSERT_EQ(navigation.update(input).phase, "target_lock_following");
+
+  now += mission.car_status_timeout_s + 0.1;
+  input.now = now;
+  input.events.clear();
+  const auto timed_out = navigation.update(input);
+  EXPECT_EQ(timed_out.phase, "lcp_hold");
+  EXPECT_FALSE(timed_out.release_gripper);
+
+  input.events = {car_status_event(1.0, 0.0, now)};
+  const auto resumed = navigation.update(input);
+  EXPECT_EQ(resumed.phase, "target_lock_following");
+  EXPECT_FALSE(resumed.release_gripper);
+
+  now += 0.5;
+  input.now = now;
+  input.events = {car_status_event(1.0, 0.0, now)};
+  EXPECT_EQ(navigation.update(input).phase, "target_lock_following");
+
+  now += 0.1;
+  input.now = now;
+  input.events.clear();
+  const auto completed = navigation.update(input);
+  EXPECT_EQ(completed.phase, "waiting_target");
+  EXPECT_FALSE(completed.release_gripper);
 }
 
 }  // namespace

@@ -22,6 +22,8 @@ struct MissionConfig
   double return_max_speed_m_s{10.0};
   /// 返航原点轨迹的二维合加速度上限，单位：米/秒²。
   double return_max_accel_m_s2{5.0};
+  /// 首条有效 car_status 后锁定动态目标并跟随的时长，单位：秒。
+  double target_lock_follow_seconds{10.0};
   double throw_distance_m{0.20};
   double throw_bearing_rad{1.57079632679};
   double throw_bearing_tolerance_rad{0.08};

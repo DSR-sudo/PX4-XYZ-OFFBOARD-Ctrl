@@ -32,6 +32,10 @@ TEST(MissionConfigTest, RejectsInvalidIndependentXyLimits)
     MissionConfig invalid_return_accel;
     invalid_return_accel.return_max_accel_m_s2 = value;
     EXPECT_THROW(invalid_return_accel.validate(), std::invalid_argument);
+
+    MissionConfig invalid_target_lock;
+    invalid_target_lock.target_lock_follow_seconds = value;
+    EXPECT_THROW(invalid_target_lock.validate(), std::invalid_argument);
   }
 }
 

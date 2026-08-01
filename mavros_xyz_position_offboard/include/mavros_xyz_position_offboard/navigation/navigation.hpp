@@ -74,6 +74,14 @@ private:
   void begin_transit_to_b();
   /// 将车体相对视觉测量转换为 ENU，并把车辆中心作为当前 XY 目标。
   bool apply_car_status(const NavigationInput & input, const communication::CarStatus & status);
+  /// 开始锁定同一 car_status 数据流并清零可暂停的跟随计时。
+  void begin_target_lock_follow(double now);
+  /// 暂停锁定跟随的有效计时，用于 LCP/视觉安全保持。
+  void pause_target_lock_follow(double now);
+  /// 从安全保持恢复锁定跟随计时。
+  void resume_target_lock_follow(double now);
+  /// 返回截至当前时刻已经消耗的有效锁定跟随时长。
+  double target_lock_follow_elapsed(double now) const;
   /// 判断最近一次有效视觉测量在当前控制周期仍然新鲜。
   bool car_status_fresh(double now) const;
   /// 取消投掷计时并开始从当前高度返回锁存原点。
@@ -94,6 +102,10 @@ private:
   std::string landing_reason_{};
   bool pending_release_gripper_{false};
   std::optional<double> last_car_status_at_{};
+  std::optional<communication::CarStatus> latest_car_status_{};
+  double target_lock_follow_elapsed_s_{0.0};
+  std::optional<double> target_lock_follow_started_at_{};
+  bool target_lock_follow_completed_{false};
 };
 
 }  // namespace mavros_xyz_position_offboard::navigation

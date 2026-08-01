@@ -37,7 +37,8 @@ Mission order:
 ```text
 waiting_preflight -> ground-hold warmup -> ok_wait -> waiting_run_plan1
 -> run_plan1 -> OFFBOARD/ARM -> latch origin and climb 1.5 m -> height_stabilizing (3 s)
--> transit_to_b -> ok_b -> waiting_target (vehicle-center tracking) -> throwing
+-> transit_to_b -> ok_b -> waiting_target -> target_lock_following (10 s dynamic follow)
+-> waiting_target/throwing
 -> PWM release -> ok_throw -> returning -> Init XY + yaw 0 -> ok_return
 -> downing -> ok_downing -> descend Init Z -> Disarm -> MANUAL -> ok_down
 ```
@@ -65,18 +66,21 @@ measurements after acknowledging `ok_b`:
 `distance_m` is in `[0, udp.max_tracking_distance_m]` (default `5.0`) and `bearing_rad` is in
 `[-pi, pi]`; it is the target line-of-sight angle relative to the UAV body: zero means straight
 ahead, `+pi/2` is the UAV's left, and `+/-pi` is directly behind.
-Every accepted `car_status` is converted with the current measured yaw and immediately becomes the
-vehicle-center XY target. The mission altitude and ARM-time yaw are preserved, and each new
-observation replans the XY target in place with the two-dimensional resultant limits
+The first accepted `car_status` starts `target_lock_following` for
+`mission.target_lock_follow_seconds` (default `10.0 s`). During this one-time phase every accepted
+observation is converted with the current measured yaw and becomes the dynamic vehicle-center XY
+target, but the raw distance gate cannot release the gripper. The mission altitude and ARM-time yaw
+are preserved, and each new observation replans the XY target in place with the two-dimensional resultant limits
 `mission.car_tracking_max_speed_m_s` (default `10.0 m/s`) and
 `mission.car_tracking_max_accel_m_s2` (default `5.0 m/s2`). If either parameter is omitted, its
 effective `safety.target_xy_*` value is inherited. Return uses the independent
 `mission.return_max_speed_m_s` (default `10.0 m/s`) and
 `mission.return_max_accel_m_s2` (default `5.0 m/s2`) limits, inheriting the effective
 `safety.target_xy_*` values when omitted; the example YAML sets them to `1.0/0.5`. B-point and
-landing trajectories keep using the global `safety.target_xy_*` limits. When the latest fresh raw `distance_m <
-mission.throw_distance_m` (default `0.20 m`), the UAV immediately enters `throwing`; equality does
-not release. `throw_bearing_rad` and `throw_bearing_tolerance_rad` remain accepted compatibility
+landing trajectories keep using the global `safety.target_xy_*` limits. After the lock-follow timer
+completes, the latest fresh raw `distance_m < mission.throw_distance_m` (default `0.20 m`)
+immediately enters `throwing`; equality does not release. Subsequent car_status messages use the
+normal live distance gate. `throw_bearing_rad` and `throw_bearing_tolerance_rad` remain accepted compatibility
 parameters but do not participate in target planning or release.
 
 UAV discrete events are `ok_wait`, `ok_b`, `ok_throw`, `ok_return`, `ok_downing`, and `ok_down`.
@@ -192,7 +196,8 @@ The deployed YAML enables the calibrated SG90 setup: BCM GPIO18 (physical pin 12
 closed, 7% open, and a 500 ms open hold. Before flight, verify this on a no-prop bench with the
 signal wire connected to GPIO18 and ensure the launch user can access the RP1 gpiochip through the
 `dialout` group. If RP1 discovery, GPIO claim, or initial 4% PWM setup fails, node startup fails.
-At the raw 0.20 m vehicle-center gate, this mission opens the gripper. Successful completion of
+After the one-time target lock-follow phase, the raw 0.20 m vehicle-center gate opens the gripper.
+Successful completion of
 its configured open/close cycle emits `ok_throw` and immediately begins autonomous return.
 
 Install the C++ GPIO dependency on deployment images with `sudo apt install liblgpio-dev`.

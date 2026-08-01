@@ -614,6 +614,7 @@ TEST(ApplicationNodeSafetyParameterTest, YamlParametersOverrideCliDefaultsAtStar
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.car_tracking_max_accel_m_s2").as_double(), 0.5);
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.return_max_speed_m_s").as_double(), 1.0);
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.return_max_accel_m_s2").as_double(), 0.5);
+  EXPECT_DOUBLE_EQ(node->get_parameter("mission.target_lock_follow_seconds").as_double(), 10.0);
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.throw_distance_m").as_double(), 0.2);
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.throw_bearing_rad").as_double(), 1.57079632679);
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.throw_bearing_tolerance_rad").as_double(), 0.08);
@@ -646,7 +647,7 @@ TEST(ApplicationNodeMissionParameterTest, CarTrackingLimitsInheritEffectiveSafet
   EXPECT_DOUBLE_EQ(node->get_parameter("mission.return_max_accel_m_s2").as_double(), 1.30);
 }
 
-TEST(ApplicationNodeMissionParameterTest, InvalidReturnLimitsAreRejectedAtStartup)
+TEST(ApplicationNodeMissionParameterTest, InvalidMissionTimingAndReturnLimitsAreRejectedAtStartup)
 {
   for (const double value : {
       0.0, -1.0, std::numeric_limits<double>::quiet_NaN(),
@@ -660,6 +661,12 @@ TEST(ApplicationNodeMissionParameterTest, InvalidReturnLimitsAreRejectedAtStartu
       std::make_shared<ApplicationNode>(
         application_test_options(), SafetyConfig{}, application_test_node_options({
           rclcpp::Parameter("mission.return_max_accel_m_s2", value)})),
+      std::invalid_argument);
+
+    EXPECT_THROW(
+      std::make_shared<ApplicationNode>(
+        application_test_options(), SafetyConfig{}, application_test_node_options({
+          rclcpp::Parameter("mission.target_lock_follow_seconds", value)})),
       std::invalid_argument);
   }
 }

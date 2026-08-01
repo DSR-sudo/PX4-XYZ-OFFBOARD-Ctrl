@@ -22,7 +22,7 @@ machine-readable reason `legacy_header_rejected`.
 | Direction | Header | Data | Allowed UAV phase | Rule |
 | --- | --- | --- | --- | --- |
 | GCS -> UAV | `run_plan1` | `{}` | `waiting_run_plan1` | Starts the normal OFFBOARD/ARM/climb sequence. Repeated packets in later startup phases are idempotent. |
-| GCS -> UAV | `car_status` | `{"distance_m": number, "bearing_rad": number}` | `waiting_target` or recoverable `lcp_hold` | `distance_m` is metres and `bearing_rad` is the target line-of-sight angle relative to measured UAV yaw: zero forward, `+pi/2` left, and `+/-pi` rear. GCS sends no timestamp; UAV receipt time is the measurement time. |
+| GCS -> UAV | `car_status` | `{"distance_m": number, "bearing_rad": number}` | `waiting_target`, `target_lock_following`, or recoverable `lcp_hold` | `distance_m` is metres and `bearing_rad` is the target line-of-sight angle relative to measured UAV yaw: zero forward, `+pi/2` left, and `+/-pi` rear. GCS sends no timestamp; UAV receipt time is the measurement time. |
 | GCS -> UAV | `ack` | `{}` | Any phase | Confirms exactly the earliest queued UAV `ok_*` event. An ACK with no queued event is harmless. |
 | UAV -> GCS | `ok_wait` | `{}` | after preflight and setpoint warmup | GCS may send `run_plan1` after receiving it. |
 | UAV -> GCS | `ok_b` | `{}` | `waiting_target` | Sent once only after the two-dimensional B trajectory is complete, measured XYZ is within tolerance, and measured horizontal/vertical speeds are below `mission.b_arrival_speed_m_s`. GCS starts graphic recognition and continuous `car_status` after receiving it. |
@@ -40,7 +40,9 @@ car_x = uav_x + distance_m * cos(uav_measured_yaw + bearing_rad)
 car_y = uav_y + distance_m * sin(uav_measured_yaw + bearing_rad)
 ```
 
-Every accepted observation writes `car_x/car_y` to `mission_goal` and calls
+The first accepted observation after `ok_b` starts the one-time `target_lock_following` phase for
+`mission.target_lock_follow_seconds` (default `10.0 s`). Every accepted observation during that
+phase writes `car_x/car_y` to `mission_goal` and calls
 `planner.set_xy_target_with_limits(car_x, car_y, mission.car_tracking_max_speed_m_s,
 mission.car_tracking_max_accel_m_s2)`. These are independent two-dimensional resultant limits;
 when the mission parameters are omitted, they inherit the effective `safety.target_xy_*` values.
@@ -48,10 +50,12 @@ The task altitude and ARM-time yaw are preserved, and a new observation immediat
 previous XY target. B-point and landing trajectories continue to use the global safety limits.
 Return instead uses `mission.return_max_speed_m_s` and `mission.return_max_accel_m_s2`;
 when omitted, each inherits the effective `safety.target_xy_*` value. It still targets the ARM-time
-Init XY at the current altitude and commands world yaw zero. `bearing_rad` is used only for this ENU conversion. When the latest valid and fresh raw `distance_m < mission.throw_distance_m` (default
-`0.20 m`), the UAV enters `throwing` and requests the gripper in the same control cycle. The strict
-comparison means `distance_m == 0.20 m` does not release. The JSON fields and UDP envelope are
-unchanged.
+Init XY at the current altitude and commands world yaw zero. `bearing_rad` is used only for this ENU conversion.
+The lock phase follows dynamic observations but never releases the gripper. When its active timer
+completes, the latest valid and fresh raw `distance_m < mission.throw_distance_m` (default `0.20 m`)
+enters `throwing` and requests the gripper in the same control cycle. The strict comparison means
+`distance_m == 0.20 m` does not release. LCP/observation safety holds pause the lock timer and
+resume it with the remaining time. The JSON fields and UDP envelope are unchanged.
 
 ## ACK And Idempotency
 
@@ -66,7 +70,8 @@ therefore expected and must be ACKed again; GCS treats each header as idempotent
 `car_status` is a fresh observation rather than a command and may be sent at a fixed rate. An
 observation outside the configured Init tracking radius or a stale stream enters the existing
 `lcp_hold`. In-radius jumps are accepted as raw targets; Navigation does not apply Kalman innovation
-rejection or predicted-intercept timing.
+rejection or predicted-intercept timing. The continuous stream must remain fresh during
+`target_lock_following`; after that one-time phase, normal live distance gating resumes.
 
 ## Flight Sequence
 
@@ -75,9 +80,9 @@ UAV: preflight + Init hold -> ok_wait
 GCS:                                ack, run_plan1
 UAV: OFFBOARD + ARM + climb -> height_stabilizing (continuous 3 s)
 UAV: transit_to_b
-UAV: at B within tolerance -> ok_b -> waiting_target
+UAV: at B within tolerance -> ok_b -> waiting_target -> target_lock_following (10 s)
 GCS:                         ack, begin recognition and continuous car_status
-UAV: raw vehicle-center tracking -> throwing
+UAV: dynamic lock follow -> normal vehicle-center tracking -> throwing
 UAV: servo success -> ok_throw -> returning (without a GCS command)
 GCS:                   ack
 UAV: Init XY + yaw 0 -> ok_return -> downing -> ok_downing

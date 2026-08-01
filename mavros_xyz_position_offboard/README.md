@@ -35,8 +35,8 @@ Initialization -- health/Z ----------+
 Mission order:
 
 ```text
-waiting_preflight -> ground-hold warmup -> ok_wait -> waiting_run_plan1
--> run_plan1 -> OFFBOARD/ARM -> latch origin and climb 1.5 m -> height_stabilizing (3 s)
+waiting_preflight -> ground-hold warmup -> ok_wait -> waiting_run_plan1/OFFBOARD hold
+-> run_plan1 -> ARM -> latch origin and climb 1.5 m -> height_stabilizing (3 s)
 -> transit_to_b -> ok_b -> waiting_target -> target_lock_following (10 s dynamic follow)
 -> waiting_target/throwing
 -> PWM release -> ok_throw -> returning -> Init XY + yaw 0 -> ok_return
@@ -117,7 +117,8 @@ wire protocol and idempotency rules.
 
 `xyzstatus` copies the raw LCP header and every geometry field from `/lcp/debug`. During preflight
 warmup and GCS wait, the node streams fresh measured ground-hold setpoints without creating a
-flight origin. Only ARM confirmation in OFFBOARD locks the MAVROS local pose as `Init` and starts
+flight origin. After `ok_wait`, the GCS wait also requests OFFBOARD while remaining disarmed;
+`run_plan1` enables ARM only after OFFBOARD is confirmed. Only ARM confirmation in OFFBOARD locks the MAVROS local pose as `Init` and starts
 the local-Z/range baseline. Default Z is the fresh local-pose difference from that baseline. A
 fresh valid down range is baselined at the same point and checks relative Z consistency
 (`z.range_cross_check_max_delta_m`, default `0.30 m`); set

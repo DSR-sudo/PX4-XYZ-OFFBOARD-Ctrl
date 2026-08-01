@@ -137,6 +137,86 @@ void advance_to_b(Navigation & navigation, NavigationInput & input, double & now
   ASSERT_EQ(navigation.phase(), "waiting_target");
 }
 
+NavigationDecision enter_waiting_run_plan1(Navigation & navigation, NavigationInput & input)
+{
+  input.now = 0.0;
+  input.events.clear();
+  navigation.update(input);
+  input.now = input.dt;
+  input.events.clear();
+  return navigation.update(input);
+}
+
+TEST(NavigationV3Test, RequestsOffboardWhileWaitingForRunPlan1WithoutArming)
+{
+  auto safety = intercept_safety();
+  Navigation navigation(safety);
+  auto input = base_input(0.0);
+
+  const auto decision = enter_waiting_run_plan1(navigation, input);
+
+  EXPECT_EQ(decision.phase, "waiting_run_plan1");
+  ASSERT_TRUE(decision.setpoint.has_value());
+  ASSERT_TRUE(decision.target_mode.has_value());
+  EXPECT_EQ(*decision.target_mode, "OFFBOARD");
+  EXPECT_FALSE(decision.arm_intent.has_value());
+  EXPECT_TRUE(has_message(decision, MessageType::ok_wait));
+}
+
+TEST(NavigationV3Test, ArmsImmediatelyAfterRunPlan1WhenOffboardAlreadyConfirmed)
+{
+  auto safety = intercept_safety();
+  Navigation navigation(safety);
+  auto input = base_input(0.0);
+  enter_waiting_run_plan1(navigation, input);
+
+  input.now += input.dt;
+  input.controller.mode = "OFFBOARD";
+  input.events = {event(MessageType::run_plan1, input.now)};
+  const auto decision = navigation.update(input);
+
+  EXPECT_EQ(decision.phase, "arming_request_pending");
+  ASSERT_TRUE(decision.target_mode.has_value());
+  EXPECT_EQ(*decision.target_mode, "OFFBOARD");
+  ASSERT_TRUE(decision.arm_intent.has_value());
+  EXPECT_TRUE(*decision.arm_intent);
+}
+
+TEST(NavigationV3Test, RunPlan1DoesNotArmUntilOffboardIsConfirmed)
+{
+  auto safety = intercept_safety();
+  Navigation navigation(safety);
+  auto input = base_input(0.0);
+  enter_waiting_run_plan1(navigation, input);
+
+  input.now += input.dt;
+  input.events = {event(MessageType::run_plan1, input.now)};
+  const auto decision = navigation.update(input);
+
+  EXPECT_EQ(decision.phase, "offboard_request_pending");
+  ASSERT_TRUE(decision.target_mode.has_value());
+  EXPECT_EQ(*decision.target_mode, "OFFBOARD");
+  EXPECT_FALSE(decision.arm_intent.has_value());
+}
+
+TEST(NavigationV3Test, PreflightLossInGcsWaitKeepsExistingResetBehavior)
+{
+  auto safety = intercept_safety();
+  Navigation navigation(safety);
+  auto input = base_input(0.0);
+  enter_waiting_run_plan1(navigation, input);
+
+  input.now += input.dt;
+  input.preflight_ready = false;
+  input.events.clear();
+  const auto decision = navigation.update(input);
+
+  EXPECT_EQ(decision.phase, "waiting_preflight");
+  EXPECT_FALSE(decision.setpoint.has_value());
+  EXPECT_FALSE(decision.target_mode.has_value());
+  EXPECT_FALSE(decision.arm_intent.has_value());
+}
+
 TEST(NavigationTypesTest, EncodesControlJsonWithoutStateMachineDependency)
 {
   ControlState control;

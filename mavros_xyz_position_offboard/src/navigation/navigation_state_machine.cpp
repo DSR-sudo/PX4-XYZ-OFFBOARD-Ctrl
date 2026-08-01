@@ -227,7 +227,8 @@ NavigationDecision Navigation::update(const NavigationInput & input)
     decision.setpoint = planner_.update(input.dt);
     control_.commanded_setpoint = decision.setpoint;
   }
-  if (phase_ == "offboard_request_pending" || phase_ == "arming_request_pending" ||
+  if (phase_ == "waiting_run_plan1" || phase_ == "offboard_request_pending" ||
+    phase_ == "arming_request_pending" ||
     phase_ == "climb" || phase_ == "height_stabilizing" || phase_ == "transit_to_b" ||
     phase_ == "waiting_target" || phase_ == "target_lock_following" ||
     phase_ == "throwing" || phase_ == "returning" ||

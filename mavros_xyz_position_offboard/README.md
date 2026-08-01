@@ -97,9 +97,8 @@ xB = mission.b_right_m   # default 0.375 m; historical parameter name, ENU X
 yB = mission.b_forward_m # default 2.375 m; historical parameter name, ENU Y
 ```
 
-The XY move is one two-dimensional trajectory. `ok_b` is emitted once only after that trajectory
-is complete, measured XYZ is within `mission.target_tolerance_m`, and measured horizontal and
-vertical speeds are both no greater than `mission.b_arrival_speed_m_s` (default `0.05 m/s`). Every
+The XY move is one two-dimensional trajectory. `ok_b` is emitted once when that planned trajectory
+is complete; B does not add a measured XYZ or velocity settling gate. Every
 accepted `car_status` uses the UAV receipt time and measured yaw to form the raw ENU vehicle-center
 target. A large in-radius jump is accepted and replans immediately; the active Navigation path does
 not use Kalman samples, innovation rejection, cardinal shaping, or predicted intercept timing.

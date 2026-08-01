@@ -30,18 +30,6 @@ bool Navigation::stable_at(
          std::abs(telemetry.local_z_m - target.z_m) <= config_.target_tolerance_m;
 }
 
-bool Navigation::b_arrival_stable(
-  const common::Telemetry & telemetry, const common::PositionSetpoint & target) const
-{
-  return stable_at(telemetry, target) &&
-         common::finite(telemetry.velocity_x_m_s) &&
-         common::finite(telemetry.velocity_y_m_s) &&
-         common::finite(telemetry.velocity_z_m_s) &&
-         std::hypot(telemetry.velocity_x_m_s, telemetry.velocity_y_m_s) <=
-         mission_.b_arrival_speed_m_s &&
-         std::abs(telemetry.velocity_z_m_s) <= mission_.b_arrival_speed_m_s;
-}
-
 bool Navigation::actual_yaw_within(
   const common::Telemetry & telemetry, double yaw_rad, double tolerance_rad) const
 {

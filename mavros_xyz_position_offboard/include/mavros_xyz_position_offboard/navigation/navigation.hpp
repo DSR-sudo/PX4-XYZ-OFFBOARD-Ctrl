@@ -64,9 +64,6 @@ private:
   /// 判断实测 XYZ 是否位于稳定阶段要求的位置容差内。
   bool stable_at(
     const common::Telemetry & telemetry, const common::PositionSetpoint & target) const;
-  /// 判断 B 点实测 XYZ 位置和水平/垂直速度是否都满足到达门限。
-  bool b_arrival_stable(
-    const common::Telemetry & telemetry, const common::PositionSetpoint & target) const;
   /// 判断实测偏航角是否已接近目标世界航向。
   bool actual_yaw_within(
     const common::Telemetry & telemetry, double yaw_rad, double tolerance_rad) const;

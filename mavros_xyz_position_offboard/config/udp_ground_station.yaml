@@ -127,15 +127,15 @@ mavros_native_xyz_position:
       # B 点固定本地 ENU X 坐标，保留 b_right_m 参数名以兼容启动配置，单位：米。
       b_right_m: 0.375
       # B 点固定本地 ENU Y 坐标，保留 b_forward_m 参数名以兼容启动配置，单位：米。
-      b_forward_m: 1.8
-      # B 点到达判定的水平合速度和垂直速度上限，单位：米/秒。
+      b_forward_m: 2.0
+      # 兼容旧配置；B 点轨迹完成后不再使用此到达速度门限。
       b_arrival_speed_m_s: 0.1
       # car_status 车辆中心 XY 轨迹允许的最大合速度，单位：米/秒。
       car_tracking_max_speed_m_s: 0.5
       # car_status 车辆中心 XY 轨迹允许的最大合加速度，单位：米/秒²。
-      car_tracking_max_accel_m_s2: 0.3
+      car_tracking_max_accel_m_s2: 0.2
       # 返航原点 XY 轨迹允许的最大合速度，单位：米/秒。
-      return_max_speed_m_s: 0.5
+      return_max_speed_m_s: 0.3
       # 返航原点 XY 轨迹允许的最大合加速度，单位：米/秒²。
       return_max_accel_m_s2: 0.3
       # 首条有效 car_status 后持续动态跟随锁定目标的时长，单位：秒。

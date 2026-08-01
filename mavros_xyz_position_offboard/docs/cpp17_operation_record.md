@@ -37,7 +37,7 @@ writes audit status. Every `/lcp/debug` sample is separately sent as one unqueue
 | `mission.height_stable_seconds` | `3.0` | Required continuous XYZ stability before B-point transit. |
 | `mission.b_right_m` | `0.375` | Fixed local ENU X coordinate of B; historical parameter name retained for compatibility. |
 | `mission.b_forward_m` | `2.375` | Fixed local ENU Y coordinate of B; historical parameter name retained for compatibility. |
-| `mission.b_arrival_speed_m_s` | `0.05` | Maximum measured horizontal resultant speed and vertical speed for B arrival. |
+| `mission.b_arrival_speed_m_s` | `0.05` | Retained compatibility parameter; no longer used for B state transition. |
 | `mission.car_tracking_max_speed_m_s` | `10.0` | Maximum resultant XY speed for `car_status` vehicle-center tracking; inherits `safety.target_xy_max_speed_m_s` when omitted. |
 | `mission.car_tracking_max_accel_m_s2` | `5.0` | Maximum resultant XY acceleration for `car_status` vehicle-center tracking; inherits `safety.target_xy_max_accel_m_s2` when omitted. |
 | `mission.return_max_speed_m_s` | `10.0` | Maximum resultant XY speed for return to the ARM-time origin; inherits `safety.target_xy_max_speed_m_s` when omitted. |
@@ -83,8 +83,8 @@ yB = mission.b_forward_m
 ```
 
 The single `set_target()` call plans the two-dimensional XY move and Z move together; the move is
-not split into forward and right legs. Only trajectory completion, measured B XYZ tolerance, and
-horizontal/vertical measured speeds no greater than `mission.b_arrival_speed_m_s` emit `ok_b`. A stale visual sample or target
+not split into forward and right legs. `ok_b` is emitted as soon as the planned B trajectory is
+complete; no additional measured B-position or velocity gate is applied. A stale visual sample or target
 outside the Init-radius bound clears the active target and freezes the safe hold point; in-radius
 target jumps are accepted directly. Successful PWM release queues `ok_throw` and begins return
 without a GCS command. `ok_return` is emitted only at Init XY and yaw zero; `ok_downing` starts

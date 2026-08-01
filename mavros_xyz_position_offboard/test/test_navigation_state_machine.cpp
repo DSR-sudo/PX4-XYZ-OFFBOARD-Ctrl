@@ -223,7 +223,7 @@ TEST(NavigationV3Test, UsesFixedLocalEnuBPointForDifferentInitialYaws)
   }
 }
 
-TEST(NavigationV3Test, RequiresMeasuredBPointVelocityBeforeSendingOkB)
+TEST(NavigationV3Test, SendsOkBWithoutMeasuredBPointStabilityGate)
 {
   auto safety = intercept_safety();
   MissionConfig mission;
@@ -236,30 +236,16 @@ TEST(NavigationV3Test, RequiresMeasuredBPointVelocityBeforeSendingOkB)
   finish_b_trajectory(navigation, input, now);
 
   follow_planner(navigation, input);
-  input.telemetry.velocity_x_m_s = 0.118;
-  input.telemetry.velocity_y_m_s = 0.0;
-  input.telemetry.velocity_z_m_s = 0.0;
+  input.telemetry.local_x_m += 0.20;
+  input.telemetry.velocity_x_m_s = 0.50;
+  input.telemetry.velocity_y_m_s = 0.50;
+  input.telemetry.velocity_z_m_s = 0.50;
   input.now = now;
   input.events.clear();
-  const auto moving_horizontally = navigation.update(input);
+  const auto decision = navigation.update(input);
   now += input.dt;
-  EXPECT_EQ(moving_horizontally.phase, "transit_to_b");
-  EXPECT_FALSE(has_message(moving_horizontally, MessageType::ok_b));
-
-  input.telemetry.velocity_x_m_s = 0.0;
-  input.telemetry.velocity_z_m_s = 0.118;
-  input.now = now;
-  const auto moving_vertically = navigation.update(input);
-  now += input.dt;
-  EXPECT_EQ(moving_vertically.phase, "transit_to_b");
-  EXPECT_FALSE(has_message(moving_vertically, MessageType::ok_b));
-
-  input.telemetry.velocity_z_m_s = 0.0;
-  input.now = now;
-  const auto stable = navigation.update(input);
-  now += input.dt;
-  EXPECT_EQ(stable.phase, "waiting_target");
-  EXPECT_TRUE(has_message(stable, MessageType::ok_b));
+  EXPECT_EQ(decision.phase, "waiting_target");
+  EXPECT_TRUE(has_message(decision, MessageType::ok_b));
 
   input.now = now;
   const auto after_ack = navigation.update(input);

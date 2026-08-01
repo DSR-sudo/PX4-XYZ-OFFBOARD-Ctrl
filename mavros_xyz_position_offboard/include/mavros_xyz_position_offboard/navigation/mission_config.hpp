@@ -12,7 +12,7 @@ struct MissionConfig
   double b_right_m{0.375};
   /// 固定本地 ENU B 点的 Y 分量，保留历史参数名以兼容部署配置。
   double b_forward_m{2.375};
-  /// B 点到达判定使用的水平合速度和垂直速度上限。
+  /// 保留旧配置字段以兼容部署参数；B 点状态切换不再使用该门限。
   double b_arrival_speed_m_s{0.05};
   /// car_status 车辆中心轨迹的二维合速度上限，单位：米/秒。
   double car_tracking_max_speed_m_s{10.0};

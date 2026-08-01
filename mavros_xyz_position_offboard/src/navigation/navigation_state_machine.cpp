@@ -121,7 +121,8 @@ NavigationDecision Navigation::update(const NavigationInput & input)
       transition("transit_to_b", input.now);
     }
   } else if (phase_ == "transit_to_b") {
-    if (planner_.target_reached() && b_arrival_stable(input.telemetry, planner_.current())) {
+    // B is a commanded transit waypoint; do not add a measured settle gate here.
+    if (planner_.target_reached()) {
       emit(communication::MessageType::ok_b);
       transition("waiting_target", input.now);
     }

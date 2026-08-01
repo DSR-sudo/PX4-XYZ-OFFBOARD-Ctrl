@@ -55,7 +55,13 @@ The lock phase follows dynamic observations but never releases the gripper. When
 completes, the latest valid and fresh raw `distance_m < mission.throw_distance_m` (default `0.20 m`)
 enters `throwing` and requests the gripper in the same control cycle. The strict comparison means
 `distance_m == 0.20 m` does not release. LCP/observation safety holds pause the lock timer and
-resume it with the remaining time. The JSON fields and UDP envelope are unchanged.
+resume it with the remaining time. During `waiting_target` and `target_lock_following`, a finite
+consecutive `local_z` change at least `mission.tracking_z_jump_threshold_m` within
+`mission.tracking_z_jump_window_s` applies one signed `mission.tracking_z_step_m` adjustment to
+the temporary planner Z target. The task `mission_goal.z_m` and ARM-time `origin.z_m` stay unchanged;
+the accumulated offset survives LCP/visual hold recovery, pauses while waiting for the gripper, and
+is cleared before return, landing, downing, or reset. Range remains a health-check input. The JSON
+audit gains the compensation state, but the UDP message formats and envelope are unchanged.
 
 ## ACK And Idempotency
 

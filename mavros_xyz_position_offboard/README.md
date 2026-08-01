@@ -80,6 +80,14 @@ effective `safety.target_xy_*` value is inherited. Return uses the independent
 `downing` uses the independent Z limits `mission.downing_max_speed_m_s` and
 `mission.downing_max_accel_m_s2` (both default `0.3`), while failure `landing` keeps the global
 Z limits. B-point and landing XY trajectories keep using the global `safety.target_xy_*` limits.
+During `waiting_target` and `target_lock_following`, consecutive finite `local_z` samples are
+compared for a short jump. A downward jump at least `mission.tracking_z_jump_threshold_m`
+(default `0.10 m`) within `mission.tracking_z_jump_window_s` (default `0.10 s`) lowers the
+temporary planner Z target by `mission.tracking_z_step_m` (default `0.11 m`); an upward jump
+applies the opposite step. The accumulated offset is preserved through visual/LCP hold recovery,
+while the original `origin.z_m` and `mission_goal.z_m` remain unchanged. New jumps are ignored
+while waiting for the gripper in `throwing`, and the offset is cleared on return, landing,
+descent, or mission reset. The offset and latest jump direction are included in `control_json`.
 After the lock-follow timer
 completes, the latest fresh raw `distance_m < mission.throw_distance_m` (default `0.20 m`)
 immediately enters `throwing`; equality does not release. Subsequent car_status messages use the
@@ -106,6 +114,11 @@ accepted `car_status` uses the UAV receipt time and measured yaw to form the raw
 target. A large in-radius jump is accepted and replans immediately; the active Navigation path does
 not use Kalman samples, innovation rejection, cardinal shaping, or predicted intercept timing.
 Stale or out-of-radius observations still enter the existing safe LCP hold.
+
+The height compensation is an application-level setpoint adjustment. It does not change the
+`car_status` UDP message or the continuous `xyzstatus` wire format, and `sensor_msgs/Range` remains
+an input to the existing health checks. It cannot undo an already fused PX4 EKF2 downward-range
+measurement; isolating that fusion would require a separate PX4/MAVROS input-chain change.
 
 On a successful gripper cycle, `ok_throw` is queued and the UAV immediately returns without a GCS
 command. It emits `ok_return` only after Init XY and yaw zero are measured, then queues
@@ -153,7 +166,7 @@ loopback. No automated test drives a real PWM pin.
 Load [config/udp_ground_station.yaml](config/udp_ground_station.yaml) with ROS parameters. It
 contains the UDP allowlist/fixed remote, the `mission.takeoff_height_m: 1.5` and
 `mission.height_stable_seconds: 3.0` gate, B-point, vehicle-center tracking, retained Kalman,
-Z, and PWM defaults. The vehicle-center speed and acceleration limits are explicitly set to
+tracking-height jump compensation, Z, and PWM defaults. The vehicle-center speed and acceleration limits are explicitly set to
 `10.0 m/s` and `5.0 m/s2`; without those mission entries, the node inherits the effective safety
 XY limits. The
 3-second timer accumulates only while measured XYZ remains within `--target-tolerance`; leaving

@@ -18,6 +18,12 @@ struct MissionConfig
   double car_tracking_max_speed_m_s{10.0};
   /// car_status 车辆中心轨迹的二维合加速度上限，单位：米/秒²。
   double car_tracking_max_accel_m_s2{5.0};
+  /// 跟车期间 local_z 短时跳变的最小判定幅度，单位：米。
+  double tracking_z_jump_threshold_m{0.10};
+  /// 每次跟车高度跳变对应的 Z 设定点补偿步长，单位：米。
+  double tracking_z_step_m{0.11};
+  /// 跟车高度相邻样本的最大跳变时间窗口，单位：秒。
+  double tracking_z_jump_window_s{0.10};
   /// 返航原点轨迹的二维合速度上限，单位：米/秒。
   double return_max_speed_m_s{10.0};
   /// 返航原点轨迹的二维合加速度上限，单位：米/秒²。

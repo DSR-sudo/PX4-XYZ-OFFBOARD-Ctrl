@@ -178,6 +178,12 @@ navigation::MissionConfig ApplicationNode::load_mission_config()
     "mission.car_tracking_max_speed_m_s", config_.target_xy_max_speed_m_s);
   value.car_tracking_max_accel_m_s2 = declare_parameter<double>(
     "mission.car_tracking_max_accel_m_s2", config_.target_xy_max_accel_m_s2);
+  value.tracking_z_jump_threshold_m = declare_parameter<double>(
+    "mission.tracking_z_jump_threshold_m", value.tracking_z_jump_threshold_m);
+  value.tracking_z_step_m = declare_parameter<double>(
+    "mission.tracking_z_step_m", value.tracking_z_step_m);
+  value.tracking_z_jump_window_s = declare_parameter<double>(
+    "mission.tracking_z_jump_window_s", value.tracking_z_jump_window_s);
   value.return_max_speed_m_s = declare_parameter<double>(
     "mission.return_max_speed_m_s", config_.target_xy_max_speed_m_s);
   value.return_max_accel_m_s2 = declare_parameter<double>(

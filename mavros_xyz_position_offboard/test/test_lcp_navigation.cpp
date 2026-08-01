@@ -619,6 +619,25 @@ TEST(ApplicationNodeMissionParameterTest, DowningLimitsUseIndependentDefaultsAnd
   EXPECT_DOUBLE_EQ(overridden->get_parameter("mission.downing_max_accel_m_s2").as_double(), 0.27);
 }
 
+TEST(ApplicationNodeMissionParameterTest, TrackingZCompensationDefaultsAndOverrides)
+{
+  const auto defaults = std::make_shared<ApplicationNode>(
+    application_test_options(), SafetyConfig{}, application_test_node_options());
+  EXPECT_DOUBLE_EQ(defaults->get_parameter("mission.tracking_z_jump_threshold_m").as_double(), 0.10);
+  EXPECT_DOUBLE_EQ(defaults->get_parameter("mission.tracking_z_step_m").as_double(), 0.11);
+  EXPECT_DOUBLE_EQ(defaults->get_parameter("mission.tracking_z_jump_window_s").as_double(), 0.10);
+
+  const auto overridden = std::make_shared<ApplicationNode>(
+    application_test_options(), SafetyConfig{}, application_test_node_options({
+      rclcpp::Parameter("mission.tracking_z_jump_threshold_m", 0.07),
+      rclcpp::Parameter("mission.tracking_z_step_m", 0.13),
+      rclcpp::Parameter("mission.tracking_z_jump_window_s", 0.08)}));
+  EXPECT_DOUBLE_EQ(
+    overridden->get_parameter("mission.tracking_z_jump_threshold_m").as_double(), 0.07);
+  EXPECT_DOUBLE_EQ(overridden->get_parameter("mission.tracking_z_step_m").as_double(), 0.13);
+  EXPECT_DOUBLE_EQ(overridden->get_parameter("mission.tracking_z_jump_window_s").as_double(), 0.08);
+}
+
 TEST(ApplicationNodeMissionParameterTest, InvalidMissionTimingAndReturnLimitsAreRejectedAtStartup)
 {
   for (const double value : {
@@ -649,6 +668,21 @@ TEST(ApplicationNodeMissionParameterTest, InvalidMissionTimingAndReturnLimitsAre
       std::make_shared<ApplicationNode>(
         application_test_options(), SafetyConfig{}, application_test_node_options({
           rclcpp::Parameter("mission.target_lock_follow_seconds", value)})),
+      std::invalid_argument);
+    EXPECT_THROW(
+      std::make_shared<ApplicationNode>(
+        application_test_options(), SafetyConfig{}, application_test_node_options({
+          rclcpp::Parameter("mission.tracking_z_jump_threshold_m", value)})),
+      std::invalid_argument);
+    EXPECT_THROW(
+      std::make_shared<ApplicationNode>(
+        application_test_options(), SafetyConfig{}, application_test_node_options({
+          rclcpp::Parameter("mission.tracking_z_step_m", value)})),
+      std::invalid_argument);
+    EXPECT_THROW(
+      std::make_shared<ApplicationNode>(
+        application_test_options(), SafetyConfig{}, application_test_node_options({
+          rclcpp::Parameter("mission.tracking_z_jump_window_s", value)})),
       std::invalid_argument);
   }
 }

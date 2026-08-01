@@ -62,6 +62,7 @@ void Navigation::enter_hold(
   planner_.freeze_xy_at(hold.x_m, hold.y_m);
   planner_.freeze_z_at(hold.z_m);
   planner_.set_yaw_rad(common::yaw_from_quaternion(hold.orientation));
+  reset_tracking_z_sample();
   control_.hold_setpoint = hold;
   control_.hold_reason = reason;
   control_.hold_resume_phase = resume_phase.value_or(phase_);
@@ -90,6 +91,7 @@ void Navigation::resume_hold(double now)
 
 void Navigation::begin_landing(double now, const std::string & reason)
 {
+  clear_tracking_z_compensation();
   pending_release_gripper_ = false;
   latest_car_status_.reset();
   target_lock_follow_elapsed_s_ = 0.0;

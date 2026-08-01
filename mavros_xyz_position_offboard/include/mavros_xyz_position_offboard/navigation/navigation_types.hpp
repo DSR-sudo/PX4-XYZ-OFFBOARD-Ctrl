@@ -49,6 +49,10 @@ struct ControlState
   std::string hold_reason{};
   std::string hold_resume_phase{};
   bool mission_paused{false};
+  /// 当前跟车高度补偿的累计值；只影响临时规划 Z 目标。
+  double tracking_z_offset_m{0.0};
+  /// 最近一次触发高度跳变补偿的方向：none、down 或 up。
+  std::string tracking_z_last_jump_direction{"none"};
   bool tracking_arrival_time_met{true};
   int target_samples{0};
   std::optional<double> predicted_intercept_seconds{};

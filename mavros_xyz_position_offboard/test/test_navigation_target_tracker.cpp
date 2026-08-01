@@ -44,6 +44,18 @@ TEST(MissionConfigTest, RejectsInvalidIndependentXyLimits)
     MissionConfig invalid_target_lock;
     invalid_target_lock.target_lock_follow_seconds = value;
     EXPECT_THROW(invalid_target_lock.validate(), std::invalid_argument);
+
+    MissionConfig invalid_tracking_threshold;
+    invalid_tracking_threshold.tracking_z_jump_threshold_m = value;
+    EXPECT_THROW(invalid_tracking_threshold.validate(), std::invalid_argument);
+
+    MissionConfig invalid_tracking_step;
+    invalid_tracking_step.tracking_z_step_m = value;
+    EXPECT_THROW(invalid_tracking_step.validate(), std::invalid_argument);
+
+    MissionConfig invalid_tracking_window;
+    invalid_tracking_window.tracking_z_jump_window_s = value;
+    EXPECT_THROW(invalid_tracking_window.validate(), std::invalid_argument);
   }
 }
 

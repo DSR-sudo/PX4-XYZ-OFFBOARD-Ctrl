@@ -63,7 +63,7 @@ bool Navigation::apply_car_status(
   planner_.set_xy_target_with_limits(
     target_x, target_y, mission_.car_tracking_max_speed_m_s,
     mission_.car_tracking_max_accel_m_s2);
-  planner_.set_z_target(goal.z_m);
+  plan_to_tracking_z_target();
   planner_.set_yaw_rad(common::yaw_from_quaternion(control_.origin->orientation));
 
   last_car_status_at_ = input.now;
@@ -112,6 +112,7 @@ bool Navigation::car_status_fresh(double now) const
 
 void Navigation::begin_return(double now)
 {
+  clear_tracking_z_compensation();
   if (!control_.origin) {
     begin_landing(now, "return_without_origin");
     return;
@@ -137,6 +138,7 @@ void Navigation::begin_return(double now)
 
 void Navigation::begin_downing(double now)
 {
+  clear_tracking_z_compensation();
   if (!control_.origin) {
     begin_landing(now, "downing_without_origin");
     return;

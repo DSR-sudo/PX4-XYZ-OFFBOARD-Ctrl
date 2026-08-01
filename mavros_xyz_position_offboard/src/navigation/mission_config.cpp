@@ -14,6 +14,7 @@ void MissionConfig::validate() const
     takeoff_height_m, height_stable_seconds, b_right_m, b_forward_m, b_arrival_speed_m_s,
     car_tracking_max_speed_m_s, car_tracking_max_accel_m_s2, return_max_speed_m_s,
     return_max_accel_m_s2, downing_max_speed_m_s, downing_max_accel_m_s2,
+    tracking_z_jump_threshold_m, tracking_z_step_m, tracking_z_jump_window_s,
     target_lock_follow_seconds, throw_distance_m,
     throw_bearing_tolerance_rad, filter_measurement_noise_m,
     filter_acceleration_noise_m_s2, prediction_horizon_s, cardinal_tolerance_deg,

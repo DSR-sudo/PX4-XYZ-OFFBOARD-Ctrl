@@ -40,6 +40,9 @@ writes audit status. Every `/lcp/debug` sample is separately sent as one unqueue
 | `mission.b_arrival_speed_m_s` | `0.05` | Retained compatibility parameter; no longer used for B state transition. |
 | `mission.car_tracking_max_speed_m_s` | `10.0` | Maximum resultant XY speed for `car_status` vehicle-center tracking; inherits `safety.target_xy_max_speed_m_s` when omitted. |
 | `mission.car_tracking_max_accel_m_s2` | `5.0` | Maximum resultant XY acceleration for `car_status` vehicle-center tracking; inherits `safety.target_xy_max_accel_m_s2` when omitted. |
+| `mission.tracking_z_jump_threshold_m` | `0.10` | Minimum consecutive `local_z` jump used during tracking. |
+| `mission.tracking_z_step_m` | `0.11` | Temporary Z setpoint step applied per detected tracking jump. |
+| `mission.tracking_z_jump_window_s` | `0.10` | Maximum time between tracking height samples for jump detection. |
 | `mission.return_max_speed_m_s` | `10.0` | Maximum resultant XY speed for return to the ARM-time origin; inherits `safety.target_xy_max_speed_m_s` when omitted. |
 | `mission.return_max_accel_m_s2` | `5.0` | Maximum resultant XY acceleration for return to the ARM-time origin; inherits `safety.target_xy_max_accel_m_s2` when omitted. |
 | `mission.downing_max_speed_m_s` | `0.3` | Maximum normal-descent Z speed; applies only to `downing`. |
@@ -70,6 +73,15 @@ the global Z limits. The active path does not filter, reject innovations, shape 
 motion, or calculate predicted intercept time. `target_samples` remains `0` and
 `predicted_intercept_seconds` remains `null` in audit JSON. Strict raw `distance_m < 0.20 m` enters
 `throwing` immediately; equality does not.
+
+During `waiting_target` and `target_lock_following`, a finite consecutive `local_z` change at or
+above `mission.tracking_z_jump_threshold_m` within `mission.tracking_z_jump_window_s` changes the
+temporary planner Z target by one signed `mission.tracking_z_step_m`. Downward changes apply a
+negative step and upward changes apply a positive step. `origin.z_m` and `mission_goal.z_m` stay at
+their task values; the cumulative offset is retained through LCP/visual hold recovery and is
+reported with its latest direction in `control_json`. Detection pauses during `throwing` and the
+offset is cleared before return, landing, downing, or reset. Range remains a health-check input and
+the UDP message formats are unchanged.
 
 ## Safety And Completion
 

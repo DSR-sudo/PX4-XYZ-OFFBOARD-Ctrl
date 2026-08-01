@@ -46,6 +46,14 @@ private:
   void set_mission_goal(const common::PositionSetpoint & goal);
   /// 从当前命令点重新规划到任务最终目标。
   void plan_to_mission_goal();
+  /// 将任务最终 Z 目标叠加当前跟车补偿后写入临时规划器。
+  void plan_to_tracking_z_target();
+  /// 观察跟车阶段的 local_z，相邻短时跳变时更新临时 Z 目标。
+  void observe_tracking_z(const NavigationInput & input);
+  /// 清除跟车高度补偿及其跨阶段的样本基准。
+  void clear_tracking_z_compensation();
+  /// 丢弃当前跟车样本，避免跨 LCP/视觉保持期间比较高度。
+  void reset_tracking_z_sample();
   /// 使用新鲜实测 XYZ 和最近命令偏航构建临时保持点。
   common::PositionSetpoint measured_hold_setpoint(const NavigationInput & input) const;
   /// 在指定保持阶段冻结可靠实测位置，且绝不改写任务最终目标。
@@ -105,6 +113,9 @@ private:
   double target_lock_follow_elapsed_s_{0.0};
   std::optional<double> target_lock_follow_started_at_{};
   bool target_lock_follow_completed_{false};
+  double tracking_z_offset_m_{0.0};
+  std::optional<double> tracking_z_previous_z_m_{};
+  std::optional<double> tracking_z_previous_at_{};
 };
 
 }  // namespace mavros_xyz_position_offboard::navigation

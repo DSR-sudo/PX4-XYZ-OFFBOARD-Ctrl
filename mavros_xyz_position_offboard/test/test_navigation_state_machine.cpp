@@ -222,10 +222,14 @@ TEST(NavigationTypesTest, EncodesControlJsonWithoutStateMachineDependency)
   ControlState control;
   control.mission_paused = true;
   control.hold_reason = "lcp_unhealthy";
+  control.tracking_z_offset_m = -0.11;
+  control.tracking_z_last_jump_direction = "down";
   control.target_samples = 3;
   const std::string encoded = control_json(control);
   EXPECT_NE(encoded.find("\"mission_paused\":true"), std::string::npos);
   EXPECT_NE(encoded.find("\"hold_reason\":\"lcp_unhealthy\""), std::string::npos);
+  EXPECT_NE(encoded.find("\"tracking_z_offset_m\":-0.11"), std::string::npos);
+  EXPECT_NE(encoded.find("\"tracking_z_last_jump_direction\":\"down\""), std::string::npos);
   EXPECT_NE(encoded.find("\"target_samples\":3"), std::string::npos);
 }
 
@@ -584,6 +588,264 @@ TEST(NavigationV3Test, NewCarStatusImmediatelyUpdatesRawVehicleCenterTarget)
   EXPECT_NEAR(navigation.planner().target_y_m(), second_y, 1e-9);
   EXPECT_EQ(second.control.target_samples, 0);
   EXPECT_FALSE(second.control.predicted_intercept_seconds);
+}
+
+TEST(NavigationV3Test, TrackingZDownJumpAdjustsPlannerOnlyAndReverseJumpCancelsIt)
+{
+  auto safety = intercept_safety();
+  MissionConfig mission;
+  mission.height_stable_seconds = 0.05;
+  Navigation navigation(safety, mission);
+  auto input = base_input(0.0);
+  input.dt = 0.05;
+  double now = 0.0;
+  advance_to_b(navigation, input, now);
+
+  const auto origin = *navigation.control_state().origin;
+  const double original_z = navigation.control_state().mission_goal->z_m;
+  input.now = now;
+  input.events = {car_status_event(1.0, 0.0, now)};
+  ASSERT_EQ(navigation.update(input).phase, "target_lock_following");
+  now += input.dt;
+
+  input.now = now;
+  input.telemetry.local_z_m = original_z - mission.tracking_z_step_m;
+  input.events.clear();
+  const auto downward = navigation.update(input);
+  EXPECT_NEAR(downward.control.tracking_z_offset_m, -mission.tracking_z_step_m, 1e-12);
+  EXPECT_EQ(downward.control.tracking_z_last_jump_direction, "down");
+  EXPECT_NEAR(navigation.planner().target_z_m(), original_z - mission.tracking_z_step_m, 1e-12);
+  ASSERT_TRUE(downward.control.mission_goal);
+  ASSERT_TRUE(downward.control.origin);
+  EXPECT_NEAR(downward.control.mission_goal->z_m, original_z, 1e-12);
+  EXPECT_NEAR(downward.control.origin->z_m, origin.z_m, 1e-12);
+
+  now += input.dt;
+  input.now = now;
+  input.telemetry.local_z_m = original_z;
+  const auto upward = navigation.update(input);
+  EXPECT_NEAR(upward.control.tracking_z_offset_m, 0.0, 1e-12);
+  EXPECT_EQ(upward.control.tracking_z_last_jump_direction, "up");
+  EXPECT_NEAR(navigation.planner().target_z_m(), original_z, 1e-12);
+  EXPECT_NEAR(upward.control.mission_goal->z_m, original_z, 1e-12);
+  EXPECT_NEAR(upward.control.origin->z_m, origin.z_m, 1e-12);
+}
+
+TEST(NavigationV3Test, TrackingZIgnoresSmallLateAndSlowHeightChanges)
+{
+  const auto run_case = [](const std::string & name, const auto & observe) {
+      auto safety = intercept_safety();
+      MissionConfig mission;
+      mission.height_stable_seconds = 0.05;
+      Navigation navigation(safety, mission);
+      auto input = base_input(0.0);
+      input.dt = 0.05;
+      double now = 0.0;
+      advance_to_b(navigation, input, now);
+      const double original_z = navigation.control_state().mission_goal->z_m;
+      input.now = now;
+      input.events = {car_status_event(1.0, 0.0, now)};
+      ASSERT_EQ(navigation.update(input).phase, "target_lock_following") << name;
+      now += input.dt;
+      observe(navigation, input, now, original_z, mission);
+      EXPECT_NEAR(navigation.control_state().tracking_z_offset_m, 0.0, 1e-12) << name;
+      EXPECT_NEAR(navigation.planner().target_z_m(), original_z, 1e-12) << name;
+    };
+
+  run_case("below threshold", [](Navigation & navigation, NavigationInput & input, double now,
+      double original_z, const MissionConfig & mission) {
+      input.now = now;
+      input.telemetry.local_z_m = original_z - mission.tracking_z_jump_threshold_m + 0.01;
+      input.events.clear();
+      navigation.update(input);
+    });
+  run_case("outside window", [](Navigation & navigation, NavigationInput & input, double now,
+      double original_z, const MissionConfig & mission) {
+      input.now = now + mission.tracking_z_jump_window_s + 0.01;
+      input.telemetry.local_z_m = original_z - mission.tracking_z_jump_threshold_m;
+      input.events.clear();
+      navigation.update(input);
+    });
+  run_case("slow change", [](Navigation & navigation, NavigationInput & input, double now,
+      double original_z, const MissionConfig &) {
+      input.events.clear();
+      for (int sample = 1; sample <= 3; ++sample) {
+        input.now = now + 0.05 * static_cast<double>(sample - 1);
+        input.telemetry.local_z_m = original_z - 0.04 * static_cast<double>(sample);
+        navigation.update(input);
+      }
+    });
+}
+
+TEST(NavigationV3Test, TrackingZCompensationSurvivesLcpAndVisualHoldRecovery)
+{
+  auto safety = intercept_safety();
+  MissionConfig mission;
+  mission.height_stable_seconds = 0.05;
+  mission.car_status_timeout_s = 0.20;
+  Navigation navigation(safety, mission);
+  auto input = base_input(0.0);
+  input.dt = 0.05;
+  double now = 0.0;
+  advance_to_b(navigation, input, now);
+  const double original_z = navigation.control_state().mission_goal->z_m;
+
+  input.now = now;
+  input.events = {car_status_event(1.0, 0.0, now)};
+  ASSERT_EQ(navigation.update(input).phase, "target_lock_following");
+  now += input.dt;
+  input.now = now;
+  input.telemetry.local_z_m = original_z - mission.tracking_z_step_m;
+  input.events.clear();
+  ASSERT_EQ(navigation.update(input).control.tracking_z_last_jump_direction, "down");
+  now += input.dt;
+
+  input.now = now;
+  input.lcp_healthy = false;
+  const auto held = navigation.update(input);
+  EXPECT_EQ(held.phase, "lcp_hold");
+  EXPECT_NEAR(held.control.tracking_z_offset_m, -mission.tracking_z_step_m, 1e-12);
+
+  now += input.dt;
+  input.now = now;
+  input.lcp_healthy = true;
+  const auto lcp_resumed = navigation.update(input);
+  EXPECT_EQ(lcp_resumed.phase, "target_lock_following");
+  EXPECT_NEAR(navigation.planner().target_z_m(), original_z - mission.tracking_z_step_m, 1e-12);
+  EXPECT_NEAR(lcp_resumed.control.mission_goal->z_m, original_z, 1e-12);
+
+  now += input.dt;
+  input.now = now;
+  input.events.clear();
+  const auto timed_out = navigation.update(input);
+  EXPECT_EQ(timed_out.phase, "target_lock_following");
+  now += mission.car_status_timeout_s + input.dt;
+  input.now = now;
+  const auto held_for_timeout = navigation.update(input);
+  EXPECT_EQ(held_for_timeout.phase, "lcp_hold");
+
+  now += input.dt;
+  input.now = now;
+  input.events = {car_status_event(1.0, 0.0, now)};
+  const auto visual_resumed = navigation.update(input);
+  EXPECT_EQ(visual_resumed.phase, "target_lock_following");
+  EXPECT_NEAR(visual_resumed.control.tracking_z_offset_m, -mission.tracking_z_step_m, 1e-12);
+  EXPECT_NEAR(navigation.planner().target_z_m(), original_z - mission.tracking_z_step_m, 1e-12);
+}
+
+TEST(NavigationV3Test, TrackingZDetectionStopsWhileWaitingForGripper)
+{
+  auto safety = intercept_safety();
+  MissionConfig mission;
+  mission.height_stable_seconds = 0.05;
+  mission.target_lock_follow_seconds = 0.04;
+  Navigation navigation(safety, mission);
+  auto input = base_input(0.0);
+  input.dt = 0.05;
+  double now = 0.0;
+  advance_to_b(navigation, input, now);
+  const double original_z = navigation.control_state().mission_goal->z_m;
+
+  input.now = now;
+  input.events = {car_status_event(1.0, 0.0, now)};
+  ASSERT_EQ(navigation.update(input).phase, "target_lock_following");
+  now += input.dt;
+  input.now = now;
+  input.telemetry.local_z_m = original_z - mission.tracking_z_step_m;
+  input.events.clear();
+  ASSERT_EQ(navigation.update(input).phase, "waiting_target");
+  ASSERT_NEAR(navigation.control_state().tracking_z_offset_m, -mission.tracking_z_step_m, 1e-12);
+  now += input.dt;
+
+  input.now = now;
+  input.events = {car_status_event(mission.throw_distance_m - 0.01, 0.0, now)};
+  const auto throwing = navigation.update(input);
+  EXPECT_EQ(throwing.phase, "throwing");
+  now += input.dt;
+  input.now = now;
+  input.telemetry.local_z_m = original_z - 2.0 * mission.tracking_z_step_m;
+  input.events.clear();
+  const auto waiting_for_gripper = navigation.update(input);
+  EXPECT_EQ(waiting_for_gripper.phase, "throwing");
+  EXPECT_NEAR(waiting_for_gripper.control.tracking_z_offset_m, -mission.tracking_z_step_m, 1e-12);
+  EXPECT_NEAR(navigation.planner().target_z_m(), original_z - mission.tracking_z_step_m, 1e-12);
+}
+
+TEST(NavigationV3Test, TrackingZCompensationClearsOnReturnLandingDowningAndReset)
+{
+  auto safety = intercept_safety();
+  MissionConfig mission;
+  mission.height_stable_seconds = 0.05;
+  mission.target_lock_follow_seconds = 0.04;
+
+  const auto apply_compensation = [&mission](Navigation & navigation, NavigationInput & input,
+      double & now) {
+      const double original_z = navigation.control_state().mission_goal->z_m;
+      input.now = now;
+      input.events = {car_status_event(1.0, 0.0, now)};
+      ASSERT_EQ(navigation.update(input).phase, "target_lock_following");
+      now += input.dt;
+      input.now = now;
+      input.telemetry.local_z_m = original_z - mission.tracking_z_step_m;
+      input.events.clear();
+      const auto compensated = navigation.update(input);
+      EXPECT_NEAR(compensated.control.tracking_z_offset_m, -mission.tracking_z_step_m, 1e-12);
+      now += input.dt;
+    };
+
+  Navigation returning(safety, mission);
+  auto return_input = base_input(0.0);
+  return_input.dt = 0.05;
+  double return_now = 0.0;
+  advance_to_b(returning, return_input, return_now);
+  apply_compensation(returning, return_input, return_now);
+  return_input.now = return_now;
+  return_input.events = {car_status_event(mission.throw_distance_m - 0.01, 0.0, return_now)};
+  ASSERT_EQ(returning.update(return_input).phase, "throwing");
+  return_now += return_input.dt;
+  return_input.now = return_now;
+  return_input.events.clear();
+  return_input.gripper_succeeded = true;
+  const auto returned = returning.update(return_input);
+  return_input.gripper_succeeded = false;
+  EXPECT_EQ(returned.phase, "returning");
+  EXPECT_NEAR(returned.control.tracking_z_offset_m, 0.0, 1e-12);
+
+  bool reached_downing = false;
+  for (int count = 0; count < 400 && returning.phase() != "downing"; ++count) {
+    follow_planner(returning, return_input);
+    return_input.now = return_now;
+    return_input.events.clear();
+    returning.update(return_input);
+    return_now += return_input.dt;
+  }
+  reached_downing = returning.phase() == "downing";
+  ASSERT_TRUE(reached_downing);
+  EXPECT_NEAR(returning.control_state().tracking_z_offset_m, 0.0, 1e-12);
+
+  Navigation landing(safety, mission);
+  auto landing_input = base_input(0.0);
+  landing_input.dt = 0.05;
+  double landing_now = 0.0;
+  advance_to_b(landing, landing_input, landing_now);
+  apply_compensation(landing, landing_input, landing_now);
+  landing_input.now = landing_now;
+  landing_input.flight_healthy = false;
+  landing_input.events.clear();
+  const auto landed = landing.update(landing_input);
+  EXPECT_EQ(landed.phase, "landing");
+  EXPECT_NEAR(landed.control.tracking_z_offset_m, 0.0, 1e-12);
+
+  Navigation reset_navigation(safety, mission);
+  auto reset_input = base_input(0.0);
+  reset_input.dt = 0.05;
+  double reset_now = 0.0;
+  advance_to_b(reset_navigation, reset_input, reset_now);
+  apply_compensation(reset_navigation, reset_input, reset_now);
+  ASSERT_NEAR(reset_navigation.control_state().tracking_z_offset_m, -mission.tracking_z_step_m, 1e-12);
+  reset_navigation.reset();
+  EXPECT_EQ(reset_navigation.phase(), "waiting_preflight");
+  EXPECT_NEAR(reset_navigation.control_state().tracking_z_offset_m, 0.0, 1e-12);
 }
 
 TEST(NavigationV3Test, RawDistanceBelowThrowThresholdWaitsForTargetLock)

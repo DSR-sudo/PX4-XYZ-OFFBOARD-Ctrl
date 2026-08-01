@@ -208,6 +208,10 @@ NavigationDecision Navigation::update(const NavigationInput & input)
     begin_landing(input.now, "maximum_flight_time_exceeded");
   }
 
+  if (phase_ == "waiting_target" || phase_ == "target_lock_following") {
+    observe_tracking_z(input);
+  }
+
   NavigationDecision decision;
   decision.phase = phase_;
   decision.messages = pending_messages_;

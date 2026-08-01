@@ -28,6 +28,9 @@ std::string control_json(const ControlState & control)
           << ",\"hold_reason\":\"" << common::json_escape(control.hold_reason)
           << "\",\"hold_resume_phase\":\"" << common::json_escape(control.hold_resume_phase)
           << "\",\"mission_paused\":" << (control.mission_paused ? "true" : "false")
+          << ",\"tracking_z_offset_m\":" << control.tracking_z_offset_m
+          << ",\"tracking_z_last_jump_direction\":\"" <<
+    common::json_escape(control.tracking_z_last_jump_direction) << "\""
           << ",\"tracking_arrival_time_met\":" <<
     (control.tracking_arrival_time_met ? "true" : "false")
           << ",\"target_samples\":" << control.target_samples

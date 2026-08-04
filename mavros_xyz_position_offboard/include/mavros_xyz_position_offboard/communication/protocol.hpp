@@ -9,17 +9,14 @@
 namespace mavros_xyz_position_offboard::communication
 {
 
-/// Names registered by the V2 UAV--GCS JSON protocol.
+/// Names registered by the Plan1 UAV--GCS JSON protocol.
 enum class MessageType
 {
   run_plan1,
-  go_ahead_ok,
   car_status,
-  match_car_ok,
-  b_ok,
   ack,
   ok_wait,
-  ok_height,
+  ok_b,
   ok_throw,
   ok_return,
   ok_downing,

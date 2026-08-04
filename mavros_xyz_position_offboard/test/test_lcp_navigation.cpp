@@ -9,6 +9,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -26,7 +27,6 @@
 #include "mavros_xyz_position_offboard/communication/ground_station_link.hpp"
 #include "mavros_xyz_position_offboard/gripper/pwm_gripper.hpp"
 #include "mavros_xyz_position_offboard/initialization/initialization.hpp"
-#include "mavros_xyz_position_offboard/navigation/navigation.hpp"
 #include "mavros_xyz_position_offboard/offboard/offboard.hpp"
 
 namespace
@@ -37,19 +37,12 @@ using mavros_xyz_position_offboard::common::SafetyConfig;
 using mavros_xyz_position_offboard::communication::GroundStationConfig;
 using mavros_xyz_position_offboard::communication::GroundStationLink;
 using mavros_xyz_position_offboard::communication::MessageType;
-using mavros_xyz_position_offboard::communication::OutgoingMessage;
-using mavros_xyz_position_offboard::communication::ProtocolEvent;
 using mavros_xyz_position_offboard::communication::RosHeader;
 using mavros_xyz_position_offboard::communication::XyzStatus;
 using mavros_xyz_position_offboard::gripper::PwmGripper;
 using mavros_xyz_position_offboard::gripper::PwmGripperConfig;
 using mavros_xyz_position_offboard::gripper::ReleaseState;
 using mavros_xyz_position_offboard::initialization::Initialization;
-using mavros_xyz_position_offboard::navigation::MissionConfig;
-using mavros_xyz_position_offboard::navigation::Navigation;
-using mavros_xyz_position_offboard::navigation::NavigationInput;
-using mavros_xyz_position_offboard::navigation::TrajectoryPlanner;
-using mavros_xyz_position_offboard::navigation::control_json;
 
 struct DoubleSafetyOverride
 {
@@ -151,65 +144,11 @@ GroundStationLink disabled_link()
   return GroundStationLink(config);
 }
 
-ProtocolEvent event(MessageType type, double now)
-{
-  ProtocolEvent value;
-  value.type = type;
-  value.received_at = now;
-  value.accepted = true;
-  return value;
-}
-
-ProtocolEvent car_status_event(double distance_m, double bearing_rad, double now)
-{
-  auto value = event(MessageType::car_status, now);
-  value.car_status = {distance_m, bearing_rad};
-  return value;
-}
-
-bool has_message(
-  const mavros_xyz_position_offboard::navigation::NavigationDecision & decision, MessageType type)
-{
-  for (const auto & message : decision.messages) {
-    if (message.type == type) {return true;}
-  }
-  return false;
-}
-
-NavigationInput base_input(double now)
-{
-  NavigationInput input;
-  input.now = now;
-  input.dt = 0.05;
-  input.preflight_ready = true;
-  input.lcp_healthy = true;
-  input.flight_healthy = true;
-  input.telemetry.local_x_m = 0.0;
-  input.telemetry.local_y_m = 0.0;
-  input.telemetry.local_z_m = 0.0;
-  input.telemetry.orientation = {0.0, 0.0, 0.0, 1.0};
-  input.controller.mode = "MANUAL";
-  return input;
-}
-
-void follow_planner(Navigation & navigation, NavigationInput & input)
-{
-  if (!navigation.planner().latched()) {return;}
-  const auto setpoint = navigation.planner().current();
-  input.telemetry.local_x_m = setpoint.x_m;
-  input.telemetry.local_y_m = setpoint.y_m;
-  input.telemetry.local_z_m = setpoint.z_m;
-  input.telemetry.orientation = setpoint.orientation;
-}
-
-TEST(ProtocolV2Test, AcceptsEveryInboundMessageWithStrictDataRules)
+TEST(ProtocolV3Test, AcceptsOnlyPlanStartAcknowledgementAndContinuousTargetMeasurements)
 {
   auto link = disabled_link();
   for (const std::string json : {
       R"({"header":"run_plan1","data":{}})",
-      R"({"header":"go_ahead_ok","data":{}})",
-      R"({"header":"match_car_ok","data":{}})",
-      R"({"header":"b_ok","data":{}})",
       R"({"header":"ack","data":{}})"}) {
     EXPECT_TRUE(link.decode_datagram(json, "127.0.0.1", 5010, 1.0).accepted) << json;
   }
@@ -223,7 +162,7 @@ TEST(ProtocolV2Test, AcceptsEveryInboundMessageWithStrictDataRules)
   EXPECT_NEAR(car.car_status->bearing_rad, -std::acos(-1.0), 1e-12);
 }
 
-TEST(ProtocolV2Test, RejectsWrongDirectionMalformedAndOutOfRangePackets)
+TEST(ProtocolV3Test, RejectsLegacyWrongDirectionMalformedAndOutOfRangePackets)
 {
   auto link = disabled_link();
   const auto reject = [&link](const std::string & json, const std::string & reason) {
@@ -232,9 +171,13 @@ TEST(ProtocolV2Test, RejectsWrongDirectionMalformedAndOutOfRangePackets)
       EXPECT_EQ(decoded.rejection_reason, reason);
     };
   reject(R"({"header":"ok_wait","data":{}})", "unknown_or_wrong_direction_header");
+  reject(R"({"header":"ok_height","data":{}})", "legacy_header_rejected");
+  reject(R"({"header":"go_ahead_ok","data":{}})", "legacy_header_rejected");
+  reject(R"({"header":"match_car_ok","data":{}})", "legacy_header_rejected");
+  reject(R"({"header":"b_ok","data":{}})", "legacy_header_rejected");
   reject(R"({"header":"run_plan1"})", "invalid_envelope");
   reject(R"({"header":"run_plan1","data":{"unexpected":1}})", "nonempty_event_data");
-  reject(R"({"header":"go_ahead_ok","data":{"unexpected":1}})", "nonempty_event_data");
+  reject(R"({"header":"go_ahead_ok","data":{"unexpected":1}})", "legacy_header_rejected");
   reject(R"({"header":"car_status","data":{"distance":0.1,"angle":0}})",
     "invalid_car_status_data");
   reject(R"({"header":"car_status","data":{"distance_m":0.1,"bearing_rad":0,"distance_unit":"m"}})",
@@ -253,11 +196,11 @@ TEST(ProtocolV2Test, RejectsWrongDirectionMalformedAndOutOfRangePackets)
     R"({"header":"ack","header":"ack","data":{}})", "127.0.0.1", 5010, 1.0).accepted);
 }
 
-TEST(ProtocolV2Test, AckRemovesOnlyEarliestQueuedEventAndXyzstatusIsNeverQueued)
+TEST(ProtocolV3Test, AckRemovesOnlyEarliestQueuedEventAndXyzstatusIsNeverQueued)
 {
   auto link = disabled_link();
   EXPECT_FALSE(link.send({MessageType::ok_wait}, 0.0));
-  EXPECT_FALSE(link.send({MessageType::ok_height}, 0.1));
+  EXPECT_FALSE(link.send({MessageType::ok_b}, 0.1));
   ASSERT_EQ(link.pending_event_count(), 2U);
   EXPECT_EQ(*link.pending_event_json(), R"({"header":"ok_wait","data":{}})");
   EXPECT_FALSE(link.retry_events(0.49));
@@ -265,7 +208,7 @@ TEST(ProtocolV2Test, AckRemovesOnlyEarliestQueuedEventAndXyzstatusIsNeverQueued)
   EXPECT_TRUE(link.decode_datagram(
     R"({"header":"ack","data":{}})", "127.0.0.1", 5010, 0.6).accepted);
   ASSERT_EQ(link.pending_event_count(), 1U);
-  EXPECT_EQ(*link.pending_event_json(), R"({"header":"ok_height","data":{}})");
+  EXPECT_EQ(*link.pending_event_json(), R"({"header":"ok_b","data":{}})");
   EXPECT_TRUE(link.decode_datagram(
     R"({"header":"ack","data":{}})", "127.0.0.1", 5010, 0.7).accepted);
   EXPECT_EQ(link.pending_event_count(), 0U);
@@ -274,7 +217,7 @@ TEST(ProtocolV2Test, AckRemovesOnlyEarliestQueuedEventAndXyzstatusIsNeverQueued)
   EXPECT_EQ(link.pending_event_count(), 0U);
 }
 
-TEST(ProtocolV2Test, EncodesFullLcpXyzstatusAndRequiredInvalidZNulls)
+TEST(ProtocolV3Test, EncodesFullLcpXyzstatusAndRequiredInvalidZNulls)
 {
   auto link = disabled_link();
   XyzStatus status;
@@ -320,840 +263,12 @@ TEST(ProtocolV2Test, EncodesFullLcpXyzstatusAndRequiredInvalidZNulls)
   EXPECT_TRUE(root["data"]["z_valid"].asBool());
 }
 
-TEST(TrajectoryPlannerTest, QuinticSetpointsObserveBoundsAndReplanContinuously)
-{
-  SafetyConfig config;
-  config.max_z_setpoint_rate_m_s = 0.20;
-  config.max_z_setpoint_accel_m_s2 = 0.40;
-  TrajectoryPlanner planner(config);
-  planner.latch(0.0, 0.0, 0.0, {0.0, 0.0, 0.0, 1.0});
-  planner.set_target(1.0, 1.0, 0.8);
-  auto previous = planner.current();
-  for (int i = 0; i < 200; ++i) {
-    const auto current = planner.update(0.01);
-    EXPECT_LE(std::hypot(current.x_m - previous.x_m, current.y_m - previous.y_m) / 0.01,
-      config.target_xy_max_speed_m_s * 1.002);
-    EXPECT_LE(std::abs(current.vertical_rate_m_s), config.max_z_setpoint_rate_m_s * 1.002);
-    previous = current;
-  }
-}
-
-TEST(TrajectoryPlannerTest, TimedXyTargetMeetsFeasibleDeadlineAndExtendsUnsafeDeadline)
-{
-  SafetyConfig feasible;
-  feasible.target_xy_max_speed_m_s = 10.0;
-  feasible.target_xy_max_accel_m_s2 = 100.0;
-  TrajectoryPlanner planner(feasible);
-  planner.latch(0.0, 0.0, 1.5, {0.0, 0.0, 0.0, 1.0});
-  EXPECT_TRUE(planner.set_xy_target_with_arrival_time(1.0, 0.0, 1.0));
-  EXPECT_TRUE(planner.xy_arrival_time_met());
-  EXPECT_NEAR(planner.xy_trajectory_duration_s(), 1.0, 1e-9);
-
-  SafetyConfig constrained;
-  constrained.target_xy_max_speed_m_s = 0.25;
-  constrained.target_xy_max_accel_m_s2 = 0.50;
-  TrajectoryPlanner limited(constrained);
-  limited.latch(0.0, 0.0, 1.5, {0.0, 0.0, 0.0, 1.0});
-  EXPECT_FALSE(limited.set_xy_target_with_arrival_time(1.0, 0.0, 1.0));
-  EXPECT_FALSE(limited.xy_arrival_time_met());
-  EXPECT_GT(limited.xy_trajectory_duration_s(), 1.0);
-  auto previous = limited.current();
-  for (int i = 0; i < 1000 && !limited.xy_target_reached(); ++i) {
-    const auto current = limited.update(0.01);
-    EXPECT_LE(std::hypot(current.x_m - previous.x_m, current.y_m - previous.y_m) / 0.01,
-      constrained.target_xy_max_speed_m_s * 1.002);
-    previous = current;
-  }
-}
-
-TEST(TrajectoryPlannerTest, ForwardPursuitCanUseASpecificSpeedLimit)
-{
-  SafetyConfig config;
-  config.target_xy_max_speed_m_s = 0.25;
-  config.target_xy_max_accel_m_s2 = 0.50;
-
-  TrajectoryPlanner default_limited(config);
-  default_limited.latch(0.0, 0.0, 1.5, {0.0, 0.0, 0.0, 1.0});
-  default_limited.set_xy_target(5.0, 0.0);
-
-  TrajectoryPlanner forward_limited(config);
-  forward_limited.latch(0.0, 0.0, 1.5, {0.0, 0.0, 0.0, 1.0});
-  forward_limited.set_xy_target_with_max_speed(5.0, 0.0, 0.50);
-
-  EXPECT_NEAR(default_limited.xy_trajectory_duration_s(), 40.0, 1e-9);
-  EXPECT_NEAR(forward_limited.xy_trajectory_duration_s(), 20.0, 1e-9);
-  auto previous = forward_limited.current();
-  for (int i = 0; i < 2500 && !forward_limited.xy_target_reached(); ++i) {
-    const auto current = forward_limited.update(0.01);
-    EXPECT_LE(std::hypot(current.x_m - previous.x_m, current.y_m - previous.y_m) / 0.01,
-      0.50 * 1.002);
-    previous = current;
-  }
-}
-
-TEST(NavigationV2Test, ForwardPursuitSpeedCannotExceedFlightHealthLimit)
-{
-  SafetyConfig safety;
-  safety.max_flight_horizontal_speed_m_s = 0.50;
-  MissionConfig mission;
-  mission.forward_max_speed_m_s = 0.51;
-  EXPECT_THROW(Navigation(safety, mission), std::invalid_argument);
-}
-
-TEST(NavigationV2Test, CompleteMissionAlignsRightThenPursuesAfterGcsApproval)
-{
-  SafetyConfig safety;
-  safety.setpoint_warmup_s = 0.01;
-  safety.max_flight_seconds = 200.0;
-  MissionConfig mission;
-  mission.takeoff_height_m = 1.5;
-  mission.right_shift_m = 0.375;
-  mission.forward_distance_m = 0.80;
-  Navigation navigation(safety, mission);
-  auto input = base_input(0.0);
-  auto decision = navigation.update(input);
-  EXPECT_EQ(navigation.phase(), "setpoint_warmup");
-  EXPECT_FALSE(decision.control.origin);
-  EXPECT_FALSE(decision.control.mission_goal);
-  EXPECT_FALSE(has_message(decision, MessageType::ok_wait));
-  ASSERT_TRUE(decision.setpoint);
-  EXPECT_NEAR(decision.setpoint->z_m, 0.0, 1e-9);
-
-  input.now += 0.01;
-  decision = navigation.update(input);
-  EXPECT_EQ(navigation.phase(), "waiting_run_plan1");
-  EXPECT_TRUE(has_message(decision, MessageType::ok_wait));
-  ASSERT_TRUE(decision.setpoint);
-  EXPECT_NEAR(decision.setpoint->z_m, 0.0, 1e-9);
-
-  input.now += 0.20;
-  decision = navigation.update(input);
-  EXPECT_EQ(navigation.phase(), "waiting_run_plan1");
-  EXPECT_FALSE(decision.target_mode);
-  EXPECT_FALSE(decision.arm_intent);
-  ASSERT_TRUE(decision.setpoint);
-  EXPECT_NEAR(decision.setpoint->z_m, 0.0, 1e-9);
-
-  input.now += 0.01;
-  input.events = {event(MessageType::run_plan1, input.now)};
-  decision = navigation.update(input);
-  input.events.clear();
-  EXPECT_EQ(navigation.phase(), "offboard_request_pending");
-  input.controller.mode = "OFFBOARD"; input.now += 0.01;
-  navigation.update(input);
-  input.telemetry.local_x_m = 0.25;
-  input.telemetry.local_y_m = -0.10;
-  input.telemetry.local_z_m = 0.40;
-  input.controller.armed = true; input.now += 0.01;
-  decision = navigation.update(input);
-  EXPECT_EQ(navigation.phase(), "climb");
-  ASSERT_TRUE(decision.control.origin);
-  ASSERT_TRUE(decision.control.mission_goal);
-  EXPECT_NEAR(decision.control.origin->x_m, 0.25, 1e-9);
-  EXPECT_NEAR(decision.control.origin->y_m, -0.10, 1e-9);
-  EXPECT_NEAR(decision.control.origin->z_m, 0.40, 1e-9);
-  EXPECT_NEAR(decision.control.mission_goal->z_m, 1.90, 1e-9);
-  for (int i = 0; i < 800 && navigation.phase() == "climb"; ++i) {
-    input.now += 0.05;
-    follow_planner(navigation, input);
-    decision = navigation.update(input);
-  }
-  ASSERT_EQ(navigation.phase(), "height_stabilizing");
-  const double height_stabilizing_started_at = input.now;
-  for (int i = 0; i < 59; ++i) {
-    input.now += 0.05;
-    follow_planner(navigation, input);
-    decision = navigation.update(input);
-    EXPECT_EQ(navigation.phase(), "height_stabilizing");
-    EXPECT_FALSE(has_message(decision, MessageType::ok_height));
-  }
-  for (int i = 0; i < 4 && navigation.phase() == "height_stabilizing"; ++i) {
-    input.now += 0.05;
-    follow_planner(navigation, input);
-    decision = navigation.update(input);
-  }
-  EXPECT_GE(input.now - height_stabilizing_started_at, mission.height_stable_seconds);
-  ASSERT_EQ(navigation.phase(), "right_shift");
-  EXPECT_TRUE(has_message(decision, MessageType::ok_height));
-  EXPECT_NEAR(navigation.planner().target_x_m(), 0.25, 1e-9);
-  EXPECT_NEAR(navigation.planner().target_y_m(), -0.475, 1e-9);
-
-  for (int i = 0; i < 200 && navigation.phase() == "right_shift"; ++i) {
-    input.now += 0.05;
-    follow_planner(navigation, input);
-    decision = navigation.update(input);
-  }
-  ASSERT_EQ(navigation.phase(), "waiting_go_ahead");
-  const double right_shift = input.telemetry.local_y_m - (-0.10);
-  EXPECT_NEAR(input.telemetry.local_x_m, 0.25, safety.target_tolerance_m);
-  EXPECT_GE(-right_shift, 0.35);
-  EXPECT_LE(-right_shift, 0.40);
-
-  input.now += 0.01;
-  input.events = {event(MessageType::go_ahead_ok, input.now)};
-  decision = navigation.update(input);
-  input.events.clear();
-  ASSERT_EQ(navigation.phase(), "pursuing_car");
-  EXPECT_NEAR(navigation.planner().target_x_m(), 1.05, 1e-9);
-  EXPECT_NEAR(navigation.planner().target_y_m(), -0.475, 1e-9);
-  EXPECT_NEAR(navigation.planner().xy_trajectory_duration_s(),
-    2.0 * mission.forward_distance_m / mission.forward_max_speed_m_s, 1e-9);
-
-  // The first visual update takes over the bounded search using actual ENU position and yaw.
-  input.now += 0.05;
-  input.telemetry.local_x_m = 0.50;
-  input.telemetry.local_y_m = -0.475;
-  input.telemetry.local_z_m = 1.90;
-  input.events = {car_status_event(0.80, 0.15, input.now)};
-  decision = navigation.update(input);
-  input.events.clear();
-  ASSERT_EQ(navigation.phase(), "tracking_to_match");
-  EXPECT_NEAR(navigation.planner().target_x_m(), 0.50 + 0.80 * std::cos(0.15), 1e-9);
-  EXPECT_NEAR(navigation.planner().target_y_m(), -0.475 + 0.80 * std::sin(0.15), 1e-9);
-  EXPECT_NEAR(navigation.planner().target_z_m(), 1.90, 1e-9);
-  EXPECT_NEAR(navigation.planner().yaw_rad(), 0.0, 1e-9);
-
-  // A fresh 0.2 m status confirms matching and starts the measured-position release hold.
-  input.now += 0.05;
-  input.events = {car_status_event(0.20, -0.10, input.now), event(MessageType::match_car_ok, input.now)};
-  decision = navigation.update(input);
-  input.events.clear();
-  ASSERT_EQ(navigation.phase(), "match_hold");
-  EXPECT_FALSE(decision.release_gripper);
-  EXPECT_FALSE(has_message(decision, MessageType::ok_throw));
-
-  input.now += mission.match_hold_seconds - 0.01;
-  decision = navigation.update(input);
-  EXPECT_EQ(navigation.phase(), "match_hold");
-  EXPECT_FALSE(decision.release_gripper);
-  EXPECT_FALSE(has_message(decision, MessageType::ok_throw));
-
-  input.now += 0.02;
-  decision = navigation.update(input);
-  ASSERT_EQ(navigation.phase(), "throwing");
-  EXPECT_TRUE(decision.release_gripper);
-  EXPECT_FALSE(has_message(decision, MessageType::ok_throw));
-
-  input.gripper_succeeded = true;
-  input.now += 0.05;
-  decision = navigation.update(input);
-  ASSERT_EQ(navigation.phase(), "accompanying_car");
-  EXPECT_TRUE(has_message(decision, MessageType::ok_throw));
-
-  input.gripper_succeeded = false;
-  input.now += 0.05;
-  input.telemetry.local_x_m = 0.60;
-  input.events = {car_status_event(0.30, 0.20, input.now)};
-  decision = navigation.update(input);
-  input.events.clear();
-  EXPECT_EQ(navigation.phase(), "accompanying_car");
-  EXPECT_NEAR(navigation.planner().target_x_m(), 0.60 + 0.30 * std::cos(0.20), 1e-9);
-  EXPECT_NEAR(navigation.planner().target_y_m(), -0.475 + 0.30 * std::sin(0.20), 1e-9);
-
-  // A sudden EKF local-Z drop from target-intercepted range is offset by one 11 cm step.
-  input.now += 0.05;
-  input.telemetry.local_z_m = 1.79;
-  decision = navigation.update(input);
-  EXPECT_EQ(navigation.phase(), "accompanying_car");
-  EXPECT_NEAR(decision.control.accompanying_z_offset_m, -0.11, 1e-9);
-  EXPECT_NEAR(navigation.planner().target_z_m(), 1.79, 1e-9);
-
-  // A reverse local-Z jump removes the temporary offset rather than accumulating an error.
-  input.now += 0.05;
-  input.telemetry.local_z_m = 1.90;
-  decision = navigation.update(input);
-  EXPECT_NEAR(decision.control.accompanying_z_offset_m, 0.0, 1e-9);
-  EXPECT_NEAR(navigation.planner().target_z_m(), 1.90, 1e-9);
-
-  input.events = {event(MessageType::b_ok, input.now)};
-  decision = navigation.update(input);
-  input.events.clear();
-  EXPECT_EQ(navigation.phase(), "returning");
-  EXPECT_TRUE(has_message(decision, MessageType::ok_return));
-  ASSERT_TRUE(decision.control.origin);
-  ASSERT_TRUE(decision.control.mission_goal);
-  EXPECT_NEAR(decision.control.mission_goal->x_m, decision.control.origin->x_m, 1e-9);
-  EXPECT_NEAR(decision.control.mission_goal->y_m, decision.control.origin->y_m, 1e-9);
-  EXPECT_NEAR(decision.control.mission_goal->z_m, decision.control.origin->z_m + mission.takeoff_height_m, 1e-9);
-
-  for (int i = 0; i < 800 && navigation.phase() == "returning"; ++i) {
-    input.now += 0.05;
-    follow_planner(navigation, input);
-    decision = navigation.update(input);
-  }
-  ASSERT_EQ(navigation.phase(), "downing");
-  EXPECT_TRUE(has_message(decision, MessageType::ok_downing));
-  for (int i = 0; i < 800 && navigation.phase() == "downing"; ++i) {
-    input.now += 0.05;
-    follow_planner(navigation, input);
-    decision = navigation.update(input);
-  }
-  ASSERT_EQ(navigation.phase(), "disarming");
-  input.controller.armed = false; input.now += 0.05;
-  navigation.update(input);
-  ASSERT_EQ(navigation.phase(), "manual_request_pending");
-  input.controller.mode = "MANUAL"; input.now += 0.05;
-  decision = navigation.update(input);
-  EXPECT_EQ(navigation.phase(), "manual");
-  EXPECT_TRUE(has_message(decision, MessageType::ok_down));
-}
-
-TEST(NavigationV2Test, PreflightLossBeforeArmForcesManualAndDisarm)
-{
-  SafetyConfig safety;
-  safety.setpoint_warmup_s = 0.01;
-  Navigation navigation(safety);
-  auto input = base_input(0.0);
-  navigation.update(input);
-  ASSERT_EQ(navigation.phase(), "setpoint_warmup");
-  input.now = 0.01;
-  navigation.update(input);
-  ASSERT_EQ(navigation.phase(), "waiting_run_plan1");
-
-  input.now = 0.02;
-  input.events = {event(MessageType::run_plan1, input.now)};
-  navigation.update(input);
-  input.events.clear();
-  ASSERT_EQ(navigation.phase(), "offboard_request_pending");
-
-  input.controller.mode = "OFFBOARD";
-  input.now = 0.04;
-  navigation.update(input);
-  ASSERT_EQ(navigation.phase(), "arming_request_pending");
-
-  // 模拟尚未解锁时预检丢失；仍应执行既有的地面安全回退。
-  input.controller.mode = "OFFBOARD";
-  input.controller.armed = false;
-  input.preflight_ready = false;
-  input.now = 0.05;
-  const auto decision = navigation.update(input);
-  EXPECT_EQ(navigation.phase(), "manual_request_pending");
-  ASSERT_TRUE(decision.target_mode);
-  EXPECT_EQ(*decision.target_mode, "MANUAL");
-  ASSERT_TRUE(decision.arm_intent);
-  EXPECT_FALSE(*decision.arm_intent);
-  EXPECT_FALSE(decision.setpoint);
-  EXPECT_FALSE(decision.control.origin);
-  EXPECT_TRUE(std::find(decision.rejections.begin(), decision.rejections.end(),
-    "preflight_lost_before_arm") != decision.rejections.end());
-
-  input.controller.mode = "MANUAL";
-  input.controller.armed = false;
-  input.now = 0.10;
-  navigation.update(input);
-  EXPECT_EQ(navigation.phase(), "manual");
-}
-
-TEST(NavigationV2Test, ArmedConfirmationIgnoresGroundPreflightAndStartsClimb)
-{
-  SafetyConfig safety;
-  safety.setpoint_warmup_s = 0.01;
-  MissionConfig mission;
-  mission.takeoff_height_m = 1.5;
-  Navigation navigation(safety, mission);
-  auto input = base_input(0.0);
-  navigation.update(input);
-  input.now = 0.01;
-  navigation.update(input);
-  input.now = 0.02;
-  input.events = {event(MessageType::run_plan1, input.now)};
-  navigation.update(input);
-  input.events.clear();
-  input.controller.mode = "OFFBOARD";
-  input.now = 0.03;
-  navigation.update(input);
-  ASSERT_EQ(navigation.phase(), "arming_request_pending");
-
-  input.controller.armed = true;
-  input.preflight_ready = false;
-  input.now = 0.04;
-  const auto decision = navigation.update(input);
-  EXPECT_EQ(navigation.phase(), "climb");
-  ASSERT_TRUE(decision.target_mode);
-  EXPECT_EQ(*decision.target_mode, "OFFBOARD");
-  ASSERT_TRUE(decision.arm_intent);
-  EXPECT_TRUE(*decision.arm_intent);
-  ASSERT_TRUE(decision.control.origin);
-  ASSERT_TRUE(decision.control.mission_goal);
-  EXPECT_NEAR(decision.control.origin->x_m, 0.0, 1e-9);
-  EXPECT_NEAR(decision.control.origin->y_m, 0.0, 1e-9);
-  EXPECT_NEAR(decision.control.origin->z_m, 0.0, 1e-9);
-  EXPECT_NEAR(decision.control.mission_goal->z_m, mission.takeoff_height_m, 1e-9);
-  EXPECT_FALSE(std::find(decision.rejections.begin(), decision.rejections.end(),
-    "preflight_lost_before_arm") != decision.rejections.end());
-}
-
-TEST(NavigationV2Test, FlightHealthFailureAfterArmRequestsAutoLand)
-{
-  SafetyConfig safety;
-  safety.setpoint_warmup_s = 0.01;
-  Navigation navigation(safety);
-  auto input = base_input(0.0);
-  navigation.update(input);
-  input.now = 0.01;
-  navigation.update(input);
-  input.now = 0.02;
-  input.events = {event(MessageType::run_plan1, input.now)};
-  navigation.update(input);
-  input.events.clear();
-  input.controller.mode = "OFFBOARD";
-  input.now = 0.03;
-  navigation.update(input);
-  ASSERT_EQ(navigation.phase(), "arming_request_pending");
-
-  input.controller.armed = true;
-  input.flight_healthy = false;
-  input.health_errors = {"range data stale"};
-  input.now = 0.04;
-  const auto decision = navigation.update(input);
-  EXPECT_EQ(navigation.phase(), "landing");
-  ASSERT_TRUE(decision.target_mode);
-  EXPECT_EQ(*decision.target_mode, "AUTO.LAND");
-  ASSERT_TRUE(decision.arm_intent);
-  EXPECT_TRUE(*decision.arm_intent);
-  EXPECT_FALSE(decision.control.origin);
-  EXPECT_FALSE(std::find(decision.rejections.begin(), decision.rejections.end(),
-    "preflight_lost_before_arm") != decision.rejections.end());
-}
-
-TEST(NavigationV2Test, OffboardLossAfterArmRequestsAutoLand)
-{
-  SafetyConfig safety;
-  safety.setpoint_warmup_s = 0.01;
-  Navigation navigation(safety);
-  auto input = base_input(0.0);
-  navigation.update(input);
-  input.now = 0.01;
-  navigation.update(input);
-  input.now = 0.02;
-  input.events = {event(MessageType::run_plan1, input.now)};
-  navigation.update(input);
-  input.events.clear();
-  input.controller.mode = "OFFBOARD";
-  input.now = 0.03;
-  navigation.update(input);
-  ASSERT_EQ(navigation.phase(), "arming_request_pending");
-
-  input.controller.armed = true;
-  input.controller.mode = "POSCTL";
-  input.now = 0.04;
-  const auto decision = navigation.update(input);
-  EXPECT_EQ(navigation.phase(), "landing");
-  ASSERT_TRUE(decision.target_mode);
-  EXPECT_EQ(*decision.target_mode, "AUTO.LAND");
-  ASSERT_TRUE(decision.arm_intent);
-  EXPECT_TRUE(*decision.arm_intent);
-  EXPECT_FALSE(decision.control.origin);
-}
-
-TEST(NavigationV2Test, FlightTimeoutUsesConfiguredThresholdAndExistingAutoLandPath)
-{
-  for (const double max_flight_seconds : {0.10, 0.20}) {
-    SafetyConfig safety;
-    safety.setpoint_warmup_s = 0.01;
-    safety.max_flight_seconds = max_flight_seconds;
-    Navigation navigation(safety);
-    auto input = base_input(0.0);
-    navigation.update(input);
-    input.now = 0.01;
-    navigation.update(input);
-    input.now = 0.02;
-    input.events = {event(MessageType::run_plan1, input.now)};
-    navigation.update(input);
-    input.events.clear();
-    input.controller.mode = "OFFBOARD";
-    input.now = 0.03;
-    navigation.update(input);
-    ASSERT_EQ(navigation.phase(), "arming_request_pending");
-
-    input.controller.armed = true;
-    input.now = 0.04;
-    navigation.update(input);
-    ASSERT_EQ(navigation.phase(), "climb");
-    input.now += max_flight_seconds - 0.01;
-    navigation.update(input);
-    EXPECT_EQ(navigation.phase(), "climb");
-    input.now += 0.02;
-    const auto decision = navigation.update(input);
-    EXPECT_EQ(navigation.phase(), "landing");
-    ASSERT_TRUE(decision.target_mode);
-    EXPECT_EQ(*decision.target_mode, "AUTO.LAND");
-  }
-}
-
-TEST(NavigationV2Test, LcpLossDuringClimbDoesNotInterruptClimb)
-{
-  SafetyConfig safety;
-  safety.setpoint_warmup_s = 0.01;
-  safety.max_z_setpoint_rate_m_s = 0.20;
-  safety.max_z_setpoint_accel_m_s2 = 0.40;
-  MissionConfig mission;
-  mission.takeoff_height_m = 1.5;
-  Navigation navigation(safety, mission);
-  auto input = base_input(0.0);
-
-  navigation.update(input);
-  input.now = 0.01;
-  navigation.update(input);
-  input.now = 0.02;
-  input.events = {event(MessageType::run_plan1, input.now)};
-  navigation.update(input);
-  input.events.clear();
-  input.controller.mode = "OFFBOARD";
-  input.now = 0.03;
-  navigation.update(input);
-  input.controller.armed = true;
-  input.now = 0.04;
-  navigation.update(input);
-  ASSERT_EQ(navigation.phase(), "climb");
-  ASSERT_NEAR(navigation.planner().target_z_m(), mission.takeoff_height_m, 1e-9);
-  ASSERT_TRUE(navigation.control_state().mission_goal);
-  const auto climb_goal = *navigation.control_state().mission_goal;
-  ASSERT_TRUE(navigation.control_state().commanded_setpoint);
-  const double command_before_lcp_loss = navigation.control_state().commanded_setpoint->z_m;
-
-  input.now = 0.09;
-  follow_planner(navigation, input);
-  input.lcp_healthy = false;
-  const auto decision = navigation.update(input);
-  EXPECT_EQ(navigation.phase(), "climb");
-  EXPECT_NEAR(navigation.planner().target_z_m(), mission.takeoff_height_m, 1e-9);
-  EXPECT_FALSE(navigation.planner().target_reached());
-  ASSERT_TRUE(decision.control.mission_goal);
-  ASSERT_TRUE(decision.control.commanded_setpoint);
-  EXPECT_FALSE(decision.control.hold_setpoint);
-  EXPECT_FALSE(decision.control.mission_paused);
-  EXPECT_NEAR(decision.control.mission_goal->z_m, climb_goal.z_m, 1e-9);
-  EXPECT_GT(decision.control.commanded_setpoint->z_m, command_before_lcp_loss);
-}
-
-TEST(NavigationV2Test, LcpLossAfterClimbHoldsMeasuredPositionUntilRecovery)
-{
-  SafetyConfig safety;
-  safety.setpoint_warmup_s = 0.01;
-  safety.max_z_setpoint_rate_m_s = 1.0;
-  safety.max_z_setpoint_accel_m_s2 = 1.5;
-  MissionConfig mission;
-  mission.takeoff_height_m = 0.20;
-  mission.height_stable_seconds = 0.01;
-  Navigation navigation(safety, mission);
-  auto input = base_input(0.0);
-
-  navigation.update(input);
-  input.now = 0.01;
-  navigation.update(input);
-  input.now = 0.02;
-  input.events = {event(MessageType::run_plan1, input.now)};
-  navigation.update(input);
-  input.events.clear();
-  input.controller.mode = "OFFBOARD";
-  input.now = 0.03;
-  navigation.update(input);
-  input.controller.armed = true;
-  input.now = 0.04;
-  navigation.update(input);
-  for (int i = 0; i < 200 && navigation.phase() != "waiting_go_ahead"; ++i) {
-    input.now += 0.05;
-    follow_planner(navigation, input);
-    navigation.update(input);
-  }
-  ASSERT_EQ(navigation.phase(), "waiting_go_ahead");
-
-  input.now += 0.01;
-  input.events = {event(MessageType::go_ahead_ok, input.now)};
-  navigation.update(input);
-  input.events.clear();
-  ASSERT_EQ(navigation.phase(), "pursuing_car");
-  ASSERT_NEAR(navigation.planner().target_x_m(), mission.forward_distance_m, 1e-9);
-  ASSERT_NEAR(navigation.planner().target_y_m(), -mission.right_shift_m, 1e-9);
-  ASSERT_TRUE(navigation.control_state().mission_goal);
-  const auto mission_before_hold = *navigation.control_state().mission_goal;
-
-  input.now += 0.05;
-  input.telemetry.local_x_m = 0.25;
-  input.telemetry.local_y_m = -0.10;
-  input.telemetry.local_z_m = 0.15;
-  input.lcp_healthy = false;
-  auto decision = navigation.update(input);
-  ASSERT_EQ(navigation.phase(), "lcp_hold");
-  ASSERT_TRUE(decision.setpoint);
-  EXPECT_NEAR(decision.setpoint->x_m, 0.25, 1e-9);
-  EXPECT_NEAR(decision.setpoint->y_m, -0.10, 1e-9);
-  EXPECT_NEAR(decision.setpoint->z_m, 0.15, 1e-9);
-  ASSERT_TRUE(decision.control.hold_setpoint);
-  ASSERT_TRUE(decision.control.mission_goal);
-  EXPECT_TRUE(decision.control.mission_paused);
-  EXPECT_EQ(decision.control.hold_reason, "lcp_unhealthy");
-  EXPECT_NEAR(decision.control.hold_setpoint->x_m, 0.25, 1e-9);
-  EXPECT_NEAR(decision.control.hold_setpoint->y_m, -0.10, 1e-9);
-  EXPECT_NEAR(decision.control.hold_setpoint->z_m, 0.15, 1e-9);
-  EXPECT_NEAR(decision.control.mission_goal->x_m, mission_before_hold.x_m, 1e-9);
-  EXPECT_NEAR(decision.control.mission_goal->y_m, mission_before_hold.y_m, 1e-9);
-  EXPECT_NEAR(decision.control.mission_goal->z_m, mission_before_hold.z_m, 1e-9);
-
-  input.now += 1.0;
-  decision = navigation.update(input);
-  EXPECT_EQ(navigation.phase(), "lcp_hold");
-  ASSERT_TRUE(decision.setpoint);
-  EXPECT_NEAR(decision.setpoint->x_m, 0.25, 1e-9);
-  EXPECT_NEAR(decision.setpoint->y_m, -0.10, 1e-9);
-  EXPECT_NEAR(decision.setpoint->z_m, 0.15, 1e-9);
-
-  input.now += 0.05;
-  input.lcp_healthy = true;
-  navigation.update(input);
-  EXPECT_EQ(navigation.phase(), "pursuing_car");
-  EXPECT_NEAR(navigation.planner().target_x_m(), mission.forward_distance_m, 1e-9);
-  EXPECT_NEAR(navigation.planner().target_y_m(), -mission.right_shift_m, 1e-9);
-  EXPECT_NEAR(navigation.planner().target_z_m(), mission.takeoff_height_m, 1e-9);
-  EXPECT_FALSE(navigation.planner().target_reached());
-  ASSERT_TRUE(navigation.control_state().mission_goal);
-  EXPECT_NEAR(navigation.control_state().mission_goal->x_m, mission_before_hold.x_m, 1e-9);
-  EXPECT_FALSE(navigation.control_state().mission_paused);
-}
-
-TEST(NavigationV2Test, HeightStabilizationRestartsAfterLcpRecovery)
-{
-  SafetyConfig safety;
-  safety.setpoint_warmup_s = 0.01;
-  safety.max_z_setpoint_rate_m_s = 1.0;
-  safety.max_z_setpoint_accel_m_s2 = 1.5;
-  MissionConfig mission;
-  mission.takeoff_height_m = 0.20;
-  mission.height_stable_seconds = 3.0;
-  Navigation navigation(safety, mission);
-  auto input = base_input(0.0);
-
-  navigation.update(input);
-  input.now = 0.01;
-  navigation.update(input);
-  input.now = 0.02;
-  input.events = {event(MessageType::run_plan1, input.now)};
-  navigation.update(input);
-  input.events.clear();
-  input.controller.mode = "OFFBOARD";
-  input.now = 0.03;
-  navigation.update(input);
-  input.controller.armed = true;
-  input.now = 0.04;
-  navigation.update(input);
-  for (int i = 0; i < 100 && navigation.phase() != "height_stabilizing"; ++i) {
-    input.now += 0.05;
-    follow_planner(navigation, input);
-    navigation.update(input);
-  }
-  ASSERT_EQ(navigation.phase(), "height_stabilizing");
-
-  input.now += 0.05;
-  follow_planner(navigation, input);
-  input.lcp_healthy = false;
-  navigation.update(input);
-  ASSERT_EQ(navigation.phase(), "lcp_hold");
-
-  input.now += 0.05;
-  follow_planner(navigation, input);
-  input.lcp_healthy = true;
-  navigation.update(input);
-  ASSERT_EQ(navigation.phase(), "height_stabilizing");
-  const double lcp_recovered_at = input.now;
-  for (int i = 0; i < 59; ++i) {
-    input.now += 0.05;
-    follow_planner(navigation, input);
-    const auto decision = navigation.update(input);
-    EXPECT_EQ(navigation.phase(), "height_stabilizing");
-    EXPECT_FALSE(has_message(decision, MessageType::ok_height));
-  }
-  for (int i = 0; i < 2 && navigation.phase() == "height_stabilizing"; ++i) {
-    input.now += 0.05;
-    follow_planner(navigation, input);
-    navigation.update(input);
-  }
-  EXPECT_GE(input.now - lcp_recovered_at, mission.height_stable_seconds);
-  EXPECT_EQ(navigation.phase(), "right_shift");
-}
-
-TEST(NavigationV2Test, MatchRequiresFreshVisualMeasurementAndReleasesAfterHold)
-{
-  SafetyConfig safety;
-  safety.setpoint_warmup_s = 0.01;
-  safety.max_z_setpoint_rate_m_s = 1.0;
-  safety.max_z_setpoint_accel_m_s2 = 1.5;
-  MissionConfig mission;
-  mission.takeoff_height_m = 0.20;
-  mission.height_stable_seconds = 0.01;
-  Navigation navigation(safety, mission);
-  auto input = base_input(0.0);
-  navigation.update(input);
-  input.now = 0.01; navigation.update(input);
-  input.events = {event(MessageType::run_plan1, 0.02)}; input.now = 0.02; navigation.update(input);
-  input.events.clear(); input.controller.mode = "OFFBOARD"; input.now = 0.03; navigation.update(input);
-  input.controller.armed = true; input.now = 0.04; navigation.update(input);
-  for (int i = 0; i < 200 && navigation.phase() != "waiting_go_ahead"; ++i) {
-    input.now += 0.05; follow_planner(navigation, input); navigation.update(input);
-  }
-  ASSERT_EQ(navigation.phase(), "waiting_go_ahead");
-
-  input.now += 0.01;
-  input.events = {event(MessageType::match_car_ok, input.now)};
-  auto decision = navigation.update(input);
-  EXPECT_EQ(navigation.phase(), "waiting_go_ahead");
-  EXPECT_TRUE(std::find(decision.rejections.begin(), decision.rejections.end(),
-    "match_car_ok_not_allowed_in_phase") != decision.rejections.end());
-
-  input.now += 0.01;
-  input.events = {event(MessageType::go_ahead_ok, input.now)};
-  navigation.update(input);
-  ASSERT_EQ(navigation.phase(), "pursuing_car");
-  input.now += 0.01;
-  input.events = {event(MessageType::match_car_ok, input.now)};
-  decision = navigation.update(input);
-  EXPECT_EQ(navigation.phase(), "pursuing_car");
-  EXPECT_TRUE(std::find(decision.rejections.begin(), decision.rejections.end(),
-    "match_car_ok_not_allowed_in_phase") != decision.rejections.end());
-
-  input.now += 0.01;
-  input.events = {car_status_event(0.21, 0.0, input.now)};
-  navigation.update(input);
-  ASSERT_EQ(navigation.phase(), "tracking_to_match");
-  input.now += 0.01;
-  input.events = {event(MessageType::match_car_ok, input.now)};
-  decision = navigation.update(input);
-  EXPECT_EQ(navigation.phase(), "tracking_to_match");
-  EXPECT_TRUE(std::find(decision.rejections.begin(), decision.rejections.end(),
-    "match_car_ok_distance_above_tracking_tolerance") != decision.rejections.end());
-
-  input.now += 0.01;
-  input.events = {car_status_event(0.20, 0.0, input.now), event(MessageType::match_car_ok, input.now)};
-  decision = navigation.update(input);
-  input.events.clear();
-  EXPECT_EQ(navigation.phase(), "match_hold");
-  EXPECT_FALSE(decision.release_gripper);
-  EXPECT_FALSE(has_message(decision, MessageType::ok_throw));
-
-  input.now += mission.match_hold_seconds + 0.01;
-  decision = navigation.update(input);
-  ASSERT_EQ(navigation.phase(), "throwing");
-  EXPECT_TRUE(decision.release_gripper);
-
-  input.gripper_succeeded = true;
-  input.now += 0.01;
-  decision = navigation.update(input);
-  ASSERT_EQ(navigation.phase(), "accompanying_car");
-  EXPECT_TRUE(has_message(decision, MessageType::ok_throw));
-
-  input.gripper_succeeded = false;
-  input.events = {event(MessageType::b_ok, input.now)};
-  decision = navigation.update(input);
-  EXPECT_EQ(navigation.phase(), "returning");
-  EXPECT_TRUE(has_message(decision, MessageType::ok_return));
-}
-
-TEST(NavigationV2Test, VisualTimeoutHoldsMeasuredPositionAndFreshStatusRestoresTracking)
-{
-  SafetyConfig safety;
-  safety.setpoint_warmup_s = 0.01;
-  safety.max_z_setpoint_rate_m_s = 1.0;
-  safety.max_z_setpoint_accel_m_s2 = 1.5;
-  MissionConfig mission;
-  mission.takeoff_height_m = 0.20;
-  mission.height_stable_seconds = 0.01;
-  Navigation navigation(safety, mission);
-  auto input = base_input(0.0);
-  navigation.update(input);
-  input.now = 0.01; navigation.update(input);
-  input.events = {event(MessageType::run_plan1, 0.02)}; input.now = 0.02; navigation.update(input);
-  input.events.clear(); input.controller.mode = "OFFBOARD"; input.now = 0.03; navigation.update(input);
-  input.controller.armed = true; input.now = 0.04; navigation.update(input);
-  for (int i = 0; i < 200 && navigation.phase() != "waiting_go_ahead"; ++i) {
-    input.now += 0.05; follow_planner(navigation, input); navigation.update(input);
-  }
-  ASSERT_EQ(navigation.phase(), "waiting_go_ahead");
-
-  input.now += 0.01;
-  input.events = {event(MessageType::go_ahead_ok, input.now)};
-  navigation.update(input);
-  input.now += 0.01;
-  input.telemetry.local_x_m = 0.40;
-  input.telemetry.local_y_m = -mission.right_shift_m;
-  const double current_yaw = std::acos(-1.0) / 2.0;
-  input.telemetry.orientation = {0.0, 0.0, std::sin(current_yaw / 2.0), std::cos(current_yaw / 2.0)};
-  input.events = {car_status_event(0.50, 0.0, input.now)};
-  navigation.update(input);
-  input.events.clear();
-  ASSERT_EQ(navigation.phase(), "tracking_to_match");
-  EXPECT_NEAR(navigation.planner().target_x_m(), 0.40, 1e-9);
-  EXPECT_NEAR(navigation.planner().target_y_m(), -mission.right_shift_m + 0.50, 1e-9);
-  EXPECT_NEAR(navigation.planner().yaw_rad(), current_yaw, 1e-9);
-
-  input.now += 0.01;
-  input.telemetry.local_y_m = 0.0;
-  input.events = {car_status_event(5.0, 0.0, input.now)};
-  auto decision = navigation.update(input);
-  input.events.clear();
-  EXPECT_EQ(navigation.phase(), "tracking_to_match");
-  EXPECT_TRUE(std::find(decision.rejections.begin(), decision.rejections.end(),
-    "car_status_target_outside_tracking_radius") != decision.rejections.end());
-
-  input.now += mission.car_status_timeout_s + 0.01;
-  input.telemetry.local_x_m = 0.45;
-  input.telemetry.local_y_m = -0.30;
-  decision = navigation.update(input);
-  ASSERT_EQ(navigation.phase(), "tracking_timeout_hold");
-  ASSERT_TRUE(decision.control.hold_setpoint);
-  EXPECT_NEAR(decision.control.hold_setpoint->x_m, 0.45, 1e-9);
-  EXPECT_NEAR(decision.control.hold_setpoint->y_m, -0.30, 1e-9);
-
-  input.now += 0.01;
-  input.events = {car_status_event(0.40, 0.5, input.now)};
-  decision = navigation.update(input);
-  input.events.clear();
-  EXPECT_EQ(navigation.phase(), "tracking_to_match");
-  EXPECT_FALSE(decision.control.mission_paused);
-  EXPECT_NEAR(navigation.planner().target_x_m(),
-    0.45 + 0.40 * std::cos(current_yaw + 0.5), 1e-9);
-  EXPECT_NEAR(navigation.planner().target_y_m(),
-    -0.30 + 0.40 * std::sin(current_yaw + 0.5), 1e-9);
-  EXPECT_NEAR(navigation.planner().yaw_rad(), current_yaw, 1e-9);
-}
-
-TEST(NavigationV3Test, ControlJsonMatchesPublishedEnuPositionTarget)
-{
-  SafetyConfig safety;
-  Navigation navigation(safety);
-  auto input = base_input(0.0);
-  input.telemetry.local_x_m = 1.25;
-  input.telemetry.local_y_m = -2.50;
-  input.telemetry.local_z_m = 0.75;
-  const auto decision = navigation.update(input);
-  ASSERT_TRUE(decision.setpoint);
-
-  Json::CharReaderBuilder reader;
-  Json::Value root;
-  std::string errors;
-  std::istringstream encoded(control_json(decision.control));
-  ASSERT_TRUE(Json::parseFromStream(reader, encoded, &root, &errors));
-  EXPECT_TRUE(root["origin"].isNull());
-  EXPECT_TRUE(root["mission_goal"].isNull());
-  EXPECT_TRUE(root["hold_setpoint"].isNull());
-  EXPECT_EQ(root["hold_reason"].asString(), "");
-  EXPECT_FALSE(root["mission_paused"].asBool());
-  ASSERT_TRUE(root["commanded_setpoint"].isObject());
-
-  builtin_interfaces::msg::Time stamp;
-  const auto target = mavros_xyz_position_offboard::offboard::Offboard::make_position_target(
-    *decision.setpoint, stamp);
-  EXPECT_DOUBLE_EQ(root["commanded_setpoint"]["x_m"].asDouble(), target.position.x);
-  EXPECT_DOUBLE_EQ(root["commanded_setpoint"]["y_m"].asDouble(), target.position.y);
-  EXPECT_DOUBLE_EQ(root["commanded_setpoint"]["z_m"].asDouble(), target.position.z);
-  EXPECT_DOUBLE_EQ(root["commanded_setpoint"]["yaw_rad"].asDouble(), target.yaw);
-}
-
 struct PwmCommand
 {
-  int handle;
-  int bcm_gpio;
-  double frequency_hz;
-  double duty_cycle;
+  int handle{0};
+  int bcm_gpio{0};
+  double frequency_hz{0.0};
+  double duty_cycle{0.0};
 };
 
 class FakePwmGpioBackend final : public mavros_xyz_position_offboard::gripper::PwmGpioBackend
@@ -1475,37 +590,101 @@ TEST(ApplicationNodeSafetyParameterTest, CliDefaultsRemainWhenNoSafetyOverrideIs
   EXPECT_FALSE(node->has_parameter("safety.hold_seconds"));
 }
 
-TEST(ApplicationNodeSafetyParameterTest, YamlParametersOverrideCliDefaultsAtStartup)
+TEST(ApplicationNodeMissionParameterTest, CarTrackingLimitsInheritEffectiveSafetyDefaults)
 {
   SafetyConfig cli_config;
-  cli_config.max_flight_seconds = 72.0;
   cli_config.target_xy_max_speed_m_s = 0.70;
-  rclcpp::NodeOptions options;
-  options.use_global_arguments(false);
-  options.arguments({
-    "--ros-args", "--params-file",
-    std::string(MAVROS_XYZ_SOURCE_DIR) + "/config/udp_ground_station.yaml"});
-  options.append_parameter_override("udp.enabled", false);
-  options.append_parameter_override("gripper_pwm.enabled", false);
-  const auto node = std::make_shared<ApplicationNode>(application_test_options(), cli_config, options);
+  cli_config.target_xy_max_accel_m_s2 = 1.30;
+  const auto node = std::make_shared<ApplicationNode>(
+    application_test_options(), cli_config, application_test_node_options());
 
-  EXPECT_DOUBLE_EQ(node->safety_config().max_flight_seconds, 120.0);
-  EXPECT_DOUBLE_EQ(node->safety_config().target_xy_max_speed_m_s, 0.25);
-  EXPECT_DOUBLE_EQ(node->get_parameter("udp.max_tracking_distance_m").as_double(), 5.0);
-  EXPECT_DOUBLE_EQ(node->get_parameter("mission.forward_max_speed_m_s").as_double(), 0.50);
-  EXPECT_DOUBLE_EQ(node->get_parameter("mission.tracking_arrival_seconds").as_double(), 1.0);
-  EXPECT_DOUBLE_EQ(node->get_parameter("mission.tracking_tolerance_m").as_double(), 0.2);
-  EXPECT_DOUBLE_EQ(node->get_parameter("mission.match_hold_seconds").as_double(), 0.5);
-  EXPECT_DOUBLE_EQ(node->get_parameter("mission.car_status_timeout_s").as_double(), 2.0);
-  EXPECT_DOUBLE_EQ(node->get_parameter("mission.max_tracking_radius_m").as_double(), 5.0);
-  EXPECT_DOUBLE_EQ(node->get_parameter("mission.accompanying_z_jump_threshold_m").as_double(), 0.10);
-  EXPECT_DOUBLE_EQ(node->get_parameter("mission.accompanying_z_step_m").as_double(), 0.11);
-  EXPECT_DOUBLE_EQ(node->get_parameter("mission.accompanying_z_jump_window_s").as_double(), 0.10);
-  EXPECT_EQ(node->get_parameter("gripper_pwm.bcm_gpio").as_int(), 18);
-  EXPECT_DOUBLE_EQ(node->get_parameter("gripper_pwm.pwm_frequency_hz").as_double(), 50.0);
-  EXPECT_DOUBLE_EQ(node->get_parameter("gripper_pwm.closed_duty_cycle").as_double(), 4.0);
-  EXPECT_DOUBLE_EQ(node->get_parameter("gripper_pwm.open_duty_cycle").as_double(), 7.0);
-  EXPECT_EQ(node->get_parameter("gripper_pwm.open_hold_ms").as_int(), 500);
+  EXPECT_DOUBLE_EQ(node->get_parameter("mission.car_tracking_max_speed_m_s").as_double(), 0.70);
+  EXPECT_DOUBLE_EQ(node->get_parameter("mission.car_tracking_max_accel_m_s2").as_double(), 1.30);
+  EXPECT_DOUBLE_EQ(node->get_parameter("mission.return_max_speed_m_s").as_double(), 0.70);
+  EXPECT_DOUBLE_EQ(node->get_parameter("mission.return_max_accel_m_s2").as_double(), 1.30);
+}
+
+TEST(ApplicationNodeMissionParameterTest, DowningLimitsUseIndependentDefaultsAndOverrides)
+{
+  const auto defaults = std::make_shared<ApplicationNode>(
+    application_test_options(), SafetyConfig{}, application_test_node_options());
+  EXPECT_DOUBLE_EQ(defaults->get_parameter("mission.downing_max_speed_m_s").as_double(), 0.30);
+  EXPECT_DOUBLE_EQ(defaults->get_parameter("mission.downing_max_accel_m_s2").as_double(), 0.30);
+
+  const auto overridden = std::make_shared<ApplicationNode>(
+    application_test_options(), SafetyConfig{}, application_test_node_options({
+      rclcpp::Parameter("mission.downing_max_speed_m_s", 0.22),
+      rclcpp::Parameter("mission.downing_max_accel_m_s2", 0.27)}));
+  EXPECT_DOUBLE_EQ(overridden->get_parameter("mission.downing_max_speed_m_s").as_double(), 0.22);
+  EXPECT_DOUBLE_EQ(overridden->get_parameter("mission.downing_max_accel_m_s2").as_double(), 0.27);
+}
+
+TEST(ApplicationNodeMissionParameterTest, TrackingZCompensationDefaultsAndOverrides)
+{
+  const auto defaults = std::make_shared<ApplicationNode>(
+    application_test_options(), SafetyConfig{}, application_test_node_options());
+  EXPECT_DOUBLE_EQ(defaults->get_parameter("mission.tracking_z_jump_threshold_m").as_double(), 0.10);
+  EXPECT_DOUBLE_EQ(defaults->get_parameter("mission.tracking_z_step_m").as_double(), 0.11);
+  EXPECT_DOUBLE_EQ(defaults->get_parameter("mission.tracking_z_jump_window_s").as_double(), 0.10);
+
+  const auto overridden = std::make_shared<ApplicationNode>(
+    application_test_options(), SafetyConfig{}, application_test_node_options({
+      rclcpp::Parameter("mission.tracking_z_jump_threshold_m", 0.07),
+      rclcpp::Parameter("mission.tracking_z_step_m", 0.13),
+      rclcpp::Parameter("mission.tracking_z_jump_window_s", 0.08)}));
+  EXPECT_DOUBLE_EQ(
+    overridden->get_parameter("mission.tracking_z_jump_threshold_m").as_double(), 0.07);
+  EXPECT_DOUBLE_EQ(overridden->get_parameter("mission.tracking_z_step_m").as_double(), 0.13);
+  EXPECT_DOUBLE_EQ(overridden->get_parameter("mission.tracking_z_jump_window_s").as_double(), 0.08);
+}
+
+TEST(ApplicationNodeMissionParameterTest, InvalidMissionTimingAndReturnLimitsAreRejectedAtStartup)
+{
+  for (const double value : {
+      0.0, -1.0, std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()}) {
+    EXPECT_THROW(
+      std::make_shared<ApplicationNode>(
+        application_test_options(), SafetyConfig{}, application_test_node_options({
+          rclcpp::Parameter("mission.return_max_speed_m_s", value)})),
+      std::invalid_argument);
+    EXPECT_THROW(
+      std::make_shared<ApplicationNode>(
+        application_test_options(), SafetyConfig{}, application_test_node_options({
+          rclcpp::Parameter("mission.return_max_accel_m_s2", value)})),
+      std::invalid_argument);
+    EXPECT_THROW(
+      std::make_shared<ApplicationNode>(
+        application_test_options(), SafetyConfig{}, application_test_node_options({
+          rclcpp::Parameter("mission.downing_max_speed_m_s", value)})),
+      std::invalid_argument);
+    EXPECT_THROW(
+      std::make_shared<ApplicationNode>(
+        application_test_options(), SafetyConfig{}, application_test_node_options({
+          rclcpp::Parameter("mission.downing_max_accel_m_s2", value)})),
+      std::invalid_argument);
+
+    EXPECT_THROW(
+      std::make_shared<ApplicationNode>(
+        application_test_options(), SafetyConfig{}, application_test_node_options({
+          rclcpp::Parameter("mission.target_lock_follow_seconds", value)})),
+      std::invalid_argument);
+    EXPECT_THROW(
+      std::make_shared<ApplicationNode>(
+        application_test_options(), SafetyConfig{}, application_test_node_options({
+          rclcpp::Parameter("mission.tracking_z_jump_threshold_m", value)})),
+      std::invalid_argument);
+    EXPECT_THROW(
+      std::make_shared<ApplicationNode>(
+        application_test_options(), SafetyConfig{}, application_test_node_options({
+          rclcpp::Parameter("mission.tracking_z_step_m", value)})),
+      std::invalid_argument);
+    EXPECT_THROW(
+      std::make_shared<ApplicationNode>(
+        application_test_options(), SafetyConfig{}, application_test_node_options({
+          rclcpp::Parameter("mission.tracking_z_jump_window_s", value)})),
+      std::invalid_argument);
+  }
 }
 
 TEST(ApplicationNodeSafetyParameterTest, InvalidStartupOverrideIsRejected)

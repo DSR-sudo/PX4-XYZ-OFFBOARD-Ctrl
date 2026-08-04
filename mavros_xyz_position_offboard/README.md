@@ -18,11 +18,11 @@ Initialization -- health/Z ----------+
 ```
 
 - `GroundStationLink` accepts one UTF-8 JSON object per UDP datagram, validates the source
-  IP/port allowlist and the complete V2 object shape, and sends only to the fixed remote.
+  IP/port allowlist and the complete Plan1 object shape, and sends only to the fixed remote.
 - `Navigation` is a pure C++ state machine. It keeps an immutable ARM-time `origin`, a task
   `mission_goal`, the published `commanded_setpoint`, and a separate temporary `hold_setpoint`.
-  It plans the bounded right shift and straight search from the ARM-time heading, then converts
-  each GCS visual relative measurement into an ENU target without turning toward the vehicle.
+  It flies to the fixed local ENU B point, then converts each GCS visual relative measurement into
+  a vehicle-center ENU target without turning toward the vehicle.
 - `Offboard` sends internal ENU position/yaw setpoints unchanged to MAVROS `PositionTarget`.
   MAVROS 2.14 `SetpointRawPlugin::local_cb()` converts the ROS ENU input to PX4 `LOCAL_NED`;
   the application must not convert it a second time.
@@ -35,13 +35,12 @@ Initialization -- health/Z ----------+
 Mission order:
 
 ```text
-waiting_preflight -> ground-hold warmup -> ok_wait -> waiting_run_plan1
--> run_plan1 -> OFFBOARD/ARM -> latch origin and climb 1.5 m -> hold stable for 3 s -> ok_height
--> right-shift 0.375 m -> wait for go_ahead_ok -> bounded forward pursuit
--> first car_status -> tracking_to_match -> fresh match_car_ok (distance <= 0.2 m)
--> hold 0.5 s -> PWM release -> ok_throw -> accompanying_car (continuous car_status)
--> b_ok -> ok_return
--> return Init XY + world yaw 0 -> ok_downing -> descend Init Z -> Disarm -> MANUAL -> ok_down
+waiting_preflight -> ground-hold warmup -> ok_wait -> waiting_run_plan1/OFFBOARD hold
+-> run_plan1 -> ARM -> latch origin and climb 1.5 m -> height_stabilizing (3 s)
+-> transit_to_b -> ok_b -> waiting_target -> target_lock_following (10 s dynamic follow)
+-> waiting_target/throwing
+-> PWM release -> ok_throw -> returning -> Init XY + yaw 0 -> ok_return
+-> downing -> ok_downing -> descend Init Z -> Disarm -> MANUAL -> ok_down
 ```
 
 An LCP loss during climb does not interrupt the climb. A later LCP loss freezes the measured
@@ -49,7 +48,7 @@ position until LCP recovers, then replans to the interrupted final target. Loss 
 health, or the maximum flight time still goes to the existing safe landing path. “Power off” in
 the mission documents means PX4 Disarm plus `MANUAL`, never powering down the Pi or FCU.
 
-## UDP V2
+## UDP V3
 
 Every packet has exactly this root shape:
 
@@ -57,57 +56,82 @@ Every packet has exactly this root shape:
 {"header":"<name>","data":{}}
 ```
 
-GCS sends `run_plan1`, `go_ahead_ok`, `match_car_ok`, `b_ok`, and `ack` with an empty `data`
-object. It sends continuous visual measurements as:
+GCS sends `run_plan1` and `ack` with an empty `data` object. It sends continuous visual
+measurements after acknowledging `ok_b`:
 
 ```json
 {"header":"car_status","data":{"distance_m":0.8,"bearing_rad":0.15}}
 ```
 
 `distance_m` is in `[0, udp.max_tracking_distance_m]` (default `5.0`) and `bearing_rad` is in
-`[-pi, pi]`; zero means straight ahead and positive angles are counterclockwise in the body frame.
+`[-pi, pi]`; it is the target line-of-sight angle relative to the UAV body: zero means straight
+ahead, `+pi/2` is the UAV's left, and `+/-pi` is directly behind.
+The first accepted `car_status` starts `target_lock_following` for
+`mission.target_lock_follow_seconds` (default `10.0 s`). During this one-time phase every accepted
+observation is converted with the current measured yaw and becomes the dynamic vehicle-center XY
+target, but the raw distance gate cannot release the gripper. The mission altitude and ARM-time yaw
+are preserved, and each new observation replans the XY target in place with the two-dimensional resultant limits
+`mission.car_tracking_max_speed_m_s` (default `10.0 m/s`) and
+`mission.car_tracking_max_accel_m_s2` (default `5.0 m/s2`). If either parameter is omitted, its
+effective `safety.target_xy_*` value is inherited. Return uses the independent
+`mission.return_max_speed_m_s` (default `10.0 m/s`) and
+`mission.return_max_accel_m_s2` (default `5.0 m/s2`) limits, inheriting the effective
+`safety.target_xy_*` values when omitted; the example YAML sets them to `1.0/0.5`. Normal
+`downing` uses the independent Z limits `mission.downing_max_speed_m_s` and
+`mission.downing_max_accel_m_s2` (both default `0.3`), while failure `landing` keeps the global
+Z limits. B-point and landing XY trajectories keep using the global `safety.target_xy_*` limits.
+During `waiting_target` and `target_lock_following`, consecutive finite `local_z` samples are
+compared for a short jump. A downward jump at least `mission.tracking_z_jump_threshold_m`
+(default `0.10 m`) within `mission.tracking_z_jump_window_s` (default `0.10 s`) lowers the
+temporary planner Z target by `mission.tracking_z_step_m` (default `0.11 m`); an upward jump
+applies the opposite step. The accumulated offset is preserved through visual/LCP hold recovery,
+while the original `origin.z_m` and `mission_goal.z_m` remain unchanged. New jumps are ignored
+while waiting for the gripper in `throwing`, and the offset is cleared on return, landing,
+descent, or mission reset. The offset and latest jump direction are included in `control_json`.
+After the lock-follow timer
+completes, the latest fresh raw `distance_m < mission.throw_distance_m` (default `0.20 m`)
+immediately enters `throwing`; equality does not release. Subsequent car_status messages use the
+normal live distance gate. `throw_bearing_rad` and `throw_bearing_tolerance_rad` remain accepted compatibility
+parameters but do not participate in target planning or release.
 
-UAV discrete events are `ok_wait`, `ok_height`, `ok_throw`, `ok_return`, `ok_downing`, and `ok_down`. They
-are ordered in an ACK queue. The UAV sends the earliest unsatisfied event right
-away and retries it every `udp.event_retry_period_s` (default `0.5`). A GCS
-`{"header":"ack","data":{}}` acknowledges only that earliest event. `xyzstatus` is continuous
-and is neither queued nor acknowledged.
+UAV discrete events are `ok_wait`, `ok_b`, `ok_throw`, `ok_return`, `ok_downing`, and `ok_down`.
+They are ordered in an ACK queue. The UAV sends and retransmits only the earliest unsatisfied event
+every `udp.event_retry_period_s` (default `0.5`); `{"header":"ack","data":{}}` removes only that
+head. `xyzstatus` is continuous and is neither queued nor acknowledged. Legacy `ok_height`,
+`go_ahead_ok`, `match_car_ok`, and `b_ok` are rejected as `legacy_header_rejected`.
 
-GCS may apply its own map or business condition before sending `b_ok`. The UAV knows only its
-relative local coordinates, accepts `b_ok` only while accompanying or in the matched visual-timeout
-hold, and then returns to its latched Init XY origin. `position_z_m`, `z_valid`, and the selected
-Z source are unrelated to `b_ok`.
+At ARM, the UAV latches Init and initial yaw for height/orientation control. After the 3-second
+stability gate it holds the climb altitude and flies directly to the fixed local ENU B point:
 
-After `ok_height`, the UAV translates `mission.right_shift_m` (validated to 0.35--0.40 m) to its
-initial-heading right side and waits. The GCS must compare the initial and translated `xyzstatus`
-coordinates and independently verify that the black line is centered in its video before sending
-`go_ahead_ok`. The UAV then flies its bounded `mission.forward_distance_m` search path at
-`mission.forward_max_speed_m_s` (default `0.50 m/s`) until the first `car_status`; this value
-may not exceed `safety.max_flight_horizontal_speed_m_s`. For every valid measurement, it uses the
-actual local XY and current yaw to
-form an ENU XY target, preserves that yaw and task height, and tries to arrive in
-`mission.tracking_arrival_seconds` (default `1.0`). Existing speed/acceleration limits always
-win if that time is infeasible. Targets outside `mission.max_tracking_radius_m` (default `5.0`)
-of Init are rejected. If status updates stop for `mission.car_status_timeout_s` (default `2.0`),
-the UAV freezes at its measured position and resumes the prior tracking stage when a fresh target
-arrives. `match_car_ok` requires a fresh visual distance no greater than
-`mission.tracking_tolerance_m` (default `0.2`); it freezes at the measured position for
-`mission.match_hold_seconds` (default `0.5`), then opens the gripper. Once the configured
-open/close cycle succeeds, the UAV sends `ok_throw`, enters `accompanying_car`, and continues
-processing `car_status` until `b_ok` arrives.
+```text
+xB = mission.b_right_m   # default 0.375 m; historical parameter name, ENU X
+yB = mission.b_forward_m # default 2.375 m; historical parameter name, ENU Y
+```
 
-If the downward laser is briefly intercepted by the accompanied target, EKF2 can produce a sudden
-local-Z step even on level ground. During `accompanying_car` only, the UAV detects a local-Z change
-of at least `mission.accompanying_z_jump_threshold_m` (default `0.10 m`) within
-`mission.accompanying_z_jump_window_s` (default `0.10 s`) and offsets the commanded Z by one
-`mission.accompanying_z_step_m` (default `0.11 m`) in the same direction. This temporary offset
-persists through visual timeout recovery and is cleared for return, landing, or release failure.
+The XY move is one two-dimensional trajectory. `ok_b` is emitted once when that planned trajectory
+is complete; B does not add a measured XYZ or velocity settling gate. Every
+accepted `car_status` uses the UAV receipt time and measured yaw to form the raw ENU vehicle-center
+target. A large in-radius jump is accepted and replans immediately; the active Navigation path does
+not use Kalman samples, innovation rejection, cardinal shaping, or predicted intercept timing.
+Stale or out-of-radius observations still enter the existing safe LCP hold.
+
+The height compensation is an application-level setpoint adjustment. It does not change the
+`car_status` UDP message or the continuous `xyzstatus` wire format, and `sensor_msgs/Range` remains
+an input to the existing health checks. It cannot undo an already fused PX4 EKF2 downward-range
+measurement; isolating that fusion would require a separate PX4/MAVROS input-chain change.
+
+On a successful gripper cycle, `ok_throw` is queued and the UAV immediately returns without a GCS
+command. It emits `ok_return` only after Init XY and yaw zero are measured, then queues
+`ok_downing`, descends, Disarms, returns to `MANUAL`, and emits `ok_down`. See
+[`docs/plan1_intercept_udp_protocol.md`](../docs/plan1_intercept_udp_protocol.md) for the complete
+wire protocol and idempotency rules.
 
 ## LCP and Z
 
 `xyzstatus` copies the raw LCP header and every geometry field from `/lcp/debug`. During preflight
 warmup and GCS wait, the node streams fresh measured ground-hold setpoints without creating a
-flight origin. Only ARM confirmation in OFFBOARD locks the MAVROS local pose as `Init` and starts
+flight origin. After `ok_wait`, the GCS wait also requests OFFBOARD while remaining disarmed;
+`run_plan1` enables ARM only after OFFBOARD is confirmed. Only ARM confirmation in OFFBOARD locks the MAVROS local pose as `Init` and starts
 the local-Z/range baseline. Default Z is the fresh local-pose difference from that baseline. A
 fresh valid down range is baselined at the same point and checks relative Z consistency
 (`z.range_cross_check_max_delta_m`, default `0.30 m`); set
@@ -133,7 +157,7 @@ colcon test --packages-select mavros_xyz_position_offboard --event-handlers cons
 colcon test-result --all --verbose
 ```
 
-The tests cover V2 validation, non-whitelisted inputs, ordered ACK retry state, full LCP
+The tests cover V3 validation, non-whitelisted inputs, ordered ACK retry state, full LCP
 `xyzstatus` encoding including null Z, state-machine mission order, mocked `lgpio` PWM calls, and UDP
 loopback. No automated test drives a real PWM pin.
 
@@ -141,10 +165,12 @@ loopback. No automated test drives a real PWM pin.
 
 Load [config/udp_ground_station.yaml](config/udp_ground_station.yaml) with ROS parameters. It
 contains the UDP allowlist/fixed remote, the `mission.takeoff_height_m: 1.5` and
-`mission.height_stable_seconds: 3.0` gate, right-shift/forward/match defaults, Z, and PWM
-defaults. The 3-second timer only
-accumulates while measured XYZ remains within `--target-tolerance`; leaving the tolerance returns
-the state machine to climb and restarts the timer.
+`mission.height_stable_seconds: 3.0` gate, B-point, vehicle-center tracking, retained Kalman,
+tracking-height jump compensation, Z, and PWM defaults. The vehicle-center speed and acceleration limits are explicitly set to
+`10.0 m/s` and `5.0 m/s2`; without those mission entries, the node inherits the effective safety
+XY limits. The
+3-second timer accumulates only while measured XYZ remains within `--target-tolerance`; leaving
+the tolerance restarts the timer.
 
 ## Unified Bringup
 
@@ -186,8 +212,9 @@ The deployed YAML enables the calibrated SG90 setup: BCM GPIO18 (physical pin 12
 closed, 7% open, and a 500 ms open hold. Before flight, verify this on a no-prop bench with the
 signal wire connected to GPIO18 and ensure the launch user can access the RP1 gpiochip through the
 `dialout` group. If RP1 discovery, GPIO claim, or initial 4% PWM setup fails, node startup fails.
-After a confirmed match hold, this mission opens the gripper. Successful completion of its
-configured open/close cycle emits `ok_throw` before visual accompaniment resumes.
+After the one-time target lock-follow phase, the raw 0.20 m vehicle-center gate opens the gripper.
+Successful completion of
+its configured open/close cycle emits `ok_throw` and immediately begins autonomous return.
 
 Install the C++ GPIO dependency on deployment images with `sudo apt install liblgpio-dev`.
 
